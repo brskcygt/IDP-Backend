@@ -1,0 +1,108 @@
+[
+  {
+    "id": "1786971019645",
+    "name": "Windows Test",
+    "tenant": "MDP",
+    "environment": "Dev",
+    "provider": "Server",
+    "status": "Idle",
+    "lastDeploy": "2026-08-17T12:50:19.645Z",
+    "config": {
+      "host": "10.0.0.1",
+      "port": "22",
+      "username": "deployer",
+      "password": "<REDACTED>",
+      "vpnEnabled": true,
+      "vpnConfig": {
+        "type": "fortinet",
+        "host": "vpn.example.com",
+        "mfaConfig": {
+          "rememberSession": true,
+          "type": "totp"
+        },
+        "username": "user@example.com",
+        "password": "<REDACTED>",
+        "port": "20443"
+      },
+      "targetOS": "linux",
+      "scriptContent": "#!/usr/bin/env bash\nset -e\n\n# 1. Masaüstü yolunu belirle (Kullanıcı diline göre Desktop veya Masaüstü)\nTARGET_USER=\"${USER:-deployer}\"\nUSER_HOME=$(eval echo \"~$TARGET_USER\")\n\nif [ -d \"$USER_HOME/Desktop\" ]; then\n    DESKTOP_DIR=\"$USER_HOME/Desktop\"\nelif [ -d \"$USER_HOME/Masaüstü\" ]; then\n    DESKTOP_DIR=\"$USER_HOME/Masaüstü\"\nelse\n    # Dizin yoksa oluştur\n    DESKTOP_DIR=\"$USER_HOME/Desktop\"\n    mkdir -p \"$DESKTOP_DIR\"\nfi\n\nFILE_NAME=\"idp-deployment-report.txt\"\nFILE_PATH=\"$DESKTOP_DIR/$FILE_NAME\"\n\n# 2. Dosya içeriğini oluştur ve yaz\ncat <<EOF > \"$FILE_PATH\"\n========================================\nIDP DEPLOYMENT SUCCESSFUL\n========================================\nTarih / Saat : $(date '+%Y-%m-%d %H:%M:%S')\nSunucu       : $(hostname)\nIP Adresi    : $(hostname -I | awk '{print $1}')\nKullanıcı    : $TARGET_USER\nDurum        : Aktif ve Hazir\n========================================\nBu dosya Centralized Deployment Portal\ntarafindan otomatik olarak olusturulmustur.\nEOF\n\n# 3. Dosya izinlerini ayarla (RDP kullanıcısının okuyup yazabilmesi için)\nchmod 644 \"$FILE_PATH\"\nchown -R \"$TARGET_USER:$TARGET_USER\" \"$DESKTOP_DIR\" 2>/dev/null || true\n\n# 4. Terminale ve Portal SSE loglarına çıktı ver\necho \"[OK] Dosya başarıyla oluşturuldu: $FILE_PATH\"\necho \"--- Dosya İçeriği ---\"\ncat \"$FILE_PATH\"",
+      "authType": "manual"
+    }
+  },
+  {
+    "id": "1786973571528",
+    "name": "Jenkins test",
+    "tenant": "MDP",
+    "environment": "Dev",
+    "provider": "Jenkins",
+    "status": "Idle",
+    "lastDeploy": "2026-08-17T13:32:51.528Z",
+    "config": {
+      "url": "http://localhost:8080",
+      "jobName": "test-deploy-job",
+      "username": "admin",
+      "apiToken": "<REDACTED>",
+      "vpnEnabled": false,
+      "vpnConfig": {
+        "type": "fortinet",
+        "host": "vpn.example.com",
+        "username": "user@example.com",
+        "password": "<REDACTED>",
+        "mfaConfig": {
+          "type": "totp"
+        },
+        "port": "20443"
+      }
+    }
+  },
+  {
+    "id": "1787140197144",
+    "name": "Remote Server SSH Example",
+    "tenant": "MDP",
+    "environment": "Dev",
+    "provider": "Server",
+    "status": "Idle",
+    "lastDeploy": "2026-08-19T11:49:57.144Z",
+    "config": {
+      "host": "10.0.0.2",
+      "username": "DOMAIN\\deployer",
+      "password": "<REDACTED>",
+      "vpnEnabled": false,
+      "vpnConfig": {
+        "type": "checkpoint",
+        "host": "vpn.example.com",
+        "username": "user@example.com",
+        "password": "<REDACTED>",
+        "mfaConfig": {
+          "rememberSession": false,
+          "type": "push"
+        },
+        "port": "443"
+      },
+      "targetOS": "linux",
+      "port": "3389",
+      "authType": "manual"
+    }
+  },
+  {
+    "id": "1787084216634",
+    "name": "PAM Test",
+    "tenant": "MDP",
+    "environment": "Dev",
+    "provider": "Server",
+    "status": "Idle",
+    "lastDeploy": "2026-08-18T20:16:56.634Z",
+    "config": {
+      "authType": "pmp",
+      "pmpConfig": {
+        "baseUrl": "https://127.0.0.1:7272/",
+        "resourceName": "example-resource",
+        "accountName": "root",
+        "authToken": "<REDACTED>"
+      },
+      "username": "root",
+      "host": "10.0.0.1",
+      "scriptContent": "cd /home/deployer/app/frontend && NODE_OPTIONS=\"--max-old-space-size=1536\" ./node_modules/.bin/vite build"
+    }
+  }
+]

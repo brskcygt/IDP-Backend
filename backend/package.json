@@ -1,0 +1,31 @@
+{
+  "name": "backend",
+  "version": "1.0.0",
+  "description": "IDP backend — deployment orchestration API",
+  "main": "src/server.js",
+  "scripts": {
+    "start": "node src/server.js",
+    "dev": "node --watch src/server.js",
+    "check:syntax": "node --check src/server.js",
+    "test": "node --require ./test/helpers/isolateDb.js --test",
+    "lint": "node scripts/check-syntax.js && node scripts/check-core-boundaries.js",
+    "scan:secrets": "node scripts/scan-secrets.js"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "dependencies": {
+    "axios": "^1.19.0",
+    "cookie-parser": "^1.4.7",
+    "cors": "^2.8.6",
+    "dotenv": "^17.4.2",
+    "express": "^5.2.1",
+    "express-session": "^1.19.0",
+    "node-ssh": "^13.2.1",
+    "nodejs-winrm": "^1.1.3",
+    "playwright": "^1.62.1",
+    "undici": "^8.10.0",
+    "ws": "^8.21.3"
+  }
+}

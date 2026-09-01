@@ -1,0 +1,107 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+# Cancel superseded runs on the same branch/PR to save CI minutes.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # backend/src/server.js and backend/test/**/*.test.js use node:sqlite and
+  # node:test (node --test), both of which require Node 24.
+  NODE_VERSION: '24'
+
+jobs:
+  backend:
+    name: Backend (test)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: backend
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js ${{ env.NODE_VERSION }}
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: backend/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run syntax check (lint)
+        run: npm run lint
+
+      # No .env file is created here on purpose: every entry in
+      # CONFIG_SCHEMA.*.required in backend/src/config.js is empty, and the
+      # 122 backend/test/*.test.js tests save/restore any env var they touch
+      # (see auth.test.js, secret-store.test.js) — the suite must pass with
+      # a completely empty environment.
+      - name: Run tests
+        run: npm test
+
+  frontend:
+    name: Frontend (typecheck, lint, build)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: frontend
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js ${{ env.NODE_VERSION }}
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Type check
+        run: npm run typecheck
+
+      - name: Lint
+        run: npm run lint
+
+      - name: Build
+        run: npm run build
+
+  desktop:
+    name: Desktop (syntax check)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: desktop
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js ${{ env.NODE_VERSION }}
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: desktop/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci
+
+      # Packaging (`npm run build`) is deliberately NOT run here — it's
+      # slow (downloads/rebuilds Electron + native deps) and, with no
+      # signing credentials in CI, would only ever produce an unsigned
+      # artifact nobody publishes from this job. `check:syntax` (`node
+      # --check` over every main/preload/build-hook file, see
+      # `desktop/package.json`) is the same fast sanity gate `verify.sh`
+      # runs locally — see T-95 in docs/04-TODO.md and docs/06-DAGITIM.md
+      # for where real signed packaging happens instead.
+      - name: Run syntax check
+        run: npm run check:syntax

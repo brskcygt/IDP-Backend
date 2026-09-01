@@ -1,0 +1,28 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "idp-runner-api",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-08-21",
+  "workers_dev": true,
+  "preview_urls": false,
+  "observability": {
+    "enabled": true,
+    "logs": {
+      "enabled": true
+    }
+  },
+  "rules": [
+    {
+      "type": "Text",
+      "globs": ["**/*.ps1"],
+      "fallthrough": true
+    }
+  ],
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "idp-runner-db",
+      "database_id": "30097b29-6964-43b9-a155-64795dc33893"
+    }
+  ]
+}

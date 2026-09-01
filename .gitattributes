@@ -1,0 +1,27 @@
+# Normalize line endings for all text files; keep working-tree line endings
+# as LF regardless of the checkout platform (relevant since this repo is
+# developed on macOS but CI runs on ubuntu-latest).
+* text=auto eol=lf
+
+# Lockfiles are machine-generated — exclude them from diffs/stats and from
+# GitHub's language detection so they don't dominate PR reviews.
+backend/package-lock.json -diff linguist-generated=true linguist-vendored=true
+frontend/package-lock.json -diff linguist-generated=true linguist-vendored=true
+
+# Preserve CRLF-agnostic binary handling for common binary types that may
+# show up under backend/public or frontend assets.
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.ico binary
+*.woff binary
+*.woff2 binary
+*.ttf binary
+*.eot binary
+*.pdf binary
+
+# SQLite database files are runtime data, never meant to be diffed as text.
+*.db binary
+*.db-wal binary
+*.db-shm binary

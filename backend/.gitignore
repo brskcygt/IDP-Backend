@@ -1,0 +1,25 @@
+# Environment
+.env
+node_modules/
+dist/
+public/errors/
+
+# Runtime data — contains credentials, never commit
+src/projects.json
+src/audit_logs.json
+
+# SQLite database (T-53) — replaces the JSON files above as the runtime
+# store; contains the same credentials/secret references, never commit
+src/idp.db
+src/idp.db-wal
+src/idp.db-shm
+
+# Auth runtime data (T-11 / SEC-04) — contains password hashes / session
+# state, never commit
+src/users.json
+src/sessions.json
+src/secrets.enc.json
+
+# Migration backups — these still contain the plaintext credentials the
+# migration moved into the encrypted store. Delete them once verified.
+src/*.bak

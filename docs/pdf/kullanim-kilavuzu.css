@@ -1,0 +1,306 @@
+@page {
+  size: A4;
+  margin: 18mm 16mm 20mm;
+  @bottom-left {
+    content: "MDP Group · Internal Developer Platform";
+    color: #64748b;
+    font-size: 8pt;
+  }
+  @bottom-right {
+    content: counter(page) " / " counter(pages);
+    color: #64748b;
+    font-size: 8pt;
+  }
+}
+
+@page:first {
+  margin: 0;
+  background: #101923;
+  @bottom-left { content: none; }
+  @bottom-right { content: none; }
+}
+
+:root {
+  --ink: #16202d;
+  --muted: #5c6878;
+  --line: #dce3ea;
+  --paper: #ffffff;
+  --soft: #f4f7f9;
+  --brand: #d98b18;
+  --brand-dark: #8c5107;
+  --navy: #101923;
+  --green: #087f5b;
+  --red: #b42318;
+}
+
+* { box-sizing: border-box; }
+
+html {
+  font-family: Inter, "Avenir Next", "Segoe UI", Arial, sans-serif;
+  font-size: 10.2pt;
+  line-height: 1.55;
+  color: var(--ink);
+  background: var(--paper);
+}
+
+body {
+  max-width: none;
+  margin: 0;
+  padding: 0;
+}
+
+body > header#title-block-header {
+  min-height: 297mm;
+  margin: -18mm -16mm -20mm;
+  padding: 34mm 24mm 24mm;
+  color: #f8fafc;
+  background:
+    radial-gradient(circle at 86% 18%, rgba(217,139,24,.34), transparent 24%),
+    linear-gradient(145deg, #0b1119 0%, #101923 60%, #182533 100%);
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  position: relative;
+  break-after: page;
+}
+
+body > header#title-block-header::before {
+  content: "MDP";
+  position: absolute;
+  top: 23mm;
+  left: 24mm;
+  padding: 2.5mm 4mm;
+  border: 1px solid rgba(255,255,255,.24);
+  border-radius: 2mm;
+  color: var(--brand);
+  font-size: 10pt;
+  font-weight: 800;
+  letter-spacing: .22em;
+}
+
+body > header#title-block-header::after {
+  content: "KULLANICI · YÖNETİCİ · TEKNİK İŞLETİM";
+  position: absolute;
+  right: 24mm;
+  bottom: 22mm;
+  color: rgba(255,255,255,.58);
+  font-family: ui-monospace, "SFMono-Regular", Consolas, monospace;
+  font-size: 8pt;
+  letter-spacing: .14em;
+}
+
+#title-block-header h1.title {
+  max-width: 145mm;
+  margin: 0;
+  color: #fff;
+  font-size: 33pt;
+  line-height: 1.05;
+  letter-spacing: -.035em;
+  border: 0;
+}
+
+#title-block-header .subtitle {
+  max-width: 120mm;
+  margin-top: 8mm;
+  color: #bdc8d4;
+  font-size: 14pt;
+  font-weight: 400;
+}
+
+#title-block-header .author,
+#title-block-header .date {
+  margin: 2mm 0 0;
+  color: #d8dee6;
+  font-size: 10pt;
+}
+
+#TOC {
+  break-after: page;
+  padding: 2mm 0 5mm;
+}
+
+#TOC::before {
+  content: "İçindekiler";
+  display: block;
+  margin-bottom: 7mm;
+  color: var(--navy);
+  font-size: 23pt;
+  font-weight: 800;
+  letter-spacing: -.025em;
+}
+
+#TOC ul {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  columns: 2;
+  column-gap: 12mm;
+}
+
+#TOC li {
+  margin: 0 0 2.4mm;
+  break-inside: avoid;
+}
+
+#TOC a {
+  color: #344255;
+  text-decoration: none;
+  font-size: 9pt;
+}
+
+body > h1:first-of-type { display: none; }
+
+h1, h2, h3, h4 {
+  color: var(--navy);
+  font-weight: 750;
+  line-height: 1.2;
+  break-after: avoid;
+  page-break-after: avoid;
+}
+
+h2 {
+  margin: 12mm 0 5mm;
+  padding: 0 0 3mm;
+  border-bottom: 1.2pt solid var(--line);
+  font-size: 20pt;
+  letter-spacing: -.025em;
+}
+
+h2::before {
+  content: "";
+  display: inline-block;
+  width: 4mm;
+  height: 4mm;
+  margin: 0 3mm .5mm 0;
+  border-radius: 1mm;
+  background: var(--brand);
+}
+
+h3 {
+  margin: 8mm 0 3mm;
+  color: #263649;
+  font-size: 14pt;
+}
+
+h4 { margin: 6mm 0 2mm; font-size: 11.5pt; }
+
+p { margin: 0 0 3.3mm; orphans: 3; widows: 3; }
+
+a { color: var(--brand-dark); text-decoration-color: #e2b464; }
+
+strong { color: #172231; }
+
+hr {
+  height: 0;
+  margin: 9mm 0;
+  border: 0;
+  border-top: 1px solid var(--line);
+}
+
+blockquote {
+  margin: 5mm 0;
+  padding: 4mm 5mm;
+  border: 0;
+  border-left: 3pt solid var(--brand);
+  border-radius: 0 2mm 2mm 0;
+  color: #3e4c5d;
+  background: #fff8ec;
+  break-inside: avoid;
+}
+
+blockquote p:last-child { margin-bottom: 0; }
+
+ul, ol { margin: 2mm 0 4mm; padding-left: 7mm; }
+li { margin-bottom: 1.3mm; }
+li::marker { color: var(--brand-dark); font-weight: 700; }
+
+table {
+  width: 100%;
+  margin: 5mm 0 7mm;
+  border-collapse: collapse;
+  font-size: 8.8pt;
+  break-inside: avoid;
+}
+
+thead { display: table-header-group; }
+
+th {
+  padding: 2.7mm 3mm;
+  color: #f8fafc;
+  background: var(--navy);
+  text-align: left;
+  font-weight: 700;
+}
+
+th:first-child { border-radius: 1.5mm 0 0 0; }
+th:last-child { border-radius: 0 1.5mm 0 0; }
+
+td {
+  padding: 2.5mm 3mm;
+  border-bottom: 1px solid var(--line);
+  vertical-align: top;
+}
+
+tbody tr:nth-child(even) { background: var(--soft); }
+
+code {
+  padding: .25mm 1mm;
+  border-radius: 1mm;
+  color: #8a4b00;
+  background: #fff3dc;
+  font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+  font-size: .88em;
+}
+
+pre {
+  margin: 4mm 0 6mm;
+  padding: 4mm 4.5mm;
+  border: 1px solid #28384a;
+  border-radius: 2mm;
+  color: #dbe5ee;
+  background: #101923;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  font-size: 8.2pt;
+  line-height: 1.45;
+  break-inside: avoid;
+}
+
+pre code {
+  padding: 0;
+  color: inherit;
+  background: transparent;
+  font-size: inherit;
+}
+
+figure {
+  margin: 6mm auto 8mm;
+  text-align: center;
+  break-inside: avoid;
+}
+
+img {
+  display: block;
+  max-width: 100%;
+  max-height: 205mm;
+  margin: 5mm auto 3mm;
+  border: 1px solid #cbd5df;
+  border-radius: 2.5mm;
+  box-shadow: 0 2mm 7mm rgba(15, 23, 42, .12);
+  object-fit: contain;
+}
+
+figcaption {
+  color: var(--muted);
+  font-size: 8.2pt;
+  font-style: italic;
+}
+
+.status-ok { color: var(--green); }
+.status-error { color: var(--red); }
+
+@media print {
+  a { color: inherit; }
+  h2 { break-before: auto; }
+  img, table, pre, blockquote { print-color-adjust: exact; -webkit-print-color-adjust: exact; }
+}
