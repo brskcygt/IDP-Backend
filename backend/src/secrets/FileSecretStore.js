@@ -15,6 +15,20 @@ const FILE_MODE = 0o600;
 const DEFAULT_FILE_PATH = path.join(__dirname, '..', 'secrets.enc.json');
 
 /**
+ * Where the encrypted store lives when the caller doesn't pass `filePath`.
+ *
+ * `IDP_SECRETS_PATH` follows IDP_DB_PATH / IDP_USERS_PATH / IDP_SESSIONS_PATH:
+ * a server install keeps its data outside the code directory, so an update
+ * that replaces backend/ can't take the secrets with it. Read at construction
+ * time (not module load) so it's honoured however late the env is set.
+ * @returns {string}
+ */
+function resolveDefaultFilePath() {
+  const override = process.env.IDP_SECRETS_PATH;
+  return override && override.trim() !== '' ? override.trim() : DEFAULT_FILE_PATH;
+}
+
+/**
  * @typedef {object} EncryptedRecord
  * @property {string} iv - base64, 12 random bytes, unique per encryption.
  * @property {string} authTag - base64, GCM authentication tag (16 bytes).
@@ -50,11 +64,12 @@ class FileSecretStore extends SecretStore {
    * @param {object} options
    * @param {Buffer} options.key - 32-byte AES-256 key (see keyManager.resolveKey()).
    * @param {string} [options.filePath] - path to the encrypted store file.
-   *   Defaults to `backend/src/secrets.enc.json`.
+   *   Defaults to `IDP_SECRETS_PATH`, else `backend/src/secrets.enc.json`.
+   *   Missing parent directories are created on first write (see _persist).
    */
   constructor(options = {}) {
     super();
-    const { key, filePath = DEFAULT_FILE_PATH } = options;
+    const { key, filePath = resolveDefaultFilePath() } = options;
     if (!Buffer.isBuffer(key) || key.length !== KEY_LENGTH_BYTES) {
       throw new Error(`FileSecretStore requires a ${KEY_LENGTH_BYTES}-byte Buffer key`);
     }

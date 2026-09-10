@@ -125,4 +125,86 @@ function loadConfig() {
   return config;
 }
 
-module.exports = { loadConfig, validateEnv };
+/**
+ * HTTP-shell-only settings: IDP_HOST, IDP_COOKIE_SECURE and the production
+ * SESSION_SECRET requirement.
+ *
+ * Deliberately NOT part of validateEnv()/loadConfig(): the Electron IPC shell
+ * (desktop/main/ipc/backendModules.js) also calls loadConfig() but never opens
+ * a port or issues a session cookie, so a missing SESSION_SECRET must not be
+ * able to abort the desktop app. Only src/server.js calls this.
+ *
+ * Pure (reads only the `env` it's given) so it can be unit-tested.
+ *
+ * @param {NodeJS.ProcessEnv} [env]
+ * @returns {{ valid: boolean, errors: string[], warnings: string[], host: string|null, cookieSecure: boolean }}
+ */
+function validateHttpServerEnv(env = process.env) {
+  const errors = [];
+  const warnings = [];
+  const isProduction = (env.NODE_ENV || 'development') === 'production';
+
+  // IDP_HOST unset/blank -> null -> app.listen(PORT) on every interface (the
+  // pre-existing behavior).
+  const rawHost = env.IDP_HOST;
+  const host = rawHost && rawHost.trim() !== '' ? rawHost.trim() : null;
+
+  // IDP_COOKIE_SECURE unset/blank -> the pre-existing rule (Secure only in
+  // production). An unrecognised value is fatal rather than guessed at: a
+  // wrong guess either breaks login over plain HTTP or silently drops Secure.
+  let cookieSecure = isProduction;
+  const rawSecure = env.IDP_COOKIE_SECURE;
+  if (rawSecure !== undefined && rawSecure.trim() !== '') {
+    const normalized = rawSecure.trim().toLowerCase();
+    if (normalized === 'true') {
+      cookieSecure = true;
+    } else if (normalized === 'false') {
+      cookieSecure = false;
+      if (isProduction) {
+        warnings.push(
+          "IDP_COOKIE_SECURE=false: oturum cookie'si düz HTTP üzerinden gidiyor, sadece güvenilir iç ağda kullanın."
+        );
+      }
+    } else {
+      errors.push(`[SERVER] IDP_COOKIE_SECURE geçersiz ("${rawSecure}"): sadece "true" veya "false" olabilir.`);
+    }
+  }
+
+  // In development a missing SESSION_SECRET still falls back to a per-process
+  // random secret (see resolveSessionSecret() in server.js). In production
+  // that fallback silently logs every user out on each restart, so refuse.
+  if (isProduction && (!env.SESSION_SECRET || env.SESSION_SECRET.trim() === '')) {
+    errors.push(
+      '[SERVER] NODE_ENV=production iken SESSION_SECRET zorunlu (yoksa her yeniden başlatmada tüm oturumlar düşer). ' +
+        'Üret: node -e "console.log(require(\'crypto\').randomBytes(32).toString(\'hex\'))"'
+    );
+  }
+
+  return { valid: errors.length === 0, errors, warnings, host, cookieSecure };
+}
+
+/**
+ * Validates and returns the HTTP-shell settings, mirroring loadConfig():
+ * warnings are logged, errors are logged and abort startup.
+ * @returns {Readonly<{ host: string|null, cookieSecure: boolean }>}
+ */
+function loadHttpServerConfig() {
+  const { valid, errors, warnings, host, cookieSecure } = validateHttpServerEnv();
+
+  for (const w of warnings) {
+    console.warn(`⚠️  ${w}`);
+  }
+
+  if (!valid) {
+    for (const e of errors) {
+      console.error(`❌ ${e}`);
+    }
+    console.error('\n💀 Server startup aborted due to missing or invalid environment variables.');
+    console.error('   Please create a .env file based on .env.example\n');
+    process.exit(1);
+  }
+
+  return Object.freeze({ host, cookieSecure });
+}
+
+module.exports = { loadConfig, validateEnv, validateHttpServerEnv, loadHttpServerConfig };

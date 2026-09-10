@@ -1,5 +1,9 @@
-const { loadConfig } = require('./config');
+const { loadConfig, loadHttpServerConfig } = require('./config');
 const appConfig = loadConfig();
+// HTTP-only settings (IDP_HOST, IDP_COOKIE_SECURE, production SESSION_SECRET
+// requirement) — exits here on invalid/missing values, before any module with
+// startup side effects (DB, session store) is loaded.
+const serverConfig = loadHttpServerConfig();
 
 const express = require('express');
 const cors = require('cors');
@@ -36,6 +40,11 @@ app.use(cors({ origin: 'http://localhost:5173', credentials: true })); // MUST e
 app.use(express.json({ limit: '1mb' }));
 app.use(cookieParser());
 
+// Health probe — unauthenticated, not rate-limited, and mounted BEFORE the
+// session middleware so polling it never touches the session store or sets a
+// cookie. See routes/health.js.
+app.use('/api/health', require('./routes/health'));
+
 /**
  * Resolves the express-session signing secret (T-11 / SEC-04).
  *
@@ -46,6 +55,10 @@ app.use(cookieParser());
  * (per the T-38/T-13 decision that missing optional config must not block
  * the whole server), but every existing session is invalidated on the next
  * restart since the generated secret isn't persisted anywhere.
+ *
+ * That fallback is development-only: with NODE_ENV=production,
+ * loadHttpServerConfig() (config.js) has already aborted startup when
+ * SESSION_SECRET is missing, so production never reaches the random branch.
  */
 function resolveSessionSecret() {
   if (process.env.SESSION_SECRET && process.env.SESSION_SECRET.trim() !== '') {
@@ -70,7 +83,10 @@ app.use(session({
   cookie: {
     httpOnly: true,
     sameSite: 'lax',
-    secure: process.env.NODE_ENV === 'production', // requires HTTPS in production
+    // IDP_COOKIE_SECURE overrides; unset keeps the old rule (Secure only in
+    // production). express-session will not send a Secure cookie over plain
+    // HTTP at all, hence the explicit opt-out for the internal-network install.
+    secure: serverConfig.cookieSecure,
     maxAge: 8 * 60 * 60 * 1000 // 8 hours
   }
 }));
@@ -362,6 +378,18 @@ setInterval(() => {
 }, 30 * 60 * 1000);
 
 const PORT = appConfig.port;
-app.listen(PORT, () => {
-  console.log(`Backend server running on port ${PORT}`);
+// IDP_HOST set -> bind only that address; unset -> every interface (as before).
+const listenArgs = serverConfig.host ? [PORT, serverConfig.host] : [PORT];
+// Express 5 passes a listen error (EADDRINUSE, EADDRNOTAVAIL, ...) to this
+// callback — previously it was ignored and the "running" line still printed.
+const server = app.listen(...listenArgs, (err) => {
+  if (err) {
+    console.error(
+      `❌ Backend server could not listen on ${serverConfig.host || '(all interfaces)'}:${PORT} — ${err.message}`
+    );
+    process.exit(1);
+  }
+  const { address, port } = server.address();
+  const hostLabel = address.includes(':') ? `[${address}]` : address;
+  console.log(`Backend server running on ${hostLabel}:${port}${serverConfig.host ? '' : ' (all interfaces)'}`);
 });
