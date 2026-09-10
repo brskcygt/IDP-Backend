@@ -128,6 +128,24 @@ ve betik durur.
   - (b) `Set-NetConnectionProfile -InterfaceAlias <ad> -NetworkCategory Private`. Bu makine genelinde
     etki eder: o arayüzde tüm Private profil kuralları devreye girer.
 
+## Git'siz kurulum (kopyalanan paket)
+
+Sunucuda git klonu yerine sadece gereken dizinleri içeren bir paket de kullanılabilir. Pakette
+yalnızca commit'lenmiş dosyalar olur (`.env`, `users.json`, `idp.db`, `node_modules` olmaz):
+
+```bash
+git archive --format=zip -o idp-server.zip HEAD backend idp-agent-gateway deploy
+```
+
+ZIP'i profil dışında bir dizine açın (ör. `C:\IDP\idp-server`) ve betiği oradan çalıştırın
+(`.\deploy\windows\install-idp-server.ps1`). Betik `.git` yokken git kontrolünü atlar.
+
+**Güncellerken `backend\.env`'i koruyun.** Dosya kod dizininin içindedir ve `IDP_SECRET_KEY`'i
+taşır. `backend` dizinini silip yeniden kopyalamak anahtarı kaybettirir ve kayıtlı tüm sırlar
+çözülemez olur. Güncelleme adımları: görevleri durdurun, yeni paketi eskisinin **üzerine** açın
+(`.env` pakette olmadığı için ezilmez), sonra betiği tekrar çalıştırın. Önce `backend\.env`'i ve
+veri dizinini yedekleyin.
+
 ## Güncelleme
 
 ```powershell
