@@ -59,8 +59,11 @@ run "frontend: build"        frontend npm run build
 # download + native rebuild) and produces an unsigned artifact this script
 # has no reason to build on every check. `check:syntax` is the fast sanity
 # gate; see docs/06-DAGITIM.md for how to run a real signed/packaged build.
+# `npm test` (node --test main/) runs under plain Node — no Electron window,
+# no Maven, no network; deployLogBridge.test.js loads backend/src directly.
 run "desktop: npm ci"          desktop npm ci
 run "desktop: check (syntax)"  desktop npm run check:syntax
+run "desktop: test"            desktop npm test
 
 # ---- Optional: security checks (mirrors .github/workflows/security.yml) ----
 if [[ "${WITH_SECURITY}" -eq 1 ]]; then

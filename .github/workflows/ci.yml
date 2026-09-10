@@ -76,7 +76,7 @@ jobs:
         run: npm run build
 
   desktop:
-    name: Desktop (syntax check)
+    name: Desktop (syntax check, test)
     runs-on: ubuntu-latest
     defaults:
       run:
@@ -105,3 +105,10 @@ jobs:
       # for where real signed packaging happens instead.
       - name: Run syntax check
         run: npm run check:syntax
+
+      # `node --test main/` under plain Node (no Electron window, no Maven,
+      # no network). deployLogBridge.test.js requires backend/src directly;
+      # that chain only uses node: built-ins (node:sqlite), so no backend
+      # `npm ci` is needed here.
+      - name: Run tests
+        run: npm test

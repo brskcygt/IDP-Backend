@@ -7,10 +7,15 @@ tekrar tekrar çalıştırabilirsiniz.
 | Bileşen | Görev | Varsayılan port | Log |
 | --- | --- | --- | --- |
 | Backend API | `IDP-Backend` | 3001 | `C:\ProgramData\IDP\Server\logs\backend.log` |
-| Agent gateway (WebSocket + REST) | `IDP-Agent-Gateway` | 7003 | `C:\ProgramData\IDP\Server\logs\gateway.log` |
+| Agent gateway, agent dinleyicisi (yalnızca agent WebSocket ve `/health`) | `IDP-Agent-Gateway` | 7003 (`0.0.0.0`) | `C:\ProgramData\IDP\Server\logs\gateway.log` |
+| Agent gateway, kontrol dinleyicisi (tüm HTTP uçları, backend'in log aboneliği) | aynı görev | 7004 (yalnızca `127.0.0.1`) | aynı log |
 
 İki görev de ayrı bir yerel hesapla (`idp-svc`, RunLevel Limited) çalışır. Bu makinede SYSTEM
 olarak çalışan Java agent görevine (`IDP-Agent-...`) betik dokunmaz.
+
+Backend gateway'e yalnızca kontrol dinleyicisinden konuşur (`IDP_AGENT_API_URL=http://127.0.0.1:7004`).
+7004 için firewall kuralı açılmaz ve bu port hiçbir yoldan dışarı açılmaz. Agent portunu
+internete açma kuralları ve seçenekleri: [`../agent-public-endpoint.md`](../agent-public-endpoint.md).
 
 ## Ön koşullar
 
@@ -20,7 +25,7 @@ olarak çalışan Java agent görevine (`IDP-Agent-...`) betik dokunmaz.
 - Git. Repo, kullanıcı profili dışında bir dizine klonlanmış olmalı (öneri:
   `C:\IDP\Internal-Developer-Platform--IDP-`). Repo yolunda `"`, `%` veya `#` olmamalı.
 - npm registry erişimi (`npm ci` için).
-- 3001 ve 7003 portları boş olmalı.
+- 3001, 7003 ve 7004 portları boş olmalı.
 - Görevler saklanan parolayla çalışır. "Network access: Do not allow storage of passwords and
   credentials" politikası açıksa görev kaydı başarısız olur. Domain GPO "Log on as a batch job"
   hakkını yönetiyorsa `idp-svc` hesabını oraya da ekletin, yoksa GPO yenilendiğinde görev
@@ -57,7 +62,9 @@ vermek isterseniz betiği yönetici PowerShell oturumunun içinden çağırın:
 | `-RepoPath` | betiğin iki üst dizini | Repo kökü |
 | `-DataDir` | `C:\ProgramData\IDP\Server` | DB, kullanıcılar, oturumlar, şifreli sırlar, agent kaydı, loglar |
 | `-Port` / `-BindHost` | `3001` / `0.0.0.0` | Backend |
-| `-GatewayPort` / `-GatewayBindHost` | `7003` / `0.0.0.0` | Gateway (başka sunuculardaki agent'lar bağlanır) |
+| `-GatewayPort` / `-GatewayBindHost` | `7003` / `0.0.0.0` | Gateway agent dinleyicisi (başka sunuculardaki agent'lar bağlanır). Kontrol dinleyicisi sabit: `127.0.0.1:7004` |
+| `-AgentPublicUrl` | mevcut değer, yoksa `ws://<ilk iç IP>:<GatewayPort>` | Agent paketlerine yazılan adres (`IDP_AGENT_PUBLIC_URL`), `ws://` ya da `wss://`. İnternetten erişimde `wss://agent.<alan>` |
+| `-CfAccessClientId` / `-CfAccessClientSecret` | mevcut değerler | Cloudflare Access service token çifti (`IDP_AGENT_CF_ACCESS_CLIENT_ID` / `_SECRET`). İkisi birlikte; secret verilmezse gizli girişle sorulur |
 | `-AdminPassword` | sorulur | Sadece `users.json` henüz yokken kullanılır |
 | `-SkipFirewall` | kapalı | Firewall kurallarına dokunmaz |
 | `-Uninstall` | kapalı | Kaldırır (aşağıya bakın) |
@@ -82,10 +89,14 @@ Betik sırasıyla şunları yapar:
 4. İzinleri ayarlar: veri dizinine, `backend\.env`'e ve `gateway.env`'e sadece SYSTEM, Administrators
    ve `idp-svc` erişebilir.
 5. `npm ci --omit=dev` çalıştırır.
-6. `.env` dosyalarını yazar.
-7. Firewall kuralını Domain ve Private profillerine açar. Public profile sadece
-   `-FirewallPublicRemoteAddress` verilirse ve yalnızca o kaynaklara açar.
-8. Görevleri kaydedip başlatır, `/api/health` ve `/health` uçlarını kontrol eder.
+6. `.env` dosyalarını yazar. Gateway'e `IDP_AGENT_GATEWAY_CONTROL_HOST=127.0.0.1` ve
+   `IDP_AGENT_GATEWAY_CONTROL_PORT=7004`, backend'e `IDP_AGENT_API_URL=http://127.0.0.1:7004`,
+   `IDP_AGENT_PUBLIC_URL` ve (verildiyse) Cloudflare Access çiftini yazar.
+7. Firewall kuralını Domain ve Private profillerine açar (3001 ve 7003). Public profile sadece
+   `-FirewallPublicRemoteAddress` verilirse ve yalnızca o kaynaklara açar. 7004 için kural
+   açılmaz.
+8. Görevleri kaydedip başlatır; `/api/health`, gateway `/health` (7003) ve kontrol
+   dinleyicisini (127.0.0.1:7004) kontrol eder.
 9. Admin hesabı oluşunca `IDP_ADMIN_PASSWORD` satırını `.env`'den siler.
 
 Konsolda hiçbir sır gösterilmez. Korunan dosya ve dizinlerin sahibi Administrators olarak ayarlanır.
@@ -114,11 +125,19 @@ ve betik durur.
   Ayar dosyasını menüden açın: **Araçlar > Ayar dosyasını aç** (dev ortamında macOS'ta
   `~/Library/Application Support/idp-desktop/idp.env`). Satır başına `export ` yazmayın.
   Uzak modda oturum bellekte tutulur; uygulama kapanınca tekrar giriş gerekir.
-- **Agent ZIP'leri yeniden üretilmeli.** "IDP Agent oluştur" formunda:
-  - WebSocket adresi: başka sunucular için `ws://192.168.0.242:7003`, bu makinedeki agent için
-    `ws://127.0.0.1:7003`.
-  - Token: `C:\ProgramData\IDP\Server\gateway.env` içindeki `IDP_AGENT_API_TOKEN`. Dosyayı yönetici
-    olarak açın.
+- **Agent ZIP'leri yeniden üretilmeli; eski ZIP'ler artık bağlanamaz.** Her agent kendi
+  kimliğini taşır. Paket IDP arayüzünden üretilir (yetki: `admin`). Backend
+  `POST /api/agents/<id>/credentials` ile gateway'den o agent'a özel bir sır alır ve sırrı,
+  `IDP_AGENT_PUBLIC_URL` adresini ve varsa Cloudflare Access çiftini pakete koyar. Sır bir kez
+  döner. Aynı ID için yeniden üretmek sırrı değiştirir ve önceki paketi geçersiz kılar.
+  - `IDP_AGENT_PUBLIC_URL` varsayılanı iç ağ adresidir (`ws://192.168.0.242:7003`). İnternetten
+    bağlanacak agent'lar için dış uç hazırlandıktan sonra betiği
+    `-AgentPublicUrl wss://agent.<alan>` ile çalıştırın:
+    [`../agent-public-endpoint.md`](../agent-public-endpoint.md).
+  - `IDP_AGENT_API_TOKEN` artık yalnızca backend ile gateway arasındaki kontrol token'ıdır;
+    agent'a verilmez. Eski değer dağıtılmış JAR'larda düz metin durduğu için değiştirin
+    (bkz. `agent-public-endpoint.md`, "Eski paylaşımlı token'ı değiştirme").
+  - Kullanılmayan agent'ın kimliğini `DELETE /api/agents/<id>/credentials` ile iptal edin.
 
   Yeni ZIP'teki `install-idp-agent-<id>.ps1` aynı görev adını `-Force` ile yeniler.
 - **Ağ profili:** kurallar Public profile herkese bilerek açılmaz. Arayüz Public görünüyorsa ve
@@ -157,7 +176,10 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\deploy\windows\install
 Betik `git pull` yapmaz. Tekrar çalıştırıldığında görevleri durdurur, `npm ci` yapar, `.env`
 anahtarlarını tazeler, görevleri yeniden kaydedip başlatır. `SESSION_SECRET`, `IDP_SECRET_KEY` ve
 `IDP_AGENT_API_TOKEN` **asla yeniden üretilmez**. Mevcut anahtar bozuksa ya da iki dosyadaki token
-farklıysa betik durur ve düzeltmeyi size bırakır. Git "dubious ownership" hatası verirse betik
+farklıysa betik durur ve düzeltmeyi size bırakır. `IDP_AGENT_PUBLIC_URL` ve Cloudflare Access
+çifti de korunur; yalnızca `-AgentPublicUrl` / `-CfAccessClientId` verildiğinde değişir.
+`backend\.env`'de çiftin yalnızca biri doluysa betik durur (backend bu durumda açılmaz). Çifti
+kaldırmak için iki satırı da elle silin. Git "dubious ownership" hatası verirse betik
 `safe.directory` komutunu gösterir.
 
 ## Kaldırma

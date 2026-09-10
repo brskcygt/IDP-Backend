@@ -4,6 +4,24 @@ const { fetch } = require('undici');
 const WebSocket = require('ws');
 const crypto = require('crypto');
 
+/**
+ * Agent ID format shared with idp-agent-gateway (its credential endpoints
+ * reject anything else). Checked here too so a malformed ID never hits the wire.
+ */
+const AGENT_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]{2,127}$/;
+
+function isValidAgentId(value) {
+  return typeof value === 'string' && AGENT_ID_PATTERN.test(value);
+}
+
+function assertValidAgentId(agentId) {
+  if (!isValidAgentId(agentId)) {
+    const error = new Error('Invalid agent ID.');
+    error.status = 400;
+    throw error;
+  }
+}
+
 function normalizeBaseUrl(value) {
   const url = String(value || process.env.IDP_AGENT_API_URL || '').trim().replace(/\/+$/, '');
   if (!url) throw new Error('IDP agent backend URL is not configured (IDP_AGENT_API_URL).');
@@ -38,7 +56,10 @@ class AgentGatewayClient {
     });
     const body = await response.json().catch(() => ({}));
     if (!response.ok || body?.type === false) {
-      throw new Error(body?.message || body?.error || `Agent backend request failed (${response.status}).`);
+      const error = new Error(body?.message || body?.error || `Agent backend request failed (${response.status}).`);
+      // Lets callers map a specific gateway answer (e.g. 404 on revoke) without parsing messages.
+      error.status = response.status;
+      throw error;
     }
     return body;
   }
@@ -53,6 +74,38 @@ class AgentGatewayClient {
       method: 'POST',
       body: JSON.stringify({ command }),
     });
+  }
+
+  /**
+   * Issues (or rotates) the per-agent credential. On rotation the gateway
+   * closes the session that used the previous secret. The secret is meant to
+   * be shown to the caller once; never log it.
+   * @param {string} agentId
+   * @returns {Promise<{ agentId: string, secret: string }>}
+   */
+  async issueCredential(agentId) {
+    assertValidAgentId(agentId);
+    const body = await this.request(`/agent/credentials/${encodeURIComponent(agentId)}`, { method: 'POST' });
+    if (!body || typeof body.secret !== 'string' || body.secret === '') {
+      throw new Error('Agent gateway returned no credential secret.');
+    }
+    return { agentId: typeof body.agentId === 'string' && body.agentId ? body.agentId : agentId, secret: body.secret };
+  }
+
+  /**
+   * Revokes the per-agent credential.
+   * @param {string} agentId
+   * @returns {Promise<boolean>} true when revoked, false when the gateway had no credential for this ID (404).
+   */
+  async revokeCredential(agentId) {
+    assertValidAgentId(agentId);
+    try {
+      await this.request(`/agent/credentials/${encodeURIComponent(agentId)}`, { method: 'DELETE' });
+      return true;
+    } catch (error) {
+      if (error.status === 404) return false;
+      throw error;
+    }
   }
 
   subscribe(agentId, handlers = {}) {
@@ -98,3 +151,5 @@ class AgentGatewayClient {
 
 module.exports = AgentGatewayClient;
 module.exports.normalizeBaseUrl = normalizeBaseUrl;
+module.exports.AGENT_ID_PATTERN = AGENT_ID_PATTERN;
+module.exports.isValidAgentId = isValidAgentId;

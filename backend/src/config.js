@@ -180,16 +180,92 @@ function validateHttpServerEnv(env = process.env) {
     );
   }
 
-  return { valid: errors.length === 0, errors, warnings, host, cookieSecure };
+  const agentCredentials = validateAgentCredentialEnv(env);
+  errors.push(...agentCredentials.errors);
+  warnings.push(...agentCredentials.warnings);
+
+  return {
+    valid: errors.length === 0,
+    errors,
+    warnings,
+    host,
+    cookieSecure,
+    agentCredentials: {
+      publicUrl: agentCredentials.publicUrl,
+      publicUrlError: agentCredentials.publicUrlError,
+      cfAccess: agentCredentials.cfAccess,
+    },
+  };
+}
+
+/**
+ * Settings handed to an agent together with its per-agent credential
+ * (POST /api/agents/:id/credentials, routes/agents.js):
+ *
+ *  - IDP_AGENT_PUBLIC_URL: the ws:// / wss:// address agents dial (e.g.
+ *    wss://agent.<domain>). Optional: unset or invalid only disables the
+ *    credential endpoint (503), it never blocks startup. Invalid is a warning.
+ *  - IDP_AGENT_CF_ACCESS_CLIENT_ID / _SECRET: Cloudflare Access service token
+ *    the agent sends in front of the gateway. Both or neither — exactly one
+ *    set is a startup error, because it would silently hand out agents that
+ *    Cloudflare Access rejects.
+ *
+ * Pure (reads only `env`). Never echoes a secret value in a message.
+ *
+ * @param {NodeJS.ProcessEnv} [env]
+ * @returns {{ errors: string[], warnings: string[], publicUrl: string|null, publicUrlError: string|null,
+ *   cfAccess: { clientId: string, clientSecret: string }|null }}
+ */
+function validateAgentCredentialEnv(env = process.env) {
+  const errors = [];
+  const warnings = [];
+
+  let publicUrl = null;
+  let publicUrlError = 'IDP_AGENT_PUBLIC_URL tanımlı değil.';
+  const rawPublicUrl = (env.IDP_AGENT_PUBLIC_URL || '').trim();
+  if (rawPublicUrl) {
+    let parsed = null;
+    try {
+      parsed = new URL(rawPublicUrl);
+    } catch {
+      parsed = null;
+    }
+    if (!parsed || !['ws:', 'wss:'].includes(parsed.protocol) || !parsed.hostname) {
+      publicUrlError = 'IDP_AGENT_PUBLIC_URL geçersiz: ws:// veya wss:// ile başlayan bir adres olmalı.';
+    } else if (parsed.username || parsed.password) {
+      publicUrlError = 'IDP_AGENT_PUBLIC_URL geçersiz: adres kullanıcı adı/parola içeremez.';
+    } else {
+      publicUrl = rawPublicUrl.replace(/\/+$/, '');
+      publicUrlError = null;
+    }
+    if (publicUrlError) {
+      warnings.push(`${publicUrlError} Agent kimliği üretimi (POST /api/agents/:id/credentials) 503 döner.`);
+    }
+  }
+
+  const clientId = (env.IDP_AGENT_CF_ACCESS_CLIENT_ID || '').trim();
+  const clientSecret = (env.IDP_AGENT_CF_ACCESS_CLIENT_SECRET || '').trim();
+  let cfAccess = null;
+  if (clientId && clientSecret) {
+    cfAccess = { clientId, clientSecret };
+  } else if (clientId || clientSecret) {
+    errors.push(
+      '[SERVER] IDP_AGENT_CF_ACCESS_CLIENT_ID ve IDP_AGENT_CF_ACCESS_CLIENT_SECRET birlikte verilmeli ' +
+        `(şu an yalnızca ${clientId ? 'CLIENT_ID' : 'CLIENT_SECRET'} dolu). İkisini de doldurun ya da ikisini de silin.`
+    );
+  }
+
+  return { errors, warnings, publicUrl, publicUrlError, cfAccess };
 }
 
 /**
  * Validates and returns the HTTP-shell settings, mirroring loadConfig():
  * warnings are logged, errors are logged and abort startup.
- * @returns {Readonly<{ host: string|null, cookieSecure: boolean }>}
+ * @returns {Readonly<{ host: string|null, cookieSecure: boolean,
+ *   agentCredentials: { publicUrl: string|null, publicUrlError: string|null, cfAccess: object|null } }>}
  */
 function loadHttpServerConfig() {
-  const { valid, errors, warnings, host, cookieSecure } = validateHttpServerEnv();
+  const { valid, errors, warnings, host, cookieSecure, agentCredentials } = validateHttpServerEnv();
 
   for (const w of warnings) {
     console.warn(`⚠️  ${w}`);
@@ -204,7 +280,15 @@ function loadHttpServerConfig() {
     process.exit(1);
   }
 
-  return Object.freeze({ host, cookieSecure });
+  return Object.freeze({
+    host,
+    cookieSecure,
+    agentCredentials: Object.freeze({
+      publicUrl: agentCredentials.publicUrl,
+      publicUrlError: agentCredentials.publicUrlError,
+      cfAccess: agentCredentials.cfAccess ? Object.freeze({ ...agentCredentials.cfAccess }) : null,
+    }),
+  });
 }
 
-module.exports = { loadConfig, validateEnv, validateHttpServerEnv, loadHttpServerConfig };
+module.exports = { loadConfig, validateEnv, validateHttpServerEnv, validateAgentCredentialEnv, loadHttpServerConfig };

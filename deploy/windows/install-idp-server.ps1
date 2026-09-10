@@ -7,6 +7,8 @@
     Idempotent: tekrar calistirmak guvenlidir. Her calistirmada
       - Node surumunu dogrular, backend ve idp-agent-gateway icin `npm ci --omit=dev` calistirir,
       - mevcut sirlari (SESSION_SECRET, IDP_SECRET_KEY, IDP_AGENT_API_TOKEN) KORUR, sadece eksikleri uretir,
+      - IDP_AGENT_PUBLIC_URL ve Cloudflare Access ciftini parametre verilmedikce KORUR,
+      - gateway kontrol dinleyicisini 127.0.0.1:7004'e baglar (firewall kurali acmaz),
       - servis hesabini, dosya izinlerini, firewall kurallarini ve zamanlanmis gorevleri yeniden uygular,
       - gorevleri yeniden baslatir ve saglik kontrolu yapar.
     `git pull` YAPMAZ: kodu guncellemek operatorun isidir.
@@ -36,6 +38,16 @@ param(
 
     [string]$GatewayBindHost = '0.0.0.0',
 
+    # Agent'larin baglanacagi adres -> backend .env IDP_AGENT_PUBLIC_URL (ws:// veya wss://, orn. wss://agent.ornek.com).
+    # Verilmezse .env'deki mevcut deger korunur; o da yoksa ws://<ilk ic IP>:<GatewayPort> yazilir (ic ag davranisi).
+    [string]$AgentPublicUrl,
+
+    # Cloudflare Access service token -> backend .env IDP_AGENT_CF_ACCESS_CLIENT_ID / _SECRET (ikisi birlikte).
+    # -CfAccessClientId verilip secret verilmezse secret gizli girisle sorulur. Verilmezse mevcut degerler korunur.
+    [string]$CfAccessClientId,
+
+    [System.Security.SecureString]$CfAccessClientSecret,
+
     [System.Security.SecureString]$AdminPassword,
 
     [switch]$SkipFirewall,
@@ -63,6 +75,11 @@ $FirewallGatewayRule = 'IDP-Agent-Gateway-Inbound'
 $FirewallBackendPublicRule = 'IDP-Backend-Inbound-PublicRestricted'
 $FirewallGatewayPublicRule = 'IDP-Agent-Gateway-Inbound-PublicRestricted'
 $FirewallGroup       = 'IDP Server'
+# Gateway kontrol dinleyicisi (tum HTTP uclari + backend aboneligi): sadece yerel. Firewall kurali ACILMAZ, tunele eklenmez.
+$GatewayControlHost  = '127.0.0.1'
+$GatewayControlPort  = 7004
+# .env'e tirnaksiz yazilabilecek degerler (IDP_AGENT_API_TOKEN kontroluyle ayni karakter kumesi).
+$EnvSafeValuePattern = '^[A-Za-z0-9._~+/=-]+$'
 $MinNodeVersion      = [version]'22.13.0'   # node:sqlite bayraksiz: 22.13+
 $HealthTimeoutSec    = 120
 $LogRotateBytes      = 20MB
@@ -249,6 +266,15 @@ function Remove-EnvKey($Lines, [string]$Key) {
 
 function Join-EnvLines($Lines) {
     return (($Lines -join "`n") + "`n")
+}
+
+# backend/src/config.js ile ayni kural: ws:// veya wss://, host zorunlu, kullanici bilgisi yok.
+# Ayrica bosluk, tirnak ve # yok: deger .env'e tirnaksiz yazilir.
+function Test-AgentPublicUrl([string]$Value) {
+    if ([string]::IsNullOrWhiteSpace($Value) -or $Value -match '[\s"''`#]') { return $false }
+    $uri = $null
+    if (-not [System.Uri]::TryCreate($Value, [System.UriKind]::Absolute, [ref]$uri)) { return $false }
+    return [bool](($uri.Scheme -eq 'ws' -or $uri.Scheme -eq 'wss') -and $uri.Host -and -not $uri.UserInfo)
 }
 
 # dotenv: tek tirnak ve ters tirnak icinde kacis islenmez; cift tirnak \n'i genisletir, kullanmiyoruz.
@@ -669,6 +695,25 @@ if (-not [Environment]::Is64BitProcess) {
     throw '64-bit Windows PowerShell gerekli (LocalAccounts modulu 32-bit oturumda yuklenmez): C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe'
 }
 if ($Port -eq $GatewayPort) { throw '-Port ve -GatewayPort ayni olamaz.' }
+if ($Port -eq $GatewayControlPort -or $GatewayPort -eq $GatewayControlPort) {
+    throw ('-Port ve -GatewayPort ' + $GatewayControlPort + ' olamaz (gateway kontrol dinleyicisinin portu).')
+}
+if ($PSBoundParameters.ContainsKey('AgentPublicUrl')) {
+    $AgentPublicUrl = ([string]$AgentPublicUrl).Trim()
+    if (-not (Test-AgentPublicUrl $AgentPublicUrl)) {
+        throw ('-AgentPublicUrl gecersiz: "' + $AgentPublicUrl + '". ws:// veya wss:// ile baslayan bir adres verin ' +
+            '(orn. wss://agent.ornek.com ya da ws://10.0.0.5:7003); bosluk, tirnak ve # iceremez.')
+    }
+}
+if ($CfAccessClientSecret -and -not $PSBoundParameters.ContainsKey('CfAccessClientId')) {
+    throw '-CfAccessClientSecret tek basina verilemez: -CfAccessClientId ile birlikte verin.'
+}
+if ($PSBoundParameters.ContainsKey('CfAccessClientId')) {
+    $CfAccessClientId = ([string]$CfAccessClientId).Trim()
+    if ($CfAccessClientId -notmatch $EnvSafeValuePattern) {
+        throw '-CfAccessClientId bos olamaz ve sadece harf, rakam ve . _ ~ + / = - icerebilir.'
+    }
+}
 foreach ($pair in @(@('-BindHost', $BindHost), @('-GatewayBindHost', $GatewayBindHost))) {
     $parsed = $null
     if (-not [System.Net.IPAddress]::TryParse([string]$pair[1], [ref]$parsed)) {
@@ -766,6 +811,8 @@ if ($Uninstall) {
 # ------------------------------------------------------------------ kurulum / guncelleme
 $servicePassword = $null
 $adminPasswordSecure = $null
+$cfSecretSecure = $null
+$agentPublicUrlSummary = ''
 $script:PasswordRotated = $false
 try {
     Write-Step 'On kontroller'
@@ -852,6 +899,19 @@ try {
         Write-Warn '-AdminPassword yok sayildi: kullanici dosyasi zaten var, parola degistirilmedi (uygulamadan degistirin).'
     }
 
+    # --- Cloudflare Access secret'i: -File ile SecureString gecmez; -CfAccessClientId verilip secret verilmediyse
+    # uzun adimlardan ONCE burada sorulur. Deger konsola yazilmaz.
+    if ($PSBoundParameters.ContainsKey('CfAccessClientId')) {
+        if ($CfAccessClientSecret) { $cfSecretSecure = $CfAccessClientSecret }
+        else { $cfSecretSecure = Read-Host 'Cloudflare Access Client Secret (-CfAccessClientId icin)' -AsSecureString }
+        $cfSecretCheck = ConvertTo-PlainText $cfSecretSecure
+        $cfSecretValid = ($cfSecretCheck -match $EnvSafeValuePattern)
+        $cfSecretCheck = $null
+        if (-not $cfSecretValid) {
+            throw 'Cloudflare Access Client Secret bos olamaz ve sadece harf, rakam ve . _ ~ + / = - icerebilir.'
+        }
+    }
+
     $isUpdate = [bool](Get-ScheduledTask -TaskName $BackendTaskName -ErrorAction SilentlyContinue)
     if ($isUpdate) { Write-Info 'Mevcut kurulum bulundu: GUNCELLEME modu (git pull yapilmaz).' }
 
@@ -860,6 +920,7 @@ try {
     Stop-IdpRuntime
     Assert-PortFree $Port 'Backend'
     Assert-PortFree $GatewayPort 'Gateway'
+    Assert-PortFree $GatewayControlPort 'Gateway kontrol'
 
     # --- 2) servis hesabi + "toplu is olarak oturum ac" hakki (kalip: install-runner-task.ps1:66-99)
     Write-Step 'Servis hesabi'
@@ -966,7 +1027,46 @@ try {
     Set-EnvValue $backendLines 'IDP_DB_PATH' $DbPath
     Set-EnvValue $backendLines 'IDP_USERS_PATH' $UsersPath
     Set-EnvValue $backendLines 'IDP_SESSIONS_PATH' $SessionsPath
-    Set-EnvValue $backendLines 'IDP_AGENT_API_URL' ('http://' + $gatewayProbeHost + ':' + $GatewayPort)
+    # Backend gateway'e yalnizca kontrol dinleyicisinden (127.0.0.1) konusur; 7003 artik sadece agent WebSocket'i.
+    Set-EnvValue $backendLines 'IDP_AGENT_API_URL' ('http://' + $GatewayControlHost + ':' + $GatewayControlPort)
+
+    # Agent paketlerine yazilan adres: parametre > .env'deki mevcut deger > ws://<ilk ic IP>:<GatewayPort> (ic ag).
+    $existingPublicUrl = Get-EnvValue $backendLines 'IDP_AGENT_PUBLIC_URL'
+    if ($PSBoundParameters.ContainsKey('AgentPublicUrl')) {
+        Set-EnvValue $backendLines 'IDP_AGENT_PUBLIC_URL' $AgentPublicUrl
+        $agentPublicUrlSummary = $AgentPublicUrl
+        Write-Info ('IDP_AGENT_PUBLIC_URL: ' + $AgentPublicUrl + ' (parametreden)')
+    }
+    elseif (-not [string]::IsNullOrWhiteSpace($existingPublicUrl)) {
+        $agentPublicUrlSummary = $existingPublicUrl.Trim()
+        if (-not (Test-AgentPublicUrl $agentPublicUrlSummary)) {
+            Write-Warn 'Mevcut IDP_AGENT_PUBLIC_URL gecersiz (ws:// veya wss:// olmali); agent kimligi uretimi 503 doner. -AgentPublicUrl ile duzeltin.'
+        }
+        Write-Info ('IDP_AGENT_PUBLIC_URL: mevcut deger korundu (' + $agentPublicUrlSummary + ')')
+    }
+    else {
+        $publicHost = [string](@(Get-ReachableHosts $GatewayBindHost) | Select-Object -First 1)
+        if ($publicHost.Contains(':')) { $publicHost = '[' + $publicHost + ']' }
+        $agentPublicUrlSummary = 'ws://' + $publicHost + ':' + $GatewayPort
+        Set-EnvValue $backendLines 'IDP_AGENT_PUBLIC_URL' $agentPublicUrlSummary
+        Write-Info ('IDP_AGENT_PUBLIC_URL: ' + $agentPublicUrlSummary + ' (varsayilan, ic ag). Internetten erisim icin -AgentPublicUrl wss://... verin.')
+    }
+
+    # Cloudflare Access cifti: parametre verildiyse ikisi birlikte yazilir; verilmediyse mevcut degerler korunur.
+    if ($cfSecretSecure) {
+        Set-EnvValue $backendLines 'IDP_AGENT_CF_ACCESS_CLIENT_ID' $CfAccessClientId
+        $cfSecretPlain = ConvertTo-PlainText $cfSecretSecure
+        Set-EnvValue $backendLines 'IDP_AGENT_CF_ACCESS_CLIENT_SECRET' $cfSecretPlain
+        $cfSecretPlain = $null
+        Write-Info 'IDP_AGENT_CF_ACCESS_CLIENT_ID / _SECRET: parametreden yazildi (secret konsola yazdirilmadi).'
+    }
+    $cfIdSet = -not [string]::IsNullOrWhiteSpace((Get-EnvValue $backendLines 'IDP_AGENT_CF_ACCESS_CLIENT_ID'))
+    $cfSecretSet = -not [string]::IsNullOrWhiteSpace((Get-EnvValue $backendLines 'IDP_AGENT_CF_ACCESS_CLIENT_SECRET'))
+    if ($cfIdSet -ne $cfSecretSet) {
+        throw ('IDP_AGENT_CF_ACCESS_CLIENT_ID ve IDP_AGENT_CF_ACCESS_CLIENT_SECRET ' + $BackendEnvPath + ' icinde birlikte olmali ' +
+            '(yalnizca biri dolu; backend bu durumda acilmaz). -CfAccessClientId ile ikisini birlikte verin ya da iki satiri da silin.')
+    }
+    if ($cfIdSet -and -not $cfSecretSecure) { Write-Info 'Cloudflare Access cifti: mevcut degerler korundu.' }
 
     if ($adminPasswordNeeded) {
         $adminPlain = ConvertTo-PlainText $adminPasswordSecure   # on kontrollerde alindi
@@ -990,6 +1090,8 @@ try {
     Set-EnvValue $gatewayLines 'NODE_ENV' 'production'
     Set-EnvValue $gatewayLines 'IDP_AGENT_GATEWAY_HOST' $GatewayBindHost
     Set-EnvValue $gatewayLines 'IDP_AGENT_GATEWAY_PORT' ([string]$GatewayPort)
+    Set-EnvValue $gatewayLines 'IDP_AGENT_GATEWAY_CONTROL_HOST' $GatewayControlHost
+    Set-EnvValue $gatewayLines 'IDP_AGENT_GATEWAY_CONTROL_PORT' ([string]$GatewayControlPort)
     if ([string]::IsNullOrWhiteSpace($tokenGateway)) { Set-EnvValue $gatewayLines 'IDP_AGENT_API_TOKEN' $agentToken }
     Set-EnvValue $gatewayLines 'IDP_AGENT_REGISTRY_PATH' $RegistryPath
     Write-ProtectedFile -Path $GatewayEnvPath -Content (Join-EnvLines $gatewayLines) -ServiceSid $ServiceSid
@@ -1061,6 +1163,11 @@ try {
     $backendLocalUrl = 'http://' + $backendProbeHost + ':' + $Port
     $gatewayOk = Wait-Until -TimeoutSeconds $HealthTimeoutSec -Condition { (Get-HttpStatus ($gatewayLocalUrl + '/health')) -eq 200 }
     Write-Info ('Gateway ' + $gatewayLocalUrl + '/health : ' + $(if ($gatewayOk) { 'OK' } else { 'YANIT YOK' }))
+    # Backend gateway'e yalnizca buradan konusur; yoksa ajan listesi/deploy calismaz (gateway kodu eski olabilir).
+    $gatewayControlUrl = 'http://' + $GatewayControlHost + ':' + $GatewayControlPort
+    $controlOk = Wait-Until -TimeoutSeconds 30 -Condition { (Get-HttpStatus ($gatewayControlUrl + '/health')) -eq 200 }
+    Write-Info ('Gateway kontrol ' + $gatewayControlUrl + '/health : ' + $(if ($controlOk) { 'OK' } else { 'YANIT YOK (gateway kodu kontrol dinleyicisini desteklemiyor olabilir)' }))
+    if ($controlOk -and -not (Test-ListenerIsOurs $GatewayControlPort $GatewayEntry)) { Write-Warn ('Port ' + $GatewayControlPort + ' IDP gateway surecine ait gorunmuyor.') }
     $backendOk = Wait-Until -TimeoutSeconds $HealthTimeoutSec -Condition {
         if ((Get-HttpStatus ($backendLocalUrl + '/api/health')) -eq 200) { return $true }
         $me = Get-HttpStatus ($backendLocalUrl + '/api/auth/me')
@@ -1085,10 +1192,10 @@ try {
         }
     }
 
-    if (-not ($gatewayOk -and $backendOk)) {
+    if (-not ($gatewayOk -and $controlOk -and $backendOk)) {
         Write-Host ''
         Write-Host 'Saglik kontrolu basarisiz. Tani:' -ForegroundColor Red
-        if (-not $gatewayOk) { Show-TaskDiagnostics $GatewayTaskName $GatewayLog }
+        if (-not ($gatewayOk -and $controlOk)) { Show-TaskDiagnostics $GatewayTaskName $GatewayLog }
         if (-not $backendOk) { Show-TaskDiagnostics $BackendTaskName $BackendLog }
         throw 'IDP servisleri saglik kontrolunu gecemedi (ayrintilar yukarida).'
     }
@@ -1100,10 +1207,13 @@ try {
     Write-Host '  Arayuz yalnizca Electron''da (backend tarayiciya arayuz sunmaz).'
     Write-Host '  Electron idp.env satiri (Araclar > Ayar dosyasini ac):'
     foreach ($h in $backendHosts) { Write-Host ('    IDP_SERVER_URL=http://' + $h + ':' + $Port) }
-    Write-Host '  Agent gateway WebSocket ("IDP Agent olustur" formundaki adres):'
+    Write-Host '  Agent gateway WebSocket (ic ag adresleri):'
     foreach ($h in $gatewayHosts) { Write-Host ('    ws://' + $h + ':' + $GatewayPort) }
     Write-Host ('    (bu makinedeki agent icin: ws://127.0.0.1:' + $GatewayPort + ')')
-    Write-Host ('  Agent formundaki token: ' + $GatewayEnvPath + ' icindeki IDP_AGENT_API_TOKEN (konsola yazdirilmadi)')
+    Write-Host ('  Agent paketlerine yazilan adres (IDP_AGENT_PUBLIC_URL): ' + $agentPublicUrlSummary)
+    Write-Host '  Agent kimligi: her agent icin IDP arayuzunden uretilir. IDP_AGENT_API_TOKEN artik sadece backend-gateway kontrol token''i, agent''a verilmez.'
+    Write-Host '  Eski agent ZIP''leri (paylasimli token) artik baglanamaz; yeniden uretin.'
+    Write-Host ('  Gateway kontrol API: ' + $GatewayControlHost + ':' + $GatewayControlPort + ' (sadece bu makine; firewall kurali yok, disari ACMAYIN)')
     Write-Host '  Loglar:'
     Write-Host ('    ' + $BackendLog)
     Write-Host ('    ' + $GatewayLog)
@@ -1141,4 +1251,5 @@ catch {
 finally {
     if ($servicePassword) { $servicePassword.Dispose() }
     if ($adminPasswordSecure -and -not $AdminPassword) { $adminPasswordSecure.Dispose() }
+    if ($cfSecretSecure -and -not $CfAccessClientSecret) { $cfSecretSecure.Dispose() }
 }

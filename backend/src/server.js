@@ -211,6 +211,17 @@ app.get('/api/agents', requirePermission('project:read'), async (_req, res) => {
   }
 });
 
+// Per-agent credentials: POST/DELETE /api/agents/:id/credentials — see
+// routes/agents.js. Same permission as building an agent package
+// ('project:write'); separately rate-limited because every POST rotates a
+// live agent's secret on the gateway (and disconnects it).
+const agentCredentialRateLimit = createRateLimit({ windowMs: 60 * 1000, max: 10 });
+app.use('/api/agents', require('./routes/agents').createAgentsRouter({
+  agentConfig: serverConfig.agentCredentials,
+  auditLogger,
+  rateLimit: agentCredentialRateLimit,
+}));
+
 app.post('/api/projects', requirePermission('project:write'), (req, res) => {
   const result = validate(req.body, createProjectSchema);
   if (!result.valid) {
