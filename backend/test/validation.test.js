@@ -390,6 +390,36 @@ test('validateProjectConfig: rejects non-string/oversized variable values, unkno
   assert.equal(validateProjectConfig({ ciConfig: { correlationInput: 'bad-name' } }).valid, false);
 });
 
+test('validateProjectConfig: rejects reserved variable names and keys over 100 characters (without echoing a huge key)', () => {
+  const reserved = validateProjectConfig(
+    JSON.parse('{"ciConfig":{"variables":{"__proto__":"x","constructor":"y","prototype":"z","OK":"1"}}}')
+  );
+  assert.equal(reserved.valid, false);
+  assert.deepEqual(reserved.errors.map((e) => e.path).sort(), [
+    'ciConfig.variables.__proto__',
+    'ciConfig.variables.constructor',
+    'ciConfig.variables.prototype',
+  ]);
+
+  assert.equal(validateProjectConfig({ ciConfig: { variables: { ['K'.repeat(100)]: 'x' } } }).valid, true);
+  assert.equal(validateProjectConfig({ ciConfig: { variables: { ['K'.repeat(101)]: 'x' } } }).valid, false);
+  const huge = validateProjectConfig({ ciConfig: { variables: { ['K'.repeat(200_000)]: 'x' } } });
+  assert.equal(huge.valid, false);
+  assert.ok(JSON.stringify(huge.errors).length < 500, 'the key is truncated in the error');
+});
+
+test('validateProjectConfig: ciConfig.baseUrl must be https:// (base config and environment overrides)', () => {
+  assert.equal(validateProjectConfig({ ciConfig: { baseUrl: 'https://ghe.acme.local/api/v3' } }).valid, true);
+
+  const plain = validateProjectConfig({ ciConfig: { baseUrl: 'http://ghe.acme.local/api/v3' } });
+  assert.equal(plain.valid, false);
+  assert.equal(plain.errors[0].path, 'ciConfig.baseUrl');
+
+  const override = validateProjectConfig({ environments: { Prod: { ciConfig: { baseUrl: 'http://ghe.acme.local/api/v3' } } } });
+  assert.equal(override.valid, false);
+  assert.ok(override.errors.some((e) => e.path === 'environments.Prod.ciConfig.baseUrl'), JSON.stringify(override.errors));
+});
+
 test('validateProjectConfig: an environment override with a partial ciConfig is accepted; its variables get a prefixed error path', () => {
   const ok = validateProjectConfig({
     ciConfig: VALID_CI_CONFIG,

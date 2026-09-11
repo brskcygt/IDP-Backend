@@ -71,7 +71,8 @@ const looseNestedConfig = () => optional(object({ allowUnknown: true }));
 const ciConfigRule = () => optional(object({
   fields: {
     platform: optional(string({ enum: CI_PLATFORMS, allowEmpty: true })),
-    baseUrl: optional(string({ max: 2000, pattern: /^https?:\/\/\S+$/ })),
+    // https only: every request to this URL carries the token.
+    baseUrl: optional(string({ max: 2000, pattern: /^https:\/\/\S+$/ })),
     owner: optional(string({ max: 255 })),
     repo: optional(string({ max: 255 })),
     refType: optional(string({ enum: CI_REF_TYPES, allowEmpty: true })),

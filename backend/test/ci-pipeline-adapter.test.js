@@ -13,12 +13,16 @@
 'use strict';
 
 const assert = require('node:assert/strict');
-const { test, mock } = require('node:test');
+const { test, mock, beforeEach } = require('node:test');
 
 const CiPipelineAdapter = require('../src/adapters/CiPipelineAdapter');
+const { pickDispatchedRun, actionsWebUrl, resetClaimedRuns } = require('../src/adapters/ci/GitHubActionsClient');
 
 // DeploymentAdapter#log() mirrors every line to stdout; keep the test output readable.
 mock.method(console, 'log', () => {});
+
+// Run ids claimed by the GitHub 204 fallback are process-wide; start every test clean.
+beforeEach(() => resetClaimedRuns());
 
 const TOKEN = 'tok_SUPER_SECRET_ci_token_1234567890';
 const EMAIL = 'deployer@example.com';
@@ -129,7 +133,7 @@ function bitbucketAdapter(fake, { ciConfig = {}, timing = {}, ...rest } = {}) {
     },
     apiToken: TOKEN,
     fetchImpl: fake.fetchImpl,
-    timing: { pollIntervalMs: 5, ...timing },
+    timing: { pollIntervalMs: 5, logRetryIntervalMs: 5, ...timing },
     ...rest,
   });
   const logs = [];
@@ -139,14 +143,16 @@ function bitbucketAdapter(fake, { ciConfig = {}, timing = {}, ...rest } = {}) {
 
 // ── Bitbucket: trigger ──────────────────────────────────────────────────────
 
-test('Bitbucket: trigger posts a custom-pipeline body and never sends or logs environment/confirmation or values', async () => {
+test('Bitbucket: trigger posts a custom-pipeline body and ignores every deploy parameter, variables included', async () => {
   const fake = createFakeFetch({ [TRIGGER_KEY]: bbTrigger });
   const { adapter, logs } = bitbucketAdapter(fake, { ciConfig: { refType: 'tag', ref: 'v2.5.0' } });
 
   const result = await adapter.trigger({
     environment: 'Prod',
     confirmation: 'My Project',
-    variables: { VERSION: '2.6.0', BRAND: 'temsa' },
+    // deploy:trigger is a deployer permission; the variables are admin-owned project config.
+    // A deployer must not be able to point customer A's pipeline at customer B.
+    variables: { CUSTOMER: 'B', VERSION: '2.6.0', BRAND: 'temsa' },
   });
 
   assert.deepEqual(result, {
@@ -165,17 +171,16 @@ test('Bitbucket: trigger posts a custom-pipeline body and never sends or logs en
     },
     variables: [
       { key: 'CUSTOMER', value: 'A' },
-      { key: 'VERSION', value: '2.6.0' },
-      { key: 'BRAND', value: 'temsa' },
+      { key: 'VERSION', value: '2.5.0' },
     ],
   });
-  assert.doesNotMatch(JSON.stringify(request.body), /Prod|My Project|environment|confirmation/);
+  assert.doesNotMatch(JSON.stringify(request.body), /Prod|My Project|environment|confirmation|2\.6\.0|temsa|BRAND/);
   assert.equal(request.headers.Authorization, `Bearer ${TOKEN}`);
   assert.equal(request.headers.Accept, 'application/json');
 
   const joined = logs.join('\n');
-  assert.match(joined, /with variables: CUSTOMER, VERSION, BRAND/);
-  assert.doesNotMatch(joined, /2\.6\.0|temsa|Prod|My Project/, 'only variable keys may be logged');
+  assert.match(joined, /with variables: CUSTOMER, VERSION$/m);
+  assert.doesNotMatch(joined, /2\.6\.0|temsa|BRAND|Prod|My Project/, 'deploy parameters are neither sent nor logged');
   assert.match(joined, /Triggered Bitbucket pipeline #42 on v2\.5\.0: https:\/\/bitbucket\.org\/acme\/web\/pipelines\/results\/42/);
 });
 
@@ -198,14 +203,27 @@ test('constructor lists every missing setting', () => {
   );
 });
 
-test('Bitbucket: trigger rejects invalid variable keys without echoing values', async () => {
+test('Bitbucket: trigger rejects invalid stored variable keys without echoing values', async () => {
   const fake = createFakeFetch({ [TRIGGER_KEY]: bbTrigger });
-  const { adapter } = bitbucketAdapter(fake);
+  const { adapter } = bitbucketAdapter(fake, { ciConfig: { variables: { 'BAD-KEY': 'secret-ish-value' } } });
   await assert.rejects(
-    adapter.trigger({ variables: { 'BAD-KEY': 'secret-ish-value' } }),
+    adapter.trigger({}),
     (err) => /BAD-KEY/.test(err.message) && !/secret-ish-value/.test(err.message)
   );
+
+  // A stored '__proto__' key is reported, not silently dropped.
+  const reserved = bitbucketAdapter(fake, { ciConfig: { variables: JSON.parse('{"__proto__":"x","A":"1"}') } });
+  await assert.rejects(reserved.adapter.trigger({}), /Variable name '__proto__' is reserved/);
   assert.equal(fake.requests.length, 0, 'nothing is sent when variables are invalid');
+});
+
+test('an http:// API base URL is refused before any request is made (the token never goes over cleartext)', () => {
+  const fake = createFakeFetch({});
+  assert.throws(
+    () => githubAdapter(fake, { ciConfig: { baseUrl: 'http://ghe.acme.local/api/v3' } }),
+    /must use https:\/\//
+  );
+  assert.equal(fake.requests.length, 0);
 });
 
 test('Bitbucket: trigger error surfaces HTTP status and error.message', async () => {
@@ -534,7 +552,7 @@ function githubAdapter(fake, { ciConfig = {}, timing = {}, ...rest } = {}) {
     },
     apiToken: TOKEN,
     fetchImpl: fake.fetchImpl,
-    timing: { pollIntervalMs: 5, correlationIntervalMs: 5, correlationTimeoutMs: 200, ...timing },
+    timing: { pollIntervalMs: 5, correlationIntervalMs: 5, correlationTimeoutMs: 200, logRetryIntervalMs: 5, ...timing },
     ...rest,
   });
   const logs = [];
@@ -621,9 +639,9 @@ test('GitHub: 422 "Unexpected inputs" explains that variables must be declared a
   const fake = createFakeFetch({
     [DISPATCH_KEY]: () => json(422, { message: 'Unexpected inputs provided: ["BRAND"]' }),
   });
-  const { adapter } = githubAdapter(fake);
+  const { adapter } = githubAdapter(fake, { ciConfig: { variables: { BRAND: 'temsa' } } });
   await assert.rejects(
-    adapter.trigger({ variables: { BRAND: 'temsa' } }),
+    adapter.trigger({}),
     /HTTP 422\): Unexpected inputs provided: \["BRAND"\].*declared under on\.workflow_dispatch\.inputs/
   );
 });
@@ -706,4 +724,209 @@ test('GitHub: abort cancels the run (202); 409 "already completed" is treated as
     assert.ok(!logs.some((line) => line.includes('Failed to cancel')), logs.join('\n'));
     await assert.rejects(adapter.streamLogs(() => {}), /Pipeline #17 was aborted\./);
   }
+});
+
+// ── GitHub: 204 fallback run matching ───────────────────────────────────────
+
+test('GitHub 204 heuristic: never picks a run created before the dispatch or one another deploy already claimed', async () => {
+  // Reviewer scenario, unit level: customer A's run was created 4s before B dispatched.
+  const dispatchStartedAt = Date.parse('2026-09-11T10:00:00Z');
+  const runOfA = { id: 'RUN_OF_CUSTOMER_A', created_at: new Date(dispatchStartedAt - 4000).toISOString() };
+  assert.deepEqual(pickDispatchedRun([runOfA], { correlationId: null, dispatchStartedAt }), { run: null, ambiguous: false });
+
+  // End to end: customer A's deploy resolves (and claims) run 100 ...
+  const fakeA = createFakeFetch({
+    [DISPATCH_KEY]: () => empty(204),
+    [LOOKUP_KEY]: () => json(200, { workflow_runs: [{ id: 100, run_number: 1, created_at: new Date().toISOString() }] }),
+  });
+  assert.equal((await githubAdapter(fakeA).adapter.trigger({})).runId, 100);
+
+  // ... then customer B's project (same workflow + ref) dispatches. Until B's run shows up the listing only
+  // has A's runs: the claimed one (inside the clock-skew allowance) and one created 4s before the dispatch.
+  const runsOfA = [
+    { id: 100, run_number: 1, created_at: new Date().toISOString() },
+    { id: 99, run_number: 0, created_at: new Date(Date.now() - 4000).toISOString() },
+  ];
+  const fakeB = createFakeFetch({
+    [DISPATCH_KEY]: () => empty(204),
+    [LOOKUP_KEY]: [
+      () => json(200, { workflow_runs: runsOfA }),
+      () => json(200, { workflow_runs: [{ id: 200, run_number: 2, html_url: RUN_HTML, created_at: new Date().toISOString() }, ...runsOfA] }),
+    ],
+  });
+  const b = githubAdapter(fakeB, { ciConfig: { variables: { customer: 'B' } } });
+  assert.equal((await b.adapter.trigger({})).runId, 200);
+  assert.equal(fakeB.count(LOOKUP_KEY), 2, "B kept looking instead of latching onto A's run");
+  assert.ok(b.logs.some((line) => /Matching is heuristic/.test(line)), 'a single candidate is still flagged as heuristic');
+});
+
+test('GitHub 204 heuristic: several unclaimed candidates fail the deploy instead of guessing; a correlation input still matches', async () => {
+  const now = () => new Date().toISOString();
+  const fake = createFakeFetch({
+    [DISPATCH_KEY]: () => empty(204),
+    [LOOKUP_KEY]: () => json(200, { workflow_runs: [{ id: 301, created_at: now() }, { id: 302, created_at: now() }] }),
+  });
+  const { adapter } = githubAdapter(fake);
+  await assert.rejects(
+    adapter.trigger({}),
+    (err) =>
+      /dispatched, but its run could not be identified unambiguously/.test(err.message) &&
+      /Configure a "Correlation input"/.test(err.message) &&
+      err.message.includes('https://github.com/acme/web/actions/workflows/deploy.yml')
+  );
+  assert.equal(adapter.runId, null);
+  assert.equal(fake.count(LOOKUP_KEY), 1, 'ambiguity is final — no further lookups');
+  assert.ok(!fake.requests.some((r) => r.path.endsWith('/cancel')), 'no run is cancelled');
+
+  // The same kind of listing with a correlation input: the run carrying our id is picked exactly.
+  const correlated = createFakeFetch({
+    [DISPATCH_KEY]: () => empty(204),
+    [LOOKUP_KEY]: () => {
+      const sentId = correlated.requests.find((r) => r.key === DISPATCH_KEY).body.inputs.idp_correlation_id;
+      return json(200, {
+        workflow_runs: [
+          { id: 401, display_title: 'Deploy other-id', created_at: now() },
+          { id: 402, run_number: 5, display_title: `Deploy ${sentId}`, created_at: now() },
+        ],
+      });
+    },
+  });
+  const matched = githubAdapter(correlated, { ciConfig: { correlationInput: 'idp_correlation_id' } });
+  assert.equal((await matched.adapter.trigger({})).runId, 402);
+
+  assert.equal(
+    actionsWebUrl({ baseUrl: 'https://ghe.acme.local/api/v3', owner: 'acme', repo: 'web', pipeline: 'deploy.yml' }),
+    'https://ghe.acme.local/acme/web/actions/workflows/deploy.yml'
+  );
+});
+
+// ── final flush: late logs, abort ───────────────────────────────────────────
+
+const GH_JOB_DONE = {
+  id: 77,
+  name: 'build',
+  status: 'completed',
+  conclusion: 'success',
+  started_at: '2026-09-11T10:00:00Z',
+  completed_at: '2026-09-11T10:00:14Z',
+  steps: [],
+};
+
+test('GitHub: a job log that 404s while it is archived is re-read after a wait and emitted before success', async () => {
+  let firstLogRequestAt = null;
+  const fake = createFakeFetch({
+    [DISPATCH_KEY]: ghDispatchOk,
+    // [0] trigger's run lookup; [1] the run finishes in the same tick as its only job.
+    [GH_RUN_KEY]: [ghRun('queued'), ghRun('completed', 'success')],
+    [GH_JOBS_KEY]: () => json(200, { jobs: [GH_JOB_DONE] }),
+    // Not archived for the first 25ms: back-to-back reads all 404, a read after a wait succeeds.
+    [GH_JOB_LOG_KEY]: () => {
+      firstLogRequestAt ??= Date.now();
+      return Date.now() - firstLogRequestAt < 25
+        ? json(404, { message: 'Not Found' })
+        : new Response('2026-09-11T10:00:13.0000000Z deployed customer A\n', { status: 200 });
+    },
+  });
+  const { adapter, logs } = githubAdapter(fake, { timing: { logRetryIntervalMs: 30 } });
+  await adapter.trigger({});
+
+  const streamed = [];
+  await adapter.streamLogs((line) =>
+    streamed.push({ line, afterSuccess: logs.some((l) => l.includes('✓ Pipeline #17 succeeded')) })
+  );
+
+  assert.deepEqual(streamed, [{ line: '[CI] deployed customer A', afterSuccess: false }]);
+  assert.ok(fake.count(GH_JOB_LOG_KEY) >= 3, `log requests: ${fake.count(GH_JOB_LOG_KEY)}`);
+  assert.ok(logs.some((l) => l.includes('✓ Pipeline #17 succeeded')), logs.join('\n'));
+});
+
+test('GitHub: abort() during a final-flush log wait settles promptly and is not reported as success', async () => {
+  const fake = createFakeFetch({
+    [DISPATCH_KEY]: ghDispatchOk,
+    [GH_RUN_KEY]: [ghRun('queued'), ghRun('completed', 'success')],
+    [GH_JOBS_KEY]: () => json(200, { jobs: [GH_JOB_DONE] }),
+    [GH_JOB_LOG_KEY]: () => json(404, { message: 'Not Found' }),
+    [GH_CANCEL_KEY]: () => json(409, { message: 'Cannot cancel a workflow run that is completed.' }),
+  });
+  // The real 3s wait: if it weren't abortable this test would take ≥3s.
+  const { adapter, logs } = githubAdapter(fake, { timing: { logRetryIntervalMs: 3000 } });
+  await adapter.trigger({});
+
+  const streaming = adapter.streamLogs(() => {});
+  streaming.catch(() => {});
+  await waitFor(() => fake.count(GH_JOB_LOG_KEY) === 2); // the final flush's first read — now parked in the wait
+  await new Promise((resolve) => setTimeout(resolve, 20));
+
+  const startedAt = Date.now();
+  await adapter.abort();
+  await assert.rejects(streaming, /Pipeline #17 was aborted\./);
+  const elapsedMs = Date.now() - startedAt;
+  assert.ok(elapsedMs < 500, `streamLogs took ${elapsedMs}ms to settle after abort()`);
+  assert.ok(!logs.some((line) => line.includes('Pipeline #17 succeeded')), logs.join('\n'));
+});
+
+test('Bitbucket: abort() during the final flush of a successful run rejects as aborted, never as success', async () => {
+  const fake = createFakeFetch({
+    [TRIGGER_KEY]: bbTrigger,
+    [`GET ${STEPS_PATH}`]: [
+      stepsOf(bbStep(completed({ name: 'SUCCESSFUL' }))),
+      () => new Promise(() => {}), // the final flush's step listing hangs until aborted
+    ],
+    [`GET ${LOG_PATH}`]: () => empty(416),
+    [`GET ${RUN_PATH}`]: pipelineState(completed({ name: 'SUCCESSFUL' })),
+    [`POST ${STOP_PATH}`]: () => json(400, { error: { message: 'Pipeline already completed' } }),
+  });
+  const { adapter, logs } = bitbucketAdapter(fake);
+  await adapter.trigger({});
+
+  const streaming = adapter.streamLogs(() => {});
+  streaming.catch(() => {});
+  await waitFor(() => fake.count(`GET ${STEPS_PATH}`) === 2);
+
+  await adapter.abort();
+  await assert.rejects(streaming, /Pipeline #42 was aborted\./);
+  assert.ok(!logs.some((line) => line.includes('Pipeline #42 succeeded')), logs.join('\n'));
+});
+
+test('Bitbucket: a finished step whose log briefly 404s (moving to long-term storage) is re-read, not cut off', async () => {
+  const fake = createFakeFetch({
+    [TRIGGER_KEY]: bbTrigger,
+    [`GET ${STEPS_PATH}`]: stepsOf(bbStep(completed({ name: 'SUCCESSFUL' }))),
+    [`GET ${LOG_PATH}`]: [
+      () => json(404, { error: { message: 'Log not found' } }),
+      () => json(404, { error: { message: 'Log not found' } }),
+      () => new Response('deployed\ntail without newline', { status: 200 }),
+    ],
+    [`GET ${RUN_PATH}`]: pipelineState(completed({ name: 'SUCCESSFUL' })),
+  });
+  const { adapter, logs } = bitbucketAdapter(fake);
+  await adapter.trigger({});
+
+  const streamed = [];
+  await adapter.streamLogs((line) => streamed.push(line));
+
+  assert.deepEqual(streamed, ['[CI] deployed', '[CI] tail without newline']);
+  assert.equal(fake.count(`GET ${LOG_PATH}`), 3);
+  assert.ok(lineMessages(logs).includes('[CI] ✓ Deploy succeeded (12s)'), logs.join('\n'));
+});
+
+test('Bitbucket: when the final log read fails transiently, the buffered partial last line is still emitted', async () => {
+  const partial = Buffer.from('line one\npartial', 'utf8');
+  const fake = createFakeFetch({
+    [TRIGGER_KEY]: bbTrigger,
+    [`GET ${STEPS_PATH}`]: stepsOf(bbStep(completed({ name: 'SUCCESSFUL' }))),
+    [`GET ${LOG_PATH}`]: [
+      () => new Response(partial, { status: 206, headers: { 'content-range': `bytes 0-${partial.length - 1}/*` } }),
+      () => json(500, { error: { message: 'Internal error' } }),
+    ],
+    [`GET ${RUN_PATH}`]: pipelineState(completed({ name: 'SUCCESSFUL' })),
+  });
+  const { adapter, logs } = bitbucketAdapter(fake);
+  await adapter.trigger({});
+
+  const streamed = [];
+  await adapter.streamLogs((line) => streamed.push(line));
+
+  assert.deepEqual(streamed, ['[CI] line one', '[CI] partial']);
+  assert.equal(logs.filter((line) => line.includes("⚠ Could not read the log of 'Deploy'")).length, 1);
 });

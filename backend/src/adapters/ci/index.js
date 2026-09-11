@@ -38,6 +38,10 @@ function createCiClient(ciConfig, {
   correlation,
 } = {}) {
   const normalized = config.normalizeCiConfig(ciConfig);
+  // Also enforced on save (projectSchemas.js); re-checked here because every request carries the token.
+  if (normalized.baseUrl && !/^https:\/\//i.test(normalized.baseUrl)) {
+    throw new Error('CI Pipeline API base URL must use https:// — the token is never sent over plain HTTP.');
+  }
   const options = { token, username, fetchImpl, signal, requestTimeoutMs, sleep, correlation };
   if (normalized.platform === 'bitbucket') return new BitbucketPipelinesClient(normalized, options);
   if (normalized.platform === 'github') return new GitHubActionsClient(normalized, options);

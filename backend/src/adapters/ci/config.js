@@ -25,6 +25,11 @@ const DEFAULT_BASE_URLS = {
 
 /** Variable (and GitHub workflow input) names: shell-safe identifiers. */
 const VARIABLE_KEY_PATTERN = /^[A-Za-z_][A-Za-z0-9_]*$/;
+/** Match the key pattern but cannot round-trip as plain object keys. */
+const RESERVED_VARIABLE_KEYS = new Set(['__proto__', 'constructor', 'prototype']);
+const MAX_VARIABLE_KEY_LENGTH = 100;
+/** How much of an over-long key is echoed back in an error message. */
+const KEY_ECHO_LENGTH = 40;
 const MAX_VARIABLES = 25;
 const MAX_VARIABLE_VALUE_LENGTH = 2000;
 
@@ -60,7 +65,14 @@ function toStringVariables(variables) {
   if (!isPlainObject(variables)) return out;
   for (const [key, value] of Object.entries(variables)) {
     if (value === null || value === undefined) continue;
-    out[key] = typeof value === 'object' ? value : String(value);
+    // defineProperty, not assignment: a '__proto__' key must stay an own
+    // entry so validateCiVariables() reports it instead of it silently vanishing.
+    Object.defineProperty(out, key, {
+      value: typeof value === 'object' ? value : String(value),
+      enumerable: true,
+      writable: true,
+      configurable: true,
+    });
   }
   return out;
 }
@@ -80,7 +92,14 @@ function validateCiVariables(variables) {
     errors.push({ key: null, message: `At most ${MAX_VARIABLES} variables are allowed (got ${entries.length}).` });
   }
   for (const [key, value] of entries) {
-    if (!VARIABLE_KEY_PATTERN.test(key)) {
+    if (key.length > MAX_VARIABLE_KEY_LENGTH) {
+      const shown = `${key.slice(0, KEY_ECHO_LENGTH)}…`;
+      errors.push({ key: shown, message: `Variable name '${shown}' is longer than ${MAX_VARIABLE_KEY_LENGTH} characters.` });
+      continue; // the value is not checked either: the entry is rejected as a whole
+    }
+    if (RESERVED_VARIABLE_KEYS.has(key)) {
+      errors.push({ key, message: `Variable name '${key}' is reserved — choose another name.` });
+    } else if (!VARIABLE_KEY_PATTERN.test(key)) {
       errors.push({
         key,
         message: `Variable name '${key}' is invalid — use letters, digits and underscores, not starting with a digit.`,
@@ -147,6 +166,8 @@ module.exports = {
   CI_AUTH_TYPES,
   DEFAULT_BASE_URLS,
   VARIABLE_KEY_PATTERN,
+  RESERVED_VARIABLE_KEYS,
+  MAX_VARIABLE_KEY_LENGTH,
   MAX_VARIABLES,
   MAX_VARIABLE_VALUE_LENGTH,
   POLL_INTERVAL_SECONDS,

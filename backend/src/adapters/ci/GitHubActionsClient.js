@@ -4,7 +4,7 @@
  * GitHub Actions REST client for the CI Pipeline provider.
  *
  * Implements the CI client interface used by CiPipelineAdapter:
- *   verify(), trigger(), getRun(), listSteps(), readStepLog(), cancel().
+ *   verify(), trigger(), getRun(), listSteps(), readStepLog(), flushPending(), cancel().
  *
  * API base: `{baseUrl}/repos/{owner}/{repo}` — `https://api.github.com` or
  * `https://HOST/api/v3` for GitHub Enterprise Server. "Steps" at the adapter
@@ -13,20 +13,74 @@
  * is downloaded once, after the job completes.
  */
 
-const { ciFetch, readBody, drain, toHttpError, CiHttpError, isTransientError } = require('./http');
+const {
+  ciFetch,
+  readBody,
+  drain,
+  toHttpError,
+  CiHttpError,
+  isTransientError,
+  LOG_NOT_AVAILABLE_BUDGET_MS,
+} = require('./http');
 
 const TERMINAL_JOB_PHASES = new Set(['succeeded', 'failed', 'cancelled', 'skipped']);
 const LOG_TIMESTAMP_PREFIX = /^\d{4}-\d{2}-\d{2}T[\d:.]+Z /;
 const MAX_JOB_LOG_LINES = 10_000;
 const JOB_LOG_TIMEOUT_MS = 60_000;
-/** A just-finished job's log can briefly 404 before it is archived. */
-const MAX_LOG_NOT_FOUND_ATTEMPTS = 3;
 const DEFAULT_CORRELATION_INTERVAL_MS = 3_000;
 const DEFAULT_CORRELATION_TIMEOUT_MS = 60_000;
-/** Heuristic 204 fallback: accept runs created up to this long before the dispatch. */
-const HEURISTIC_WINDOW_MS = 15_000;
+/** Heuristic 204 fallback: clock-skew allowance for "created after our dispatch started". */
+const DISPATCH_CLOCK_SKEW_MS = 2_000;
+/** Run ids remembered per repository; the oldest claims are dropped beyond this. */
+const MAX_CLAIMED_RUNS_PER_REPO = 500;
 
 const enc = encodeURIComponent;
+
+/**
+ * `baseUrl/owner/repo` -> ids (as strings) of the runs deploys in this process
+ * already resolved. The 204 heuristic never picks one of them, so two deploys
+ * of the same workflow and ref cannot end up watching (and cancelling) the
+ * same run.
+ * @type {Map<string, Set<string>>}
+ */
+const claimedRuns = new Map();
+
+function claimedRunsFor(repoKey) {
+  let claimed = claimedRuns.get(repoKey);
+  if (!claimed) {
+    claimed = new Set();
+    claimedRuns.set(repoKey, claimed);
+  }
+  return claimed;
+}
+
+function claimRun(repoKey, runId) {
+  const claimed = claimedRunsFor(repoKey);
+  claimed.add(String(runId));
+  // Sets iterate in insertion order: drop the oldest claims first.
+  while (claimed.size > MAX_CLAIMED_RUNS_PER_REPO) claimed.delete(claimed.values().next().value);
+}
+
+/** Test seam: forget every claimed run. */
+function resetClaimedRuns() {
+  claimedRuns.clear();
+}
+
+/** Web page listing the workflow's runs: github.com, or the GHES host (API base minus `/api/v3`). */
+function actionsWebUrl({ baseUrl, owner, repo, pipeline }) {
+  let web = 'https://github.com';
+  try {
+    const url = new URL(baseUrl);
+    if (url.hostname !== 'api.github.com') {
+      web = `${url.origin}${url.pathname.replace(/\/api\/v3\/?$/i, '').replace(/\/+$/, '')}`;
+    }
+  } catch (_err) {
+    // Keep github.com — this URL is only a hint in an error message.
+  }
+  // The web UI addresses workflows by file name, not by numeric id.
+  const page = /^\d+$/.test(pipeline) ? 'actions' : `actions/workflows/${enc(pipeline)}`;
+  return `${web}/${enc(owner)}/${enc(repo)}/${page}`;
+}
 
 function check(name, ok, detail) {
   return { name, ok, detail };
@@ -79,18 +133,26 @@ function parseJobLog(text) {
 }
 
 /**
- * Picks the run a 204 dispatch created: by correlation id in `display_title`
- * when available, otherwise the newest run created around the dispatch time.
+ * Picks the run a 204 dispatch created. With a correlation id: the run whose
+ * `display_title` carries it (exact). Without one: the only run created since
+ * the dispatch started (minus DISPATCH_CLOCK_SKEW_MS) that no other deploy in
+ * this process has claimed. Several such candidates are reported as
+ * ambiguous — never guessed.
+ *
+ * @param {object[]} runs - `workflow_runs` of the runs listing.
+ * @param {{ correlationId?: string|null, dispatchStartedAt: number, claimed?: Set<string> }} options
+ * @returns {{ run: object|null, ambiguous: boolean }}
  */
-function pickDispatchedRun(runs, { correlationId, triggerTime }) {
-  if (!Array.isArray(runs)) return null;
+function pickDispatchedRun(runs, { correlationId, dispatchStartedAt, claimed = new Set() } = {}) {
+  if (!Array.isArray(runs)) return { run: null, ambiguous: false };
   if (correlationId) {
-    return runs.find((run) => typeof run.display_title === 'string' && run.display_title.includes(correlationId)) || null;
+    const run = runs.find((item) => item && typeof item.display_title === 'string' && item.display_title.includes(correlationId));
+    return { run: run || null, ambiguous: false };
   }
-  const cutoff = triggerTime - HEURISTIC_WINDOW_MS;
-  return runs
-    .filter((run) => Date.parse(run.created_at) >= cutoff)
-    .sort((a, b) => Date.parse(b.created_at) - Date.parse(a.created_at))[0] || null;
+  const cutoff = dispatchStartedAt - DISPATCH_CLOCK_SKEW_MS;
+  const candidates = runs.filter((item) => item && !claimed.has(String(item.id)) && Date.parse(item.created_at) >= cutoff);
+  if (candidates.length > 1) return { run: null, ambiguous: true };
+  return { run: candidates[0] || null, ambiguous: false };
 }
 
 function decorateDispatchError(err) {
@@ -134,6 +196,7 @@ class GitHubActionsClient {
     this._authorization = `Bearer ${token}`;
     this._repoBase = `${ciConfig.baseUrl}/repos/${enc(ciConfig.owner)}/${enc(ciConfig.repo)}`;
     this._workflowBase = `${this._repoBase}/actions/workflows/${enc(ciConfig.pipeline)}`;
+    this._repoKey = `${ciConfig.baseUrl}/${ciConfig.owner}/${ciConfig.repo}`.toLowerCase();
     this._sleep = sleep || ((ms) => new Promise((resolve) => setTimeout(resolve, ms)));
     this._correlation = {
       intervalMs: (correlation && correlation.intervalMs) ?? DEFAULT_CORRELATION_INTERVAL_MS,
@@ -269,19 +332,22 @@ class GitHubActionsClient {
     const { ref, correlationInput } = this.cfg;
     const inputs = { ...(variables || {}) };
     if (correlationInput) inputs[correlationInput] = correlationId;
-    const triggerTime = Date.now();
 
+    // Recorded right before each POST: the 204 heuristic only accepts runs created after it.
+    let dispatchStartedAt = Date.now();
     let response = await this._dispatch({ ref, inputs, return_run_details: true });
     if (response.status === 422) {
       const err = await toHttpError(response, 'Workflow dispatch');
       // Older GHES versions reject the parameter; retry once without it (→ 204 path).
       if (!/return_run_details/i.test(err.providerMessage)) throw decorateDispatchError(err);
+      dispatchStartedAt = Date.now();
       response = await this._dispatch({ ref, inputs });
     }
 
     if (response.status === 200) {
       const data = await readBody(response, 'json', { label: 'Workflow dispatch' });
       if (data && data.workflow_run_id) {
+        claimRun(this._repoKey, data.workflow_run_id);
         const details = await this._runDetails(data.workflow_run_id);
         return {
           runId: data.workflow_run_id,
@@ -290,11 +356,11 @@ class GitHubActionsClient {
           matchedBy: 'direct',
         };
       }
-      return this._findDispatchedRun({ correlationId, triggerTime });
+      return this._findDispatchedRun({ correlationId, dispatchStartedAt });
     }
     if (response.status === 204) {
       await drain(response);
-      return this._findDispatchedRun({ correlationId, triggerTime });
+      return this._findDispatchedRun({ correlationId, dispatchStartedAt });
     }
     throw decorateDispatchError(await toHttpError(response, 'Workflow dispatch'));
   }
@@ -317,7 +383,7 @@ class GitHubActionsClient {
     }
   }
 
-  async _findDispatchedRun({ correlationId, triggerTime }) {
+  async _findDispatchedRun({ correlationId, dispatchStartedAt }) {
     const { ref, correlationInput } = this.cfg;
     const branch = ref.replace(/^refs\/(heads|tags)\//, '');
     const url = `${this._workflowBase}/runs?event=workflow_dispatch&branch=${enc(branch)}&per_page=20`;
@@ -325,25 +391,38 @@ class GitHubActionsClient {
     let lastError = null;
 
     for (;;) {
+      let ambiguous = false;
       try {
         const response = await this._send(url, { label: 'Workflow run lookup', abortable: false });
         if (!response.ok) throw await toHttpError(response, 'Workflow run lookup');
         const data = await readBody(response, 'json', { label: 'Workflow run lookup' });
-        const match = pickDispatchedRun(data && data.workflow_runs, {
+        const pick = pickDispatchedRun(data && data.workflow_runs, {
           correlationId: correlationInput ? correlationId : null,
-          triggerTime,
+          dispatchStartedAt,
+          claimed: claimedRunsFor(this._repoKey),
         });
-        if (match) {
+        if (pick.run) {
+          claimRun(this._repoKey, pick.run.id);
           return {
-            runId: match.id,
-            runNumber: match.run_number ?? null,
-            webUrl: match.html_url || null,
+            runId: pick.run.id,
+            runNumber: pick.run.run_number ?? null,
+            webUrl: pick.run.html_url || null,
             matchedBy: correlationInput ? 'correlation' : 'heuristic',
           };
         }
+        ambiguous = pick.ambiguous;
       } catch (err) {
         if (!isTransientError(err)) throw err;
         lastError = err;
+      }
+      if (ambiguous) {
+        // Guessing could latch onto another deploy's run — and aborting this deploy would then cancel it.
+        throw new CiHttpError(
+          'The workflow was dispatched, but its run could not be identified unambiguously: several ' +
+            `workflow_dispatch runs of '${this.cfg.pipeline}' on '${branch}' started at the same time. ` +
+            'Configure a "Correlation input" for exact matching. IDP is not watching or cancelling any run — ' +
+            `check GitHub manually before re-running: ${actionsWebUrl(this.cfg)}`
+        );
       }
       const remaining = deadline - Date.now();
       if (remaining <= 0) break;
@@ -398,7 +477,7 @@ class GitHubActionsClient {
    * @returns {Promise<{ lines: string[], cursor: object, done: boolean }>}
    */
   async readStepLog(runId, job, cursor) {
-    const state = cursor || { fetched: false, notFound: 0 };
+    const state = cursor || { fetched: false, notFoundSince: null };
     if (state.fetched) return { lines: [], cursor: state, done: true };
     if (!TERMINAL_JOB_PHASES.has(job.phase)) return { lines: [], cursor: state, done: false };
     if (job.phase === 'skipped') return { lines: [], cursor: { ...state, fetched: true }, done: true };
@@ -409,9 +488,10 @@ class GitHubActionsClient {
     });
     if (response.status === 404 || response.status === 410) {
       await drain(response);
-      const notFound = state.notFound + 1;
-      if (response.status === 404 && notFound < MAX_LOG_NOT_FOUND_ATTEMPTS) {
-        return { lines: [], cursor: { ...state, notFound }, done: false };
+      // Time-based, not attempt-based: the final flush may re-read within milliseconds.
+      const notFoundSince = state.notFoundSince ?? Date.now();
+      if (response.status === 404 && Date.now() - notFoundSince < LOG_NOT_AVAILABLE_BUDGET_MS) {
+        return { lines: [], cursor: { ...state, notFoundSince }, done: false };
       }
       return {
         lines: [`⚠ Logs not available for job '${job.name}' (HTTP ${response.status}).`],
@@ -422,6 +502,11 @@ class GitHubActionsClient {
     if (!response.ok) throw await toHttpError(response, 'Job log');
     const text = await readBody(response, 'text', { label: 'Job log', signal: this._signal });
     return { lines: parseJobLog(text), cursor: { ...state, fetched: true }, done: true };
+  }
+
+  /** Job logs are downloaded whole, so there is never a buffered partial line. */
+  flushPending() {
+    return [];
   }
 
   /** Cancels the run. 202 → accepted; 409 → already completed (treated as ok). */
@@ -444,3 +529,5 @@ module.exports.mapRunStatus = mapRunStatus;
 module.exports.mapJobPhase = mapJobPhase;
 module.exports.parseJobLog = parseJobLog;
 module.exports.pickDispatchedRun = pickDispatchedRun;
+module.exports.actionsWebUrl = actionsWebUrl;
+module.exports.resetClaimedRuns = resetClaimedRuns;

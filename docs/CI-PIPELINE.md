@@ -48,13 +48,13 @@ Ayarlar `project.config.ciConfig` altında tutulur. Token ve e-posta mevcut orta
 | Alan | Zorunlu | Açıklama |
 |---|---|---|
 | `platform` | Evet | `bitbucket` veya `github` |
-| `baseUrl` | Hayır | API adresi. Boşsa `https://api.bitbucket.org/2.0` / `https://api.github.com`. GitHub Enterprise: `https://HOST/api/v3` |
+| `baseUrl` | Hayır | API adresi. Boşsa `https://api.bitbucket.org/2.0` / `https://api.github.com`. GitHub Enterprise: `https://HOST/api/v3`. Sadece `https://` kabul edilir: token her istekte gider, düz HTTP'den asla gönderilmez |
 | `owner` | Evet | Bitbucket workspace slug'ı / GitHub owner veya organizasyon |
 | `repo` | Evet | Repo slug'ı / adı |
 | `refType` | Hayır | Sadece Bitbucket: `branch` (varsayılan) veya `tag` |
 | `ref` | Evet | Branch veya tag adı, örn. `master`, `v2.5.0` (GitHub `ref` ikisini de kabul eder) |
 | `pipeline` | Evet | Bitbucket: custom pipeline adı. GitHub: workflow dosya adı (`deploy.yml`) veya numerik id |
-| `variables` | Hayır | `ANAHTAR: değer` çiftleri. Anahtar `^[A-Za-z_][A-Za-z0-9_]*$`, değer en fazla 2000 karakter, en fazla 25 değişken |
+| `variables` | Hayır | `ANAHTAR: değer` çiftleri. Anahtar `^[A-Za-z_][A-Za-z0-9_]*$`, en fazla 100 karakter; `__proto__`, `constructor`, `prototype` kullanılamaz. Değer en fazla 2000 karakter, en fazla 25 değişken. Sadece proje ayarlarından gelir (bkz. §8) |
 | `authType` | Hayır | Sadece Bitbucket: `bearer` (Access Token, varsayılan) veya `basic` (Atlassian e-posta + API token). GitHub her zaman bearer |
 | `pollIntervalSeconds` | Hayır | Durum sorgulama aralığı. Varsayılan 10, en az 3, en fazla 60 |
 | `timeoutMinutes` | Hayır | IDP'nin pipeline'ı izleme süresi. Varsayılan 60, en az 1, en fazla 720 |
@@ -163,8 +163,14 @@ sürümlerinde yanıt `204` olur ve IDP run'ı liste üzerinden bulmak zorunda k
 
 - `correlationInput` ayarlıysa (örnekteki `idp_correlation_id`), IDP bu input'a benzersiz bir id yazar ve
   `run-name` içinde bu id'yi taşıyan run'ı seçer. Workflow `run-name` satırında input'u kullanmalıdır.
-- Ayarlı değilse, dispatch anından hemen sonra oluşan en yeni run seçilir ve logda bunun **tahmini**
-  olduğu yazılır. Aynı workflow'u aynı anda başka biri de tetiklerse yanlış run izlenebilir.
+- Ayarlı değilse IDP run'ı tahminle bulur. Aday sayılan run'lar: dispatch isteğinden hemen önce kaydedilen
+  andan sonra (saat farkı için 2 sn pay) oluşmuş ve bu IDP sürecindeki başka bir deploy'un zaten sahiplendiği
+  run'lar dışındakiler. **Tek aday** varsa o seçilir ve logda eşleşmenin **tahmini** olduğu yazılır.
+  **Birden fazla aday** varsa (aynı workflow ve ref aynı anda birden çok kez tetiklendiyse) IDP tahmin
+  etmez: deploy `run could not be identified unambiguously` hatasıyla başarısız olur ve GitHub Actions
+  sayfasının linkini verir. Bu durumda IDP hiçbir run'ı izlemez ve iptal etmez. Workflow büyük olasılıkla
+  çalışıyordur, GitHub'da kontrol edin. Aynı workflow'u paylaşan müşteri başına projelerde
+  `correlationInput` kullanın.
 
 ## 7. Çalışma semantiği
 
@@ -181,7 +187,15 @@ sürümlerinde yanıt `204` olur ve IDP run'ı liste üzerinden bulmak zorunda k
   `was cancelled outside IDP` hatasıyla başarısız olur.
 - **Loglar:** Bitbucket'ta adım logları **canlı** akar. GitHub'ın canlı log API'si yoktur: her job
   **bittikten sonra** logu bir kez indirilir; job çalışırken sadece adım ilerleme satırları görünür
-  (`▶ build › npm ci`, `✓ build › npm ci (12s)`). Her durumda loglar `[CI]` önekiyle gelir.
+  (`▶ build › npm ci`, `✓ build › npm ci (12s)`). Her durumda loglar `[CI]` önekiyle gelir. Run biterken
+  henüz arşivlenmemiş bir log (HTTP 404) ilk 404'ten sonra ~30 sn boyunca, birkaç saniye arayla yeniden
+  denenir.
+- **Tetikleme isteği idempotent değildir.** Tetikleme isteği zaman aşımına uğrarsa veya yanıtı okunamazsa
+  IDP deploy'u `Failed to trigger ...` hatasıyla başarısız sayar, ama pipeline yine de başlamış olabilir.
+  Yeniden deploy etmeden önce Bitbucket/GitHub'da çalışan bir run olup olmadığını kontrol edin, yoksa aynı
+  deploy iki kez çalışabilir.
+- **Eski GHES, `correlationInput` yok:** run belirsiz kalırsa (bkz. §6) deploy tahmin yürütmek yerine
+  hatayla biter. Workflow büyük olasılıkla çalışıyordur, GitHub'da kontrol edin.
 - **Geçici hatalar** (ağ, 5xx, 429): artan beklemeyle tekrar denenir; üst üste 5 hatada deploy başarısız
   olur (pipeline iptal edilmez). 401/403/404 hemen hata verir.
 - **Rate limit:** Bitbucket'ta token başına saatlik istek kotası 1000'e kadar düşebilir. IDP bir adım
@@ -196,8 +210,12 @@ sürümlerinde yanıt `204` olur ve IDP run'ı liste üzerinden bulmak zorunda k
   **secrets/environment secrets** içinde tutun.
 - Token IDP'de şifreli saklanır. Log satırlarından, akış satırlarından ve hata mesajlarından token (ve
   Basic auth için üretilen base64 kimlik bilgisi) temizlenir.
-- IDP loglarına sadece değişken **anahtarları** yazılır, değerleri yazılmaz. Deploy tetiklenirken
-  gönderilen `environment`/`confirmation` gibi parametreler pipeline'a gönderilmez ve loglanmaz.
+- IDP loglarına sadece değişken **anahtarları** yazılır, değerleri yazılmaz.
+- Değişkenler **sadece proje ayarlarından** gelir (`ciConfig.variables`, ortam override'ı birleştirilmiş
+  hâliyle). Deploy tetiklenirken gönderilen parametrelerin hiçbiri, `variables` dahil, pipeline'a
+  gönderilmez ve loglanmaz. Değişkenler yalnızca proje düzenlenerek (admin) değiştirilebilir, tetikleme
+  anında asla değiştirilemez. Böylece deploy yetkisi olan bir kullanıcı müşteri A'nın pipeline'ına
+  `CUSTOMER=B` gönderemez.
 
 ## 9. Test Connection
 

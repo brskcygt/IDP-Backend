@@ -9,7 +9,6 @@ const {
   normalizeCiConfig,
   findMissingCiFields,
   validateCiVariables,
-  toStringVariables,
   isPlainObject,
 } = require('./ci');
 const { isTransientError } = require('./ci/http');
@@ -31,8 +30,9 @@ const { isTransientError } = require('./ci/http');
  *
  * Secrets: every string that leaves this adapter (log lines, stream lines,
  * thrown Error messages) passes through a scrubber that removes the token.
- * Only variable KEYS are ever logged, never values; deploy parameters other
- * than `variables` (e.g. `environment`, `confirmation`) are never sent or logged.
+ * Only variable KEYS are ever logged, never values. Variables come only from
+ * the project config; deploy parameters (`variables`, `environment`,
+ * `confirmation`, …) are ignored — never sent or logged.
  */
 
 const MAX_CONSECUTIVE_POLL_FAILURES = 5;
@@ -40,6 +40,10 @@ const MAX_POLL_DELAY_MS = 60_000;
 /** While a step is running, fetch the run status only every Nth tick (rate-limit budget). */
 const STATUS_EVERY_N_TICKS = 3;
 const MAX_LOG_READS_PER_FINISHED_STEP = 20;
+/** Final flush: wait between empty / not-yet-available log reads (the log may still be archiving). */
+const LOG_RETRY_INTERVAL_MS = 3_000;
+/** Final flush: total time spent waiting for logs, across all steps. */
+const MAX_FINAL_LOG_WAIT_MS = 30_000;
 const TERMINAL_PHASES = new Set(['succeeded', 'failed', 'cancelled', 'skipped']);
 
 const PLATFORM_NAMES = { bitbucket: 'Bitbucket Pipelines', github: 'GitHub Actions' };
@@ -87,7 +91,8 @@ class CiPipelineAdapter extends DeploymentAdapter {
    * @param {string} [config.username] - Atlassian email (Bitbucket basic auth only).
    * @param {Function} [config.fetchImpl] - test seam; defaults to undici's fetch.
    * @param {object} [config.timing] - test seam: `{ pollIntervalMs, timeoutMs,
-   *   correlationIntervalMs, correlationTimeoutMs }` overriding the ciConfig values.
+   *   correlationIntervalMs, correlationTimeoutMs, logRetryIntervalMs }` overriding
+   *   the ciConfig values / built-in defaults.
    * @throws {Error} listing every missing setting when the config is incomplete.
    */
   constructor(config) {
@@ -122,6 +127,9 @@ class CiPipelineAdapter extends DeploymentAdapter {
     const timing = isPlainObject(this.config.timing) ? this.config.timing : {};
     this._pollIntervalMs = timing.pollIntervalMs ?? this.ciConfig.pollIntervalSeconds * 1000;
     this._timeoutMs = timing.timeoutMs ?? this.ciConfig.timeoutMinutes * 60_000;
+    this._logRetryIntervalMs = timing.logRetryIntervalMs ?? LOG_RETRY_INTERVAL_MS;
+    /** Set by _finalFlush(): no more log-retry waits after this time. */
+    this._finalLogWaitUntil = 0;
 
     this.client = createCiClient(this.ciConfig, {
       token: apiToken,
@@ -167,14 +175,18 @@ class CiPipelineAdapter extends DeploymentAdapter {
   }
 
   /**
-   * Starts the run. Only `params.variables` is used (merged over
-   * ciConfig.variables); every other deploy parameter is ignored.
+   * Starts the run with the project's own variables: `ciConfig.variables`,
+   * environment override already merged. Every deploy parameter is ignored,
+   * `variables` included — triggering a deploy is a deployer permission while
+   * changing variables means editing the project (admin), so a deployer must
+   * not be able to point a run elsewhere (e.g. `CUSTOMER=B`) at trigger time.
+   *
+   * @param {object} [_params] - deploy parameters; deliberately unused.
    */
-  async trigger(params) {
+  async trigger(_params) {
     if (this.aborted) throw this._error('Deployment was aborted before the pipeline was triggered.');
 
-    const overrides = isPlainObject(params) && isPlainObject(params.variables) ? toStringVariables(params.variables) : {};
-    const variables = { ...this.ciConfig.variables, ...overrides };
+    const variables = { ...this.ciConfig.variables };
     const problems = validateCiVariables(variables);
     if (problems.length > 0) {
       throw this._error(`Invalid CI variables: ${problems.map((problem) => problem.message).join(' ')}`);
@@ -259,7 +271,11 @@ class CiPipelineAdapter extends DeploymentAdapter {
         this.log(`⚠ Polling failed (${err.message}); retrying in ${formatDuration(delayMs)} (${failures}/${MAX_CONSECUTIVE_POLL_FAILURES}).`);
       }
 
-      if (run && (await this._handleRunPhase(run, emit, episode)) === 'done') return;
+      if (run && (await this._handleRunPhase(run, emit, episode)) === 'done') {
+        // Never report success once abort() ran: DeploymentManager already marked the deploy aborted.
+        if (this.aborted) throw this._abortedError();
+        return;
+      }
 
       if (this.client.consumeNearLimit() && intervalMs < MAX_POLL_DELAY_MS) {
         intervalMs = Math.min(intervalMs * 2, MAX_POLL_DELAY_MS);
@@ -310,6 +326,8 @@ class CiPipelineAdapter extends DeploymentAdapter {
         return undefined;
       case 'succeeded': {
         await this._finalFlush(emit);
+        // _finalFlush() swallows an abort that lands during it; don't turn that into a success.
+        if (this.aborted) throw this._abortedError();
         const duration = formatDuration(Date.now() - this._startedAt);
         this.log(`✓ Pipeline #${ref} succeeded (${duration}) ${this.webUrl || ''}`.trim());
         return 'done';
@@ -327,6 +345,7 @@ class CiPipelineAdapter extends DeploymentAdapter {
 
   /** Re-reads the steps once the run is over so no trailing log line is lost. */
   async _finalFlush(emit) {
+    this._finalLogWaitUntil = Date.now() + MAX_FINAL_LOG_WAIT_MS;
     try {
       const steps = await this.client.listSteps(this.runId);
       await this._processSteps(steps, emit, true);
@@ -378,19 +397,27 @@ class CiPipelineAdapter extends DeploymentAdapter {
 
   /**
    * Reads new log lines for one step: a single read per tick while it runs,
-   * until the end once it finished. Log failures never fail the deploy —
-   * the run status is what decides success.
+   * until the end once it finished. In the final flush an empty or
+   * not-yet-available read is retried after an (abortable) wait, since the
+   * log may still be archiving; all waits of one flush share
+   * MAX_FINAL_LOG_WAIT_MS. Log failures never fail the deploy — the run
+   * status is what decides success.
    */
   async _readStepLogs(step, state, emit, final) {
     const terminal = TERMINAL_PHASES.has(step.phase);
     const maxReads = terminal ? MAX_LOG_READS_PER_FINISHED_STEP : 1;
     try {
-      for (let read = 0; read < maxReads && !state.logDone; read += 1) {
+      for (let read = 0; read < maxReads && !state.logDone && !this.aborted; read += 1) {
         const result = await this.client.readStepLog(this.runId, step, state.cursor);
         state.cursor = result.cursor;
         for (const line of result.lines) emit(line);
-        if (result.done) state.logDone = true;
-        else if (result.lines.length === 0 && !final) break; // nothing yet — retry next tick
+        if (result.done) {
+          state.logDone = true;
+        } else if (result.lines.length === 0) {
+          // Nothing yet: retry next tick — or, in the final flush, after a short wait.
+          if (!final || read + 1 >= maxReads || Date.now() >= this._finalLogWaitUntil) break;
+          await this._sleep(this._logRetryIntervalMs);
+        }
       }
     } catch (err) {
       if (this.aborted || (err && err.aborted)) throw err;
@@ -398,9 +425,15 @@ class CiPipelineAdapter extends DeploymentAdapter {
         state.logWarned = true;
         this.log(`⚠ Could not read the log of '${step.name}': ${err.message}`);
       }
-      if (!isTransientError(err)) state.logDone = true;
+      if (!isTransientError(err)) this._finishLog(state, emit);
     }
-    if (final && terminal) state.logDone = true;
+    if (final && terminal && !state.logDone) this._finishLog(state, emit);
+  }
+
+  /** Gives up on a step's log without the client saying it ended: emit the buffered partial last line first. */
+  _finishLog(state, emit) {
+    state.logDone = true;
+    for (const line of this.client.flushPending(state.cursor)) emit(line);
   }
 
   _stepState(id) {

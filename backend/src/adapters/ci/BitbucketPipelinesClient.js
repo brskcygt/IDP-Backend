@@ -4,7 +4,7 @@
  * Bitbucket Pipelines REST client for the CI Pipeline provider.
  *
  * Implements the CI client interface used by CiPipelineAdapter:
- *   verify(), trigger(), getRun(), listSteps(), readStepLog(), cancel().
+ *   verify(), trigger(), getRun(), listSteps(), readStepLog(), flushPending(), cancel().
  *
  * API base: `{baseUrl}/repositories/{owner}/{repo}` (Bitbucket Cloud 2.0).
  * Auth: `Bearer <access token>` (Repository/Project/Workspace Access Token)
@@ -13,7 +13,7 @@
  * always URL-encoded when placed in a path.
  */
 
-const { ciFetch, readBody, drain, toHttpError, CiHttpError } = require('./http');
+const { ciFetch, readBody, drain, toHttpError, CiHttpError, LOG_NOT_AVAILABLE_BUDGET_MS } = require('./http');
 
 const MAX_STEP_PAGES = 5;
 const TERMINAL_STEP_PHASES = new Set(['succeeded', 'failed', 'cancelled', 'skipped']);
@@ -320,15 +320,17 @@ class BitbucketPipelinesClient {
   /**
    * Reads new bytes of a step's log using `Range: bytes=<offset>-`.
    * 206 → partial content; 200 → whole file (sliced from offset);
-   * 416 → nothing new; 404 → log not available yet (not an error).
+   * 416 → nothing new; 404 → log not available yet (not an error). A
+   * finished step's log can briefly 404 while it moves to long-term storage,
+   * so 404 only ends it after LOG_NOT_AVAILABLE_BUDGET_MS of 404s.
    *
    * @param {string} runId
    * @param {{ id: string, phase: string }} step
-   * @param {{ offset: number, pending: Buffer }|null} cursor - opaque, from the previous call.
+   * @param {{ offset: number, pending: Buffer, notFoundSince: number|null }|null} cursor - opaque, from the previous call.
    * @returns {Promise<{ lines: string[], cursor: object, done: boolean }>}
    */
   async readStepLog(runId, step, cursor) {
-    const state = cursor || { offset: 0, pending: Buffer.alloc(0) };
+    const state = cursor || { offset: 0, pending: Buffer.alloc(0), notFoundSince: null };
     const terminal = TERMINAL_STEP_PHASES.has(step.phase);
     const response = await this._send(this._pipelineUrl(runId, `/steps/${enc(step.id)}/log`), {
       label: 'Step log',
@@ -338,6 +340,7 @@ class BitbucketPipelinesClient {
     let chunk = null;
     let offset = state.offset;
     let atEnd = false;
+    let notFoundSince = null;
     if (response.status === 206) {
       chunk = await readBody(response, 'bytes', { label: 'Step log', signal: this._signal });
       offset += chunk.length;
@@ -348,16 +351,34 @@ class BitbucketPipelinesClient {
       chunk = whole.subarray(Math.min(state.offset, whole.length));
       offset = whole.length;
       atEnd = true;
-    } else if (response.status === 416 || response.status === 404) {
+    } else if (response.status === 416) {
       await drain(response);
       atEnd = true;
+    } else if (response.status === 404) {
+      await drain(response);
+      // A running step simply has no log yet; the budget only applies once it finished.
+      if (terminal) {
+        notFoundSince = state.notFoundSince ?? Date.now();
+        atEnd = Date.now() - notFoundSince >= LOG_NOT_AVAILABLE_BUDGET_MS;
+      }
     } else {
       throw await toHttpError(response, 'Step log');
     }
 
     const done = terminal && atEnd;
     const { lines, pending } = splitLogLines(state.pending, chunk, done);
-    return { lines, cursor: { offset, pending }, done };
+    return { lines, cursor: { offset, pending, notFoundSince }, done };
+  }
+
+  /**
+   * The incomplete last line still buffered in a cursor. The adapter emits it
+   * when it gives up on a finished step's log, so the tail is not lost.
+   * @param {{ pending?: Buffer }|null} cursor
+   * @returns {string[]}
+   */
+  flushPending(cursor) {
+    if (!cursor || !Buffer.isBuffer(cursor.pending) || cursor.pending.length === 0) return [];
+    return splitLogLines(cursor.pending, null, true).lines;
   }
 
   /** Stops the pipeline. 204 → stopped; 400 → already completed (treated as ok). */

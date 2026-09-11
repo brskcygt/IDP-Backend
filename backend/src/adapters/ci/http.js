@@ -16,6 +16,12 @@
 
 const DEFAULT_REQUEST_TIMEOUT_MS = 15_000;
 const MAX_PROVIDER_MESSAGE_LENGTH = 300;
+/**
+ * A just-finished step/job log can briefly 404 while the provider archives it
+ * (GitHub) or moves it to long-term storage (Bitbucket). Clients keep treating
+ * such a 404 as "not available yet" for this long after the first one.
+ */
+const LOG_NOT_AVAILABLE_BUDGET_MS = 30_000;
 
 /** An HTTP/network failure talking to the CI provider. */
 class CiHttpError extends Error {
@@ -209,4 +215,5 @@ module.exports = {
   parseRetryAfterMs,
   isTransientError,
   DEFAULT_REQUEST_TIMEOUT_MS,
+  LOG_NOT_AVAILABLE_BUDGET_MS,
 };
