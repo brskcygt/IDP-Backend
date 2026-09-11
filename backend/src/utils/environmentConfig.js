@@ -27,13 +27,28 @@ function isPlainObject(value) {
 }
 
 // Nested config keys merged field-by-field (rather than wholesale replaced)
-// when an environment override defines them.
-const NESTED_MERGE_KEYS = ['pmpConfig', 'vpnConfig'];
+// when an environment override defines them. `ciConfig` (CI Pipeline
+// provider) is merged one level deep: overriding `ciConfig.ref` for Prod
+// keeps the shared owner/repo/pipeline; an overridden `variables` map
+// replaces the base map as a whole.
+const NESTED_MERGE_KEYS = ['pmpConfig', 'vpnConfig', 'ciConfig'];
 
-function mergeNestedField(baseValue, overrideValue) {
+// For these keys an override field left blank ('' / null) means "inherit
+// the base value", not "clear it" — the settings form sends cleared text
+// fields as ''.
+const SKIP_EMPTY_OVERRIDE_KEYS = new Set(['ciConfig']);
+
+function withoutEmptyValues(value) {
+  return Object.fromEntries(
+    Object.entries(value).filter(([, inner]) => inner !== '' && inner !== null && inner !== undefined)
+  );
+}
+
+function mergeNestedField(baseValue, overrideValue, key) {
   if (!isPlainObject(overrideValue)) return baseValue;
   const base = isPlainObject(baseValue) ? baseValue : {};
-  const merged = { ...base, ...overrideValue };
+  const override = SKIP_EMPTY_OVERRIDE_KEYS.has(key) ? withoutEmptyValues(overrideValue) : overrideValue;
+  const merged = { ...base, ...override };
 
   // vpnConfig.mfaConfig is itself worth field-merging rather than replacing —
   // overriding just the MFA secret for Prod shouldn't drop the shared type.
@@ -84,7 +99,7 @@ function resolveEnvironmentConfig(config, environment) {
       Object.prototype.hasOwnProperty.call(override, key) ||
       Object.prototype.hasOwnProperty.call(baseWithoutEnvironments, key)
     ) {
-      merged[key] = mergeNestedField(baseWithoutEnvironments[key], override[key]);
+      merged[key] = mergeNestedField(baseWithoutEnvironments[key], override[key], key);
     }
   }
 

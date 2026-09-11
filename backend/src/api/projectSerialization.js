@@ -89,7 +89,9 @@ function mergeProjectConfig(existingConfig, incoming) {
   const existing = existingConfig || {};
   const body = incoming || {};
 
-  const merged = deepMerge(stripPresenceFlags(existing), stripPresenceFlags(body));
+  const cleanBody = stripPresenceFlags(body);
+  const merged = deepMerge(stripPresenceFlags(existing), cleanBody);
+  replaceWholesaleKeys(merged, cleanBody);
 
   // Union of secret paths on both sides: a path may exist only in the stored
   // config (client omitted it) or only in the incoming one (new environment).
@@ -111,6 +113,43 @@ function mergeProjectConfig(existingConfig, incoming) {
   return merged;
 }
 
+/**
+ * Nested config objects that a settings save REPLACES instead of deep-merging
+ * (at the top level and inside each `environments.<Name>`). `ciConfig` holds
+ * user-edited data and no secrets (the CI token is the top-level `apiToken`):
+ * deep-merging it would resurrect a deleted `variables` key or a cleared
+ * optional field on every save.
+ */
+const REPLACE_ON_SAVE_KEYS = ['ciConfig'];
+
+/**
+ * Subtrees exempt from presence-flag stripping — they hold no secrets, so
+ * any `has…` key inside them (e.g. a CI variable named `hasCache`) is data.
+ */
+const PRESENCE_FLAG_EXEMPT_KEYS = new Set(['ciConfig']);
+
+function isPlainObject(value) {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+/** Applies REPLACE_ON_SAVE_KEYS from the (flag-stripped) incoming patch onto `merged`, in place. */
+function replaceWholesaleKeys(merged, incoming) {
+  const replaceIn = (target, source) => {
+    for (const key of REPLACE_ON_SAVE_KEYS) {
+      if (isPlainObject(source[key])) target[key] = structuredClone(source[key]);
+    }
+  };
+
+  replaceIn(merged, incoming);
+  if (isPlainObject(incoming.environments) && isPlainObject(merged.environments)) {
+    for (const [envName, override] of Object.entries(incoming.environments)) {
+      if (isPlainObject(override) && isPlainObject(merged.environments[envName])) {
+        replaceIn(merged.environments[envName], override);
+      }
+    }
+  }
+}
+
 /** Recursively drop every `has…` presence flag — those are response-only. */
 function stripPresenceFlags(value) {
   if (Array.isArray(value)) return value.map(stripPresenceFlags);
@@ -119,7 +158,7 @@ function stripPresenceFlags(value) {
   const out = {};
   for (const [key, inner] of Object.entries(value)) {
     if (/^has[A-Z]/.test(key)) continue;
-    out[key] = stripPresenceFlags(inner);
+    out[key] = PRESENCE_FLAG_EXEMPT_KEYS.has(key) ? inner : stripPresenceFlags(inner);
   }
   return out;
 }

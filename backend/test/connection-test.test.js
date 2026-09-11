@@ -633,6 +633,106 @@ test('documented timeout budget: 10s per check, 30s overall ceiling', () => {
   assert.equal(MAX_TOTAL_BUDGET_MS, 30_000);
 });
 
+// ── CI Pipeline ──────────────────────────────────────────────────────────
+
+const CI_TOKEN = 'ci-secret-token-value-123';
+
+function pipelineProject(configOverrides = {}) {
+  return baseProject({
+    provider: 'Pipeline',
+    config: {
+      ciConfig: { platform: 'bitbucket', owner: 'acme', repo: 'web', ref: 'master', pipeline: 'deploy-customer' },
+      apiToken: CI_TOKEN,
+      ...configOverrides,
+    },
+  });
+}
+
+/** Fake `createCiClient` — records what it was built with, returns a client whose verify() is scripted. */
+function fakeCiClientFactory(verify) {
+  const calls = [];
+  const factory = (ciConfig, options) => {
+    calls.push({ ciConfig, options });
+    return { verify };
+  };
+  factory.calls = calls;
+  return factory;
+}
+
+test('Pipeline: verify() checks are passed through; ok when none failed', async () => {
+  const createCiClient = fakeCiClientFactory(async () => ({
+    checks: [
+      { name: 'Bitbucket Repository', ok: true, detail: 'Access to acme/web confirmed.' },
+      { name: 'Bitbucket Pipelines', ok: true, detail: 'The token can read pipelines.' },
+      { name: 'Pipeline Definition', ok: null, detail: 'Could not read bitbucket-pipelines.yml — not verified.' },
+    ],
+  }));
+
+  const result = await testProjectConnection({
+    project: pipelineProject(),
+    deps: { createCiClient, resolveSecrets: passThroughResolveSecrets },
+  });
+
+  assert.equal(result.ok, true);
+  assert.deepEqual(result.checks.map((c) => c.ok), [true, true, null]);
+  assert.equal(createCiClient.calls.length, 1);
+  assert.equal(createCiClient.calls[0].options.token, CI_TOKEN);
+  assert.equal(createCiClient.calls[0].options.requestTimeoutMs, DEFAULT_CHECK_TIMEOUT_MS);
+  assert.equal(createCiClient.calls[0].ciConfig.baseUrl, 'https://api.bitbucket.org/2.0', 'defaults are applied');
+});
+
+test('Pipeline: an auth failure is a failed check, and the token never leaks into the result', async () => {
+  const createCiClient = fakeCiClientFactory(async () => ({
+    checks: [
+      { name: 'Bitbucket Repository', ok: false, detail: `Authentication failed (HTTP 401) for token ${CI_TOKEN}` },
+      { name: 'Bitbucket Pipelines', ok: null, detail: 'Not tested — the repository check above failed.' },
+    ],
+  }));
+
+  const result = await testProjectConnection({
+    project: pipelineProject(),
+    deps: { createCiClient, resolveSecrets: passThroughResolveSecrets },
+  });
+
+  assert.equal(result.ok, false);
+  assert.equal(result.checks[0].ok, false);
+  assert.match(result.checks[0].detail, /Authentication failed \(HTTP 401\)/);
+  assert.doesNotMatch(JSON.stringify(result), new RegExp(CI_TOKEN));
+});
+
+test('Pipeline: missing settings -> a single failed Configuration check, no client is built', async () => {
+  const createCiClient = fakeCiClientFactory(async () => {
+    throw new Error('must not be called');
+  });
+
+  const result = await testProjectConnection({
+    project: baseProject({ provider: 'Pipeline', config: { ciConfig: { platform: 'github', owner: 'acme' } } }),
+    deps: { createCiClient, resolveSecrets: passThroughResolveSecrets },
+  });
+
+  assert.equal(result.ok, false);
+  assert.equal(result.checks.length, 1);
+  assert.equal(result.checks[0].name, 'Configuration');
+  assert.match(result.checks[0].detail, /missing: repo, ref, pipeline, apiToken/);
+  assert.equal(createCiClient.calls.length, 0);
+});
+
+test('Pipeline: a verify() that throws is reported as a failed check, not thrown', async () => {
+  const createCiClient = fakeCiClientFactory(async () => {
+    throw new Error(`socket hang up (${CI_TOKEN})`);
+  });
+
+  const result = await testProjectConnection({
+    project: pipelineProject(),
+    deps: { createCiClient, resolveSecrets: passThroughResolveSecrets },
+  });
+
+  assert.equal(result.ok, false);
+  assert.equal(result.checks[0].name, 'CI Pipeline API');
+  assert.match(result.checks[0].detail, /socket hang up/);
+  assert.doesNotMatch(result.checks[0].detail, new RegExp(CI_TOKEN));
+});
+
 // ── Unknown provider ─────────────────────────────────────────────────────
 
 test('unknown provider reports a single failing check instead of throwing', async () => {

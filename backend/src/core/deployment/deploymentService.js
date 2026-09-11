@@ -22,6 +22,7 @@ const WindowsAdapter = require('../../adapters/WindowsAdapter');
 // possible rollback, but it is no longer selected by the active product flow.
 // const CloudflareRunnerAdapter = require('../../adapters/CloudflareRunnerAdapter');
 const IdpAgentAdapter = require('../../adapters/IdpAgentAdapter');
+const CiPipelineAdapter = require('../../adapters/CiPipelineAdapter');
 const VpnManager = require('../../services/vpn/VpnManager');
 const deploymentManager = require('../../services/DeploymentManager');
 const auditLogger = require('../../services/AuditLogger');
@@ -71,6 +72,14 @@ function createAdapter(project, appConfig) {
       password: pCfg.password || appConfig.pmp.password,
       timeoutMs: pCfg.timeoutMs || appConfig.pmp.timeoutMs,
     });
+  } else if (project.provider === 'Pipeline') {
+    // CI Pipeline provider: IDP triggers a Bitbucket/GitHub pipeline instead
+    // of dialing the target. Throws listing missing settings when incomplete.
+    return new CiPipelineAdapter({
+      ciConfig: pCfg.ciConfig,
+      username: pCfg.username,
+      apiToken: pCfg.apiToken,
+    });
   } else if (isServerProvider(project.provider)) {
     const isWindows = (pCfg.targetOS || (project.provider === 'WinRM' ? 'windows' : 'linux')) === 'windows';
     if (isWindows) {
@@ -103,6 +112,19 @@ function createAdapter(project, appConfig) {
   }
 
   throw new Error(`Unknown provider: ${project.provider}`);
+}
+
+/**
+ * Human-readable deploy target for the "[System] Environment ..." line — a
+ * host for direct providers, the repository/ref for the CI Pipeline provider.
+ * Never includes credentials.
+ */
+function describeDeployTarget(provider, config) {
+  if (provider === 'Pipeline') {
+    const ci = (config && config.ciConfig) || {};
+    return `CI pipeline ${ci.owner || '?'}/${ci.repo || '?'} @ ${ci.ref || '?'}`;
+  }
+  return `host ${config.host || config.url || 'unknown'}`;
 }
 
 /**
@@ -191,12 +213,12 @@ async function executeDeploy({ project, parameters, triggeredBy, appConfig }) {
   // to — never the credentials — so "deploy to Prod" can be visually
   // verified against where it's actually going instead of taken on faith.
   if (parameters.environment) {
-    const resolvedHost = envResolution.config.host || envResolution.config.url || 'unknown';
+    const resolvedTarget = describeDeployTarget(project.provider, envResolution.config);
     deploymentManager.pushLog(
       deploymentId,
       envResolution.matched
-        ? `[System] Environment '${parameters.environment}' → host ${resolvedHost}`
-        : `[System] Environment '${parameters.environment}' has no override configured — using the shared base config (host ${resolvedHost}).`
+        ? `[System] Environment '${parameters.environment}' → ${resolvedTarget}`
+        : `[System] Environment '${parameters.environment}' has no override configured — using the shared base config (${resolvedTarget}).`
     );
   }
 
@@ -324,6 +346,10 @@ async function executeDeploy({ project, parameters, triggeredBy, appConfig }) {
       // 4. Clean up sensitive credential variable from runtime memory
       adapter.password = null;
       if (adapter.config) adapter.config.password = null;
+      if (adapter.config) adapter.config.apiToken = null;
+      // Adapters whose HTTP client captured the token at construction time
+      // (CiPipelineAdapter) drop it here too.
+      if (typeof adapter.releaseCredentials === 'function') adapter.releaseCredentials();
       if (Object.prototype.hasOwnProperty.call(adapter, 'adminApiKey')) adapter.adminApiKey = null;
       if (adapter.config) adapter.config.runnerAdminApiKey = null;
     }

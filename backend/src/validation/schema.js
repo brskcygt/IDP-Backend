@@ -37,7 +37,7 @@ function isPlainObject(value) {
 // Rule builders
 // ---------------------------------------------------------------------------
 
-/** @param {{min?: number, max?: number, pattern?: RegExp, enum?: string[]}} [opts] */
+/** @param {{min?: number, max?: number, pattern?: RegExp, enum?: string[], allowEmpty?: boolean}} [opts] */
 function string(opts = {}) {
   return { type: 'string', required: true, ...opts };
 }
@@ -118,7 +118,8 @@ function validateString(value, rule, path) {
   if (rule.pattern instanceof RegExp && value !== '' && !rule.pattern.test(value)) {
     errors.push({ path, message: 'Does not match the required format.' });
   }
-  if (Array.isArray(rule.enum) && !rule.enum.includes(value)) {
+  // `allowEmpty`: a cleared <select> arrives as '' and means "unset".
+  if (Array.isArray(rule.enum) && !(rule.allowEmpty && value === '') && !rule.enum.includes(value)) {
     errors.push({ path, message: `Must be one of: ${rule.enum.join(', ')}.` });
   }
   return { valid: errors.length === 0, value, errors };

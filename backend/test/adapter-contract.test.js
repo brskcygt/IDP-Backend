@@ -14,7 +14,8 @@
  *   - Each adapter hand-wrote its own log prefix at every call site.
  *
  * This file guards the fix for all four:
- *   1. supportsLogStreaming defaults to false; only JenkinsAdapter opts in.
+ *   1. supportsLogStreaming defaults to false; only JenkinsAdapter and
+ *      CiPipelineAdapter (CI Pipeline provider) opt in.
  *      The base streamLogs() is a silent no-op — no fake log lines.
  *   2. assertTriggerResult() throws when a trigger() return value reports
  *      failure/abort via its `status` field, instead of letting it flow
@@ -46,6 +47,29 @@ const SshServerAdapter = require('../src/adapters/SshServerAdapter');
 const PmpWebAdapter = require('../src/adapters/PmpWebAdapter');
 const WindowsAdapter = require('../src/adapters/WindowsAdapter');
 const JenkinsAdapter = require('../src/adapters/JenkinsAdapter');
+const CiPipelineAdapter = require('../src/adapters/CiPipelineAdapter');
+
+/**
+ * CiPipelineAdapter validates its config on construction (it throws listing
+ * missing settings), so unlike the others it can't be built from `{}`. This
+ * minimal valid config never touches the network: nothing below calls
+ * connect()/trigger().
+ */
+function createCiAdapter() {
+  return new CiPipelineAdapter({
+    ciConfig: { platform: 'github', owner: 'acme', repo: 'web', ref: 'main', pipeline: 'deploy.yml' },
+    apiToken: 'contract-test-token',
+  });
+}
+
+/** [name, factory] for every real adapter — used by the abort() contract loops. */
+const ADAPTER_FACTORIES = [
+  ['SshServerAdapter', () => new SshServerAdapter({})],
+  ['PmpWebAdapter', () => new PmpWebAdapter({})],
+  ['WindowsAdapter', () => new WindowsAdapter({})],
+  ['JenkinsAdapter', () => new JenkinsAdapter({})],
+  ['CiPipelineAdapter', createCiAdapter],
+];
 
 /** Minimal fake adapter used to test generic base-class behavior in isolation. */
 class FakeAdapter extends DeploymentAdapter {}
@@ -102,11 +126,12 @@ test('the base streamLogs() is a silent no-op — it never calls the callback', 
   assert.equal(called, false);
 });
 
-test('only JenkinsAdapter sets supportsLogStreaming to true', () => {
+test('only JenkinsAdapter and CiPipelineAdapter set supportsLogStreaming to true', () => {
   assert.equal(new SshServerAdapter({}).supportsLogStreaming, false);
   assert.equal(new PmpWebAdapter({}).supportsLogStreaming, false);
   assert.equal(new WindowsAdapter({}).supportsLogStreaming, false);
   assert.equal(new JenkinsAdapter({}).supportsLogStreaming, true);
+  assert.equal(createCiAdapter().supportsLogStreaming, true);
 });
 
 test('SshServerAdapter, PmpWebAdapter, and WindowsAdapter no longer override streamLogs() — they inherit the base no-op', () => {
@@ -117,6 +142,10 @@ test('SshServerAdapter, PmpWebAdapter, and WindowsAdapter no longer override str
 
 test('JenkinsAdapter still overrides streamLogs() with real progressive-log streaming', () => {
   assert.notEqual(JenkinsAdapter.prototype.streamLogs, DeploymentAdapter.prototype.streamLogs);
+});
+
+test('CiPipelineAdapter overrides streamLogs() with real pipeline polling', () => {
+  assert.notEqual(CiPipelineAdapter.prototype.streamLogs, DeploymentAdapter.prototype.streamLogs);
 });
 
 test('streamLogs() on an adapter with supportsLogStreaming=false produces no log lines at all', async () => {
@@ -134,20 +163,20 @@ test('streamLogs() on an adapter with supportsLogStreaming=false produces no log
 // ── abort() consistency: async + idempotent on every adapter ────────────────
 
 test('abort() is an async function (returns a Promise) on every adapter', () => {
-  for (const Adapter of [SshServerAdapter, PmpWebAdapter, WindowsAdapter, JenkinsAdapter]) {
-    const adapter = new Adapter({});
+  for (const [name, create] of ADAPTER_FACTORIES) {
+    const adapter = create();
     const result = adapter.abort();
-    assert.ok(result instanceof Promise, `${Adapter.name}.abort() should return a Promise`);
+    assert.ok(result instanceof Promise, `${name}.abort() should return a Promise`);
     // Prevent an unhandled-rejection warning if something unexpected rejects.
     result.catch(() => {});
   }
 });
 
 test('abort() is idempotent — calling it twice never throws, on every adapter', async () => {
-  for (const Adapter of [SshServerAdapter, PmpWebAdapter, WindowsAdapter, JenkinsAdapter]) {
-    const adapter = new Adapter({});
-    await assert.doesNotReject(adapter.abort(), `${Adapter.name}: first abort() call`);
-    await assert.doesNotReject(adapter.abort(), `${Adapter.name}: second abort() call`);
+  for (const [name, create] of ADAPTER_FACTORIES) {
+    const adapter = create();
+    await assert.doesNotReject(adapter.abort(), `${name}: first abort() call`);
+    await assert.doesNotReject(adapter.abort(), `${name}: second abort() call`);
     assert.equal(adapter.aborted, true);
   }
 });
@@ -199,10 +228,11 @@ test('each real adapter emits its documented, byte-identical log prefix', () => 
     { Adapter: PmpWebAdapter, prefix: '[PMP]' },
     { Adapter: WindowsAdapter, prefix: '[WinRM]' },
     { Adapter: JenkinsAdapter, prefix: '[Jenkins]' },
+    { Adapter: CiPipelineAdapter, prefix: '[CI]', create: createCiAdapter },
   ];
 
-  for (const { Adapter, prefix } of cases) {
-    const adapter = new Adapter({});
+  for (const { Adapter, prefix, create } of cases) {
+    const adapter = create ? create() : new Adapter({});
     assert.equal(adapter.logPrefix, prefix, `${Adapter.name}.logPrefix`);
 
     const lines = [];

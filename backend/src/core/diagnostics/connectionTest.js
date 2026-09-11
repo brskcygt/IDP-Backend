@@ -49,6 +49,7 @@ const { fetch: undiciFetch } = require('undici');
 const { NodeSSH } = require('node-ssh');
 
 const JenkinsAdapterDefault = require('../../adapters/JenkinsAdapter');
+const { createCiClient: createCiClientDefault } = require('../../adapters/ci');
 const PmpServiceDefault = require('../../services/vault/PmpService');
 const {
   createHostVerifier: createHostVerifierDefault,
@@ -61,6 +62,7 @@ const secretStoreDefault = require('../secrets/secretStoreInstance');
 
 const { makeCheck, withTimeout } = require('./checks/shared');
 const { testJenkins } = require('./checks/jenkins');
+const { testCiPipeline } = require('./checks/ciPipeline');
 const { testPmpVault } = require('./checks/pmp');
 const { testSsh } = require('./checks/ssh');
 const { testWinRm } = require('./checks/winrm');
@@ -121,6 +123,7 @@ async function testProjectConnection({ project, appConfig, environment, deps = {
     netConnect = net.connect,
     NodeSSHImpl = NodeSSH,
     fetchImpl = undiciFetch,
+    createCiClient = createCiClientDefault,
     checkTimeoutMs = DEFAULT_CHECK_TIMEOUT_MS,
   } = deps;
 
@@ -145,6 +148,10 @@ async function testProjectConnection({ project, appConfig, environment, deps = {
     checks = await runWithOverallBudget(() => testJenkins({ config, appConfig, JenkinsAdapter, timeoutMs: checkTimeoutMs }));
   } else if (project.provider === 'PMP') {
     checks = await runWithOverallBudget(async () => [await testPmpVault({ pmpConfig: config.pmpConfig, PmpService })]);
+  } else if (project.provider === 'Pipeline') {
+    checks = await runWithOverallBudget(() =>
+      testCiPipeline({ config, createCiClient, fetchImpl, timeoutMs: checkTimeoutMs })
+    );
   } else if (isServerProvider(project.provider)) {
     const isWindows = (config.targetOS || (project.provider === 'WinRM' ? 'windows' : 'linux')) === 'windows';
     checks = await runWithOverallBudget(async () => {

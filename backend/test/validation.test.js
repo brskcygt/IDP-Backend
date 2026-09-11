@@ -307,6 +307,104 @@ test('validateProjectConfig: an unknown top-level field does not break the save 
 });
 
 // ---------------------------------------------------------------------------
+// CI Pipeline provider (`provider: 'Pipeline'`, `config.ciConfig`)
+// ---------------------------------------------------------------------------
+
+const VALID_CI_CONFIG = {
+  platform: 'bitbucket',
+  owner: 'acme',
+  repo: 'web',
+  refType: 'tag',
+  ref: 'v2.5.0',
+  pipeline: 'deploy-customer',
+  variables: { CUSTOMER: 'A', BRAND: 'temsa', VERSION: '2.5.0' },
+  authType: 'basic',
+  pollIntervalSeconds: 10,
+  timeoutMinutes: 60,
+};
+
+test('string(): allowEmpty lets "" through an enum, other values are still checked', () => {
+  const rule = string({ enum: ['a', 'b'], allowEmpty: true });
+  assert.equal(validate('', rule).valid, true);
+  assert.equal(validate('a', rule).valid, true);
+  assert.equal(validate('c', rule).valid, false);
+  assert.equal(validate('', string({ enum: ['a'] })).valid, false, 'without allowEmpty, "" is still rejected');
+});
+
+test('createProjectSchema: accepts the Pipeline provider', () => {
+  const result = validate(
+    { name: 'Temsa Deploy', tenant: 'Customer A', environment: 'Prod', provider: 'Pipeline' },
+    createProjectSchema
+  );
+  assert.equal(result.valid, true, JSON.stringify(result.errors));
+});
+
+test('validateProjectConfig: accepts a complete ciConfig (plus the shared username/apiToken fields)', () => {
+  const result = validateProjectConfig({ ciConfig: VALID_CI_CONFIG, username: 'dev@example.com', apiToken: 'tok' });
+  assert.equal(result.valid, true, JSON.stringify(result.errors));
+});
+
+test('validateProjectConfig: accepts "" for every cleared ciConfig text/select field', () => {
+  const result = validateProjectConfig({
+    ciConfig: {
+      platform: '',
+      baseUrl: '',
+      owner: '',
+      repo: '',
+      refType: '',
+      ref: '',
+      pipeline: '',
+      authType: '',
+      correlationInput: '',
+    },
+  });
+  assert.equal(result.valid, true, JSON.stringify(result.errors));
+});
+
+test('validateProjectConfig: rejects a bad platform, a bad variable key, and more than 25 variables', () => {
+  const badPlatform = validateProjectConfig({ ciConfig: { platform: 'gitlab' } });
+  assert.equal(badPlatform.valid, false);
+  assert.equal(badPlatform.errors[0].path, 'ciConfig.platform');
+
+  const badKey = validateProjectConfig({ ciConfig: { variables: { 'BAD-KEY': 'x', '1ST': 'y', OK_1: 'z' } } });
+  assert.equal(badKey.valid, false);
+  assert.deepEqual(badKey.errors.map((e) => e.path).sort(), ['ciConfig.variables.1ST', 'ciConfig.variables.BAD-KEY']);
+
+  const many = Object.fromEntries(Array.from({ length: 26 }, (_, i) => [`VAR_${i}`, 'x']));
+  const tooMany = validateProjectConfig({ ciConfig: { variables: many } });
+  assert.equal(tooMany.valid, false);
+  assert.equal(tooMany.errors[0].path, 'ciConfig.variables');
+
+  const exactly25 = Object.fromEntries(Array.from({ length: 25 }, (_, i) => [`VAR_${i}`, 'x']));
+  assert.equal(validateProjectConfig({ ciConfig: { variables: exactly25 } }).valid, true);
+});
+
+test('validateProjectConfig: rejects non-string/oversized variable values, unknown ciConfig fields, and out-of-range numbers', () => {
+  const badValue = validateProjectConfig({ ciConfig: { variables: { A: 5, B: 'x'.repeat(2001) } } });
+  assert.deepEqual(badValue.errors.map((e) => e.path).sort(), ['ciConfig.variables.A', 'ciConfig.variables.B']);
+
+  assert.equal(validateProjectConfig({ ciConfig: { branch: 'main' } }).valid, false, 'unknown ciConfig field');
+  assert.equal(validateProjectConfig({ ciConfig: { pollIntervalSeconds: 1 } }).valid, false);
+  assert.equal(validateProjectConfig({ ciConfig: { timeoutMinutes: 721 } }).valid, false);
+  assert.equal(validateProjectConfig({ ciConfig: { baseUrl: 'ftp://nope' } }).valid, false);
+  assert.equal(validateProjectConfig({ ciConfig: { correlationInput: 'bad-name' } }).valid, false);
+});
+
+test('validateProjectConfig: an environment override with a partial ciConfig is accepted; its variables get a prefixed error path', () => {
+  const ok = validateProjectConfig({
+    ciConfig: VALID_CI_CONFIG,
+    environments: { Prod: { ciConfig: { ref: 'v2.5.1' } } },
+  });
+  assert.equal(ok.valid, true, JSON.stringify(ok.errors));
+
+  const bad = validateProjectConfig({
+    environments: { Prod: { ciConfig: { variables: { 'no-dashes': 'x' } } } },
+  });
+  assert.equal(bad.valid, false);
+  assert.equal(bad.errors[0].path, 'environments.Prod.ciConfig.variables.no-dashes');
+});
+
+// ---------------------------------------------------------------------------
 // deployTriggerSchema
 // ---------------------------------------------------------------------------
 

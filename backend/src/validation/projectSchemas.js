@@ -6,9 +6,18 @@
  * ./schema.js — see that file for why there's no zod/joi/ajv here.
  */
 const { string, number, boolean, object, optional, validate } = require('./schema');
+const {
+  CI_PLATFORMS,
+  CI_REF_TYPES,
+  CI_AUTH_TYPES,
+  VARIABLE_KEY_PATTERN,
+  POLL_INTERVAL_SECONDS,
+  TIMEOUT_MINUTES,
+  validateCiVariables,
+} = require('../adapters/ci/config');
 
 const ENVIRONMENTS = ['Dev', 'Stage', 'Prod'];
-const PROVIDERS = ['Jenkins', 'PMP', 'Server'];
+const PROVIDERS = ['Jenkins', 'PMP', 'Server', 'Pipeline'];
 const TARGET_OS_VALUES = ['linux', 'windows'];
 const WINDOWS_TRANSPORT_VALUES = ['winrm', 'idp-agent'];
 const AUTH_TYPES = ['manual', 'pmp'];
@@ -50,6 +59,33 @@ const createProjectSchema = object({
 /** Loosely-typed passthrough for pmpConfig/vpnConfig — shape isn't pinned down by T-20. */
 const looseNestedConfig = () => optional(object({ allowUnknown: true }));
 
+/**
+ * `ciConfig` for the CI Pipeline provider (see adapters/ci/config.js). Every
+ * field is optional here — projects are created with an empty config and
+ * CiPipelineAdapter reports missing fields at deploy time. The settings form
+ * sends a cleared text/select field as '', which is accepted (and treated as
+ * unset by normalizeCiConfig). `variables` is only shape-checked here; its
+ * entries are validated in validateProjectConfig() so each error carries the
+ * variable's own path.
+ */
+const ciConfigRule = () => optional(object({
+  fields: {
+    platform: optional(string({ enum: CI_PLATFORMS, allowEmpty: true })),
+    baseUrl: optional(string({ max: 2000, pattern: /^https?:\/\/\S+$/ })),
+    owner: optional(string({ max: 255 })),
+    repo: optional(string({ max: 255 })),
+    refType: optional(string({ enum: CI_REF_TYPES, allowEmpty: true })),
+    ref: optional(string({ max: 255 })),
+    pipeline: optional(string({ max: 255 })),
+    variables: optional(object({ allowUnknown: true })),
+    authType: optional(string({ enum: CI_AUTH_TYPES, allowEmpty: true })),
+    pollIntervalSeconds: optional(number({ min: POLL_INTERVAL_SECONDS.min, max: POLL_INTERVAL_SECONDS.max, integer: true })),
+    timeoutMinutes: optional(number({ min: TIMEOUT_MINUTES.min, max: TIMEOUT_MINUTES.max, integer: true })),
+    correlationInput: optional(string({ max: 100, pattern: VARIABLE_KEY_PATTERN })),
+  },
+  allowUnknown: false,
+}));
+
 /** Shared field rules for both a project's base config and each `environments.*` override. */
 const baseConfigFields = {
   url: optional(string({ max: 2000 })),
@@ -78,6 +114,7 @@ const baseConfigFields = {
   timeoutMs: optional(number({ min: 0, integer: true })),
   vpnConfig: looseNestedConfig(),
   pmpConfig: looseNestedConfig(),
+  ciConfig: ciConfigRule(),
 };
 
 /** A single `environments.<Name>` override — same fields, no nested `environments` of its own. */
@@ -105,17 +142,29 @@ const projectConfigSchema = object({
  */
 function validateProjectConfig(body) {
   const base = validate(body, projectConfigSchema);
-  const errors = [...base.errors];
+  const errors = [...base.errors, ...ciVariableErrors(body, '')];
 
   const environments = base.value && isPlainObject(base.value.environments) ? base.value.environments : null;
   if (environments) {
     for (const [envName, envConfig] of Object.entries(environments)) {
-      const envResult = validate(envConfig, environmentOverrideSchema, `environments.${envName}`);
-      errors.push(...envResult.errors);
+      const envPath = `environments.${envName}`;
+      const envResult = validate(envConfig, environmentOverrideSchema, envPath);
+      errors.push(...envResult.errors, ...ciVariableErrors(envConfig, envPath));
     }
   }
 
   return { valid: errors.length === 0, value: base.value, errors };
+}
+
+/** Entry-level checks for `ciConfig.variables`: count, key format, value type/length. */
+function ciVariableErrors(config, basePath) {
+  const variables = isPlainObject(config) && isPlainObject(config.ciConfig) ? config.ciConfig.variables : undefined;
+  if (!isPlainObject(variables)) return [];
+  const path = basePath ? `${basePath}.ciConfig.variables` : 'ciConfig.variables';
+  return validateCiVariables(variables).map(({ key, message }) => ({
+    path: key === null ? path : `${path}.${key}`,
+    message,
+  }));
 }
 
 function isPlainObject(value) {
