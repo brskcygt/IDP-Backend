@@ -1,6 +1,6 @@
 # IDP — Artifact Deploy (release → sunucu)
 
-> Son güncelleme: 2026-09-11 · Kapsam: `backend/src/core/artifacts/`, `backend/src/routes/artifacts.js`,
+> Son güncelleme: 2026-09-13 · Kapsam: `backend/src/core/artifacts/`, `backend/src/routes/artifacts.js`,
 > `idp-agent-gateway` (`/agent/artifact-command`), agent tarafı: `idp-agent/ARTIFACT-DEPLOY-AGENT.md`.
 > Testler: `backend/test/artifact-*.test.js`, `backend/test/release-service.test.js`, `idp-agent-gateway/test/gateway.test.js`.
 
@@ -11,13 +11,14 @@ Müşteri sunucusunda **tek bir agent** çalışır (sunucu başına tek proje) 
 
 1. **Release (F1).** Geliştirici IDP'den bir projenin sürümünü keser (ör. jetsrm `2.5.0`). IDP build'i mevcut
    adapter'larla tetikler (**CI Pipeline** → Bitbucket Pipelines / GitHub Actions, ya da **Jenkins**). Build,
-   sürümlü `.tar.gz` artifact'ları ve bir **manifest** üretip **Bitbucket Downloads** veya **GitHub Release
-   assets**'e yükler. Build başarılı olunca IDP manifest'i okur, doğrular, `releases` + `release_artifacts`
-   tablolarına yazar; release `ready` olur. Build yoksa (`build.provider: none`) artifact'lar elle yüklenir ve
-   release **import** edilir.
+   sürümlü `.tar.gz` artifact'ları ve bir **manifest** üretip provider bağımsız CI upload API'siyle **IDP'nin
+   yerel artifact deposuna** yollar. Bitbucket Pipelines, GitHub Actions ve Jenkins aynı iki uçlu sözleşmeyi
+   kullanır. IDP tüm dosyaları boyut + SHA-256 ile tekrar doğrulayıp dizini atomik yayınladıktan sonra release'i
+   `ready` yapar. Eski Bitbucket Downloads / GitHub Release asset **import** akışı geriye uyumlu olarak kalır.
 2. **Deploy (F2).** IDP bir release'i bir **hedefe** (deploy target = müşteri sunucusu = agent) gönderir:
-   backend → gateway → agent `artifact_deploy`. Agent her artifact'ı **IDP backend'inden** indirir (backend
-   kaynağa proxy olur; repo token'ı agent'a hiç gitmez), sha256 doğrular, açar, sunucuya özel dosyaları korur,
+   backend → gateway → agent `artifact_deploy`. Agent her artifact'ı **IDP backend'inden** kısa ömürlü token'la
+   indirir; yerel release diskteki dosyadan stream edilir, eski external import release'i kaynağa proxy edilir.
+   Agent sha256 doğrular, açar, sunucuya özel dosyaları korur,
    durdurur / değiştirir / (varsa preStart hook'larını çalıştırır) / başlatır, health-check yapar, hata olursa
    otomatik geri alır, aşama olayları ve **tek bir** terminal sonuç gönderir.
 
@@ -26,7 +27,8 @@ Müşteri sunucusunda **tek bir agent** çalışır (sunucu başına tek proje) 
                             |  ^                                                        |
                             |  +------ GET /api/artifacts/:id/download (Bearer indirme token'ı) ---+
                             +--> Bitbucket Downloads / GitHub Release assets (repo token yalnız burada)
-[CI Pipeline | Jenkins] --build--> *.tar.gz + <proje>-<sürüm>-manifest.json --upload--> Bitbucket/GitHub
+[Bitbucket Pipelines | GitHub Actions | Jenkins]
+        --build--> *.tar.gz --PUT--> [IDP .staging] --manifest/finalize--> [IDP releases]
 ```
 
 Klasör düzeni (Windows): `C:/inetpub/wwwroot/jetsrm/` altında `backend/`, `frontend/` (IIS statik site),
@@ -60,8 +62,8 @@ yüklenir.
 | `artifacts[].sha256` | 64 küçük harf hex |
 | `artifacts[].size` | pozitif tamsayı (bayt) |
 
-Import sırasında her dosyanın kaynakta **gerçekten bulunduğu** ve boyutunun manifest'le **aynı** olduğu kontrol
-edilir (Bitbucket Downloads listesi / GitHub release assets).
+Yerel finalize sırasında her dosya yeniden okunup **boyut + SHA-256** manifest ile karşılaştırılır. External
+import sırasında dosyanın kaynakta bulunduğu ve boyutunun aynı olduğu kontrol edilir.
 
 **Arşiv kökü = bileşen klasörünün içeriği.** `tar -czf x.tar.gz -C dist .` gibi; üstte ekstra bir klasör,
 mutlak yol, `..`, symlink/hardlink olmamalı (agent reddeder).
@@ -91,21 +93,26 @@ Zarf değişmedi: `{date, type, agentId, process, payload}`.
       "runtime": { "type": "iis-static", "serviceName": null, "appPool": null },
       "preserve": ["web.config"],
       "health": null,
-      "runtimeConfig": { "VITE_APP_MAIN_URL": "https://api.customer", "VITE_COMPANY_NAME": "temsa" },
+      "runtimeConfig": { "format": "frontend-config-js", "values": {
+        "VITE_APP_MAIN_URL": "https://api.customer", "VITE_COMPANY_NAME": "temsa" } },
       "hooks": null } ] }
 ```
 
   - `runtime.type` ∈ `nssm | windows-service | iis-static | systemd | none`. `serviceName` nssm/windows-service/
     systemd için dolu, diğerlerinde `null`; `appPool` yalnız `iis-static` için (swap sonrası recycle), yoksa `null`.
-  - `runtimeConfig` (string→string ya da `null`): agent bileşen köküne, **preserve'den sonra**
-    `config.js` = `window.__ENV__ = <JSON>;` yazar (IDP yönetir, korunan dosyayı ezer). Yalnız
-    `writeRuntimeConfig: true` bileşenlere, hedefin `runtimeConfig` değeri gider.
+  - `runtimeConfig`: `{format, values}` ya da `null`. `frontend-config-js` bileşen köküne
+    `config.js` = `window.__ENV__ = <JSON>;`; `env-file` ise `.env` yazar. Dosya adı payload'dan
+    alınmaz. Eski düz string map yalnız `writeRuntimeConfig: true` frontend bileşenleri için korunur.
   - `hooks.preStart` (ya da `null`): swap'tan **sonra**, servis başlamadan **önce**, bileşen kökünde sırayla
     çalışır (bkz. §3.2).
   - `timeoutSec`: agent tarafı genel süre; `900 + Σ health.timeoutSec + Σ hook.timeoutSec`, en az 1800, en çok 14400.
 - `artifact_rollback` `{ "deployId": "dep_…", "components": ["backend"] | null }` (`null` = önceki sürümü olan tüm bileşenler)
 - `artifact_cancel` `{ "deployId": "dep_…" }`
 - `artifact_status` `{ "requestId": "req_…" }`
+- `artifact_config_apply` `{ "deployId": "dep_…", "timeoutSec": 120,
+  "components": [{"name":"backend","runtimeConfig":{"format":"env-file","values":{"PORT":"3000"}}}] }`
+  kurulu release'i değiştirmeden config'i atomik yazar, runtime'ı yeniden başlatır/recycle eder, health-check
+  yapar; hata halinde eski config'i geri koyup runtime'ı tekrar ayağa kaldırır.
 
 **Agent → sunucu** (`type: "agent"`), gateway `FORWARDED_PROCESSES` ile backend aboneliğine iletilir:
 
@@ -119,6 +126,8 @@ Zarf değişmedi: `{date, type, agentId, process, payload}`.
   Red için de kullanılır: meşgul → `success:false, error:"busy"`; geçersiz payload → `error:"invalid_payload: …"`;
   base-path yok → `error:"not_configured"`; iptal → `error:"cancelled"`.
 - `artifact_status_result` `{ requestId, basePath, components: { "<name>": { version, deployedAt, previousVersions: [..] } } }`
+- `artifact_config_event` / `artifact_config_result`: config uygulamasının aşama ve terminal sonucu;
+  config **değerleri** hiçbir mesaj, log veya state dosyasına geri yazılmaz.
 
 **Korelasyon:** backend bir mesajı yalnızca `agentId` hedefin agent'ı **ve** `payload.deployId` bu deploy'un
 id'si ise sayar. Eski `command_execution_result` ve başka her trafik yok sayılır.
@@ -143,6 +152,47 @@ id'si ise sayar. Eski `command_execution_result` ve başka her trafik yok sayıl
   depolama URL'sine gitmez; yalnız `https://`; en çok 5 yönlendirme.
 - IP başına 60 istek/dk. Her indirme ve her ret audit'e düşer (`ARTIFACT_DOWNLOADED`, `ARTIFACT_DOWNLOAD_REJECTED`,
   `ARTIFACT_DOWNLOAD_FAILED`: artifact id, agent id, deployment id; **token asla**).
+
+### 2.4 CI artifact upload uçları
+
+CI sağlayıcısından bağımsız iki aşamalı sözleşme:
+
+1. Her artifact için:
+
+   ```http
+   PUT /api/artifact-uploads/<projectId>/<version>/<fileName>
+   Authorization: Bearer <IDP_ARTIFACT_UPLOAD_TOKEN>
+   Content-Type: application/gzip
+   X-Artifact-Sha256: <64 lowercase hex>
+
+   <raw .tar.gz body>
+   ```
+
+2. Tüm artifact'lar başarıyla yüklendikten sonra:
+
+   ```http
+   POST /api/artifact-uploads/<projectId>/<version>/finalize
+   Authorization: Bearer <IDP_ARTIFACT_UPLOAD_TOKEN>
+   Content-Type: application/json
+
+   { ...manifest... }
+   ```
+
+- Artifact adı yalnız yalın `.tar.gz`; slash, `..`, sürücü veya başka uzantı kabul edilmez.
+- Gövde stream edilerek `.staging` altında rastgele temp dosyaya yazılır. Byte limiti ve SHA-256 geçmeden
+  görünür dosya adına taşınmaz.
+- Finalize manifestteki **bütün** dosyaları diskten tekrar hash'ler. Eksik, fazla, symlink, farklı boyut/hash
+  varsa release `failed`; final dizin oluşmaz.
+- Doğrulanan staging dizini tek bir rename ile `releases` altına yayınlanır. Aynı sürüm + aynı içerik retry'ı
+  idempotenttir; aynı sürümü farklı içerikle overwrite etmek `409` döner.
+- IDP'den başlatılan CI build'i henüz `building` iken upload/finalize yapılabilir. Build tamamlandığında yerel
+  release zaten `ready` ise external kaynağa import denenmez.
+- Bearer yok/geçersiz: `401`; upload kapalı: `503`; declared/stream boyutu limiti aşarsa `413`.
+- Varsayılan tek-artifact limiti 1 GiB; `IDP_ARTIFACT_MAX_BYTES` ile en fazla 20 GiB.
+- Her proje için son üç yerel `ready` release tutulur. Daha eski binary + release satırı otomatik silinir;
+  herhangi bir hedefte kurulu (`current_release_id`) veya aktif deploy'da kullanılan release korunur. Bu
+  nedenle korunanlarla disk üzerinde üçten fazla release bulunabilir. External import release'leri bu
+  retention'a dahil değildir.
 
 ## 3. Proje ayarı: `config.artifactDeploy`
 
@@ -189,7 +239,7 @@ override'ı yok).
 | `components[].runtime` | `type` + `serviceName` (nssm/windows-service/systemd için zorunlu, `^[A-Za-z0-9._@-]{1,128}$`) / `appPool` (iis-static) |
 | `components[].preserve` | En çok 50 göreli desen (`..`, baştaki `/` ya da sürücü harfi yok). Canlı klasörden yeni sürüme kopyalanır, canlı kazanır |
 | `components[].health` | `null` ya da `{url (http/https), expectVersionPath?, timeoutSec 5–600 (vars. 90)}` |
-| `components[].writeRuntimeConfig` | `true` → hedefin `runtimeConfig`'i `config.js` olarak yazılır |
+| `components[].writeRuntimeConfig` | Yalnız eski düz runtimeConfig map uyumluluğu: `true` → `config.js`. Yeni component-aware config'te format hedefte seçilir |
 | `components[].hooks` | `null` ya da `{ preStart: [...] }` (bkz. 3.2) |
 
 Kaydetme sırasında `artifactDeploy` **bir bütün olarak değiştirilir** (silinen bileşen/desen/hook gerçekten
@@ -207,13 +257,14 @@ alınır.
 | `name` | `^[a-z][a-z0-9-]{0,31}$`, bileşen içinde benzersiz |
 | `command` | **yalın çalıştırılabilir adı** `^[A-Za-z0-9._-]{1,64}$`; yol ayırıcı yok, agent PATH'ten çözer |
 | `args` | en çok 20 string, her biri ≤ 512 karakter, NUL yok. Kabuk yok: argüman listesi olarak geçer |
-| `env` | en çok 20 anahtar, `^[A-Z_][A-Z0-9_]*$`, değer ≤ 1024 karakter |
+| `env` | yalnız `NODE_ENV` kabul edilir (değer ≤ 1024 karakter); diğer tüm değerler target runtime config'e gider |
 | `timeoutSec` | 1–3600, varsayılan 600 |
 
 - Hook'lar **yalnız proje ayarından** gelir (`project:write`, admin). Deploy anındaki parametrelerden **asla**
   kabul edilmez; deploy isteğinde `hooks` alanı 400 döner.
-- `pre_start` olaylarında yalnız hook adı görünür; env değerleri log, olay ve audit'e yazılmaz. Yine de hook
-  env'ine sır koymayın: sunucudaki `.env` (preserve) daha doğru yerdir.
+- `pre_start` olaylarında yalnız hook adı görünür; env değerleri log, olay ve audit'e yazılmaz. Hook env proje
+  ayarlarında tutulduğu için sır taşıyamaz. Kalıcı sırları
+  hook env'ine değil hedefin şifreli `backend: {format:"env-file", values:{...}}` config'ine koyun.
 
 JetSRM örneği (Sequelize, 440 migration, uygulama açılışta migrate etmez):
 
@@ -240,28 +291,118 @@ Build job'ı (CI Pipeline, GitHub Actions ya da Jenkins):
 2. Her bileşen için `<artifactName>-<component>-<version>[-<os>].tar.gz` üretir (dosya adı serbest ama
    manifest'teki `file` ile aynı olmalı). Arşiv kökü = bileşen klasörü.
 3. `<artifactName>-<version>-manifest.json` üretir (sha256 + boyut).
-4. Hepsini Bitbucket Downloads'a ya da `v<version>` (veya `<version>`) etiketli GitHub Release'e yükler.
-5. Başarısızsa non-zero çıkar: IDP release'i `failed` yapar ve manifest okumaz.
+4. Artifact dosyalarını provider bağımsız CI upload API'sine `PUT` eder ve manifest gövdesiyle release'i
+   `finalize` eder. Bitbucket, GitHub ve Jenkins'in tamamı aynı IDP uçlarını kullanır.
+5. Herhangi bir build, yerel doğrulama, upload veya finalize adımı başarısızsa non-zero çıkar. Yarım kalan
+   staging dizini `ready` release olarak görünmez.
 
-Manifest üreten küçük bir script (repo içinde `scripts/make-manifest.js`):
+Manifest üretmek için repo içindeki dış bağımlılıksız Node 24 aracı kullanılır:
 
-```js
-// node scripts/make-manifest.js <artifactName> <version> <commit> <component>:<os>:<file> ...
-const fs = require('fs');
-const crypto = require('crypto');
-const path = require('path');
-const [project, version, commit, ...entries] = process.argv.slice(2);
-const artifacts = entries.map((entry) => {
-  const [component, os, file] = entry.split(':');
-  const data = fs.readFileSync(file);
-  return { component, os, file: path.basename(file), size: data.length,
-           sha256: crypto.createHash('sha256').update(data).digest('hex') };
-});
-fs.writeFileSync(`${project}-${version}-manifest.json`,
-  JSON.stringify({ schema: 1, project, version, commit, createdAt: new Date().toISOString(), artifacts }, null, 2));
+```bash
+node scripts/make-manifest.js jetsrm "$VERSION" "$COMMIT_SHA" \
+  "backend:win-x64:artifacts/jetsrm-backend-$VERSION-win-x64.tar.gz" \
+  "backend:linux-x64:artifacts/jetsrm-backend-$VERSION-linux-x64.tar.gz" \
+  "frontend:any:artifacts/jetsrm-frontend-$VERSION.tar.gz"
+mv "jetsrm-$VERSION-manifest.json" artifacts/
 ```
 
-### 4.1 Bitbucket Pipelines (custom pipeline)
+Ardından aynı dizindeki artifact'lar manifest ile yeniden doğrulanır, sırayla yüklenir ve finalize edilir:
+
+```bash
+export IDP_URL="https://idp.example.com"
+export IDP_PROJECT_ID="<IDP proje kimliği>"
+# Buradaki değer backend master'ından bu proje için türetilir ve yalnız CI secret store'dan gelir.
+node scripts/upload-artifacts.js \
+  --project-id "$IDP_PROJECT_ID" \
+  --version "$VERSION" \
+  --manifest "artifacts/jetsrm-$VERSION-manifest.json"
+```
+
+`upload-artifacts.js` token'ı komut satırı argümanı olarak kabul etmez ve yazdırmaz. Her dosyayı ağa çıkmadan
+önce manifestteki SHA-256 ve boyutla karşılaştırır; raw `PUT` isteklerini sıralı gönderir; ilk hatada durur ve
+`finalize` çağırmaz. Varsayılan istek zaman aşımı 30 dakikadır
+(`IDP_ARTIFACT_UPLOAD_TIMEOUT_MS`). Düz HTTP token'ı açığa çıkaracağı için yalnız localhost'ta varsayılan olarak
+kabul edilir; güvenilen özel ağda zorunluysa açıkça `--allow-http` gerekir.
+
+Bu iki script uygulama reposunda örneklerdeki gibi `scripts/` altında takip edilmelidir. Başka bir alt dizine
+taşınırsa pipeline yollarını da güncelleyin. Örnek `npm run build:*` komutları uygulama reposunun build komutlarıdır ve şu
+dizinleri üretir:
+
+```text
+dist/backend/win-x64/    # Windows için bir kez
+dist/backend/linux-x64/  # Linux için bir kez
+dist/frontend/           # bütün müşteriler için ortak, bir kez
+```
+
+Hazır örnekler:
+
+- Bitbucket Pipelines: `examples/pipelines/bitbucket-pipelines.artifact-upload.yml`
+- GitHub Actions: `examples/pipelines/github-actions.artifact-upload.yml`
+- Jenkins: `examples/pipelines/Jenkinsfile.artifact-upload`
+
+Üçü de Node 24 kullanır, aynı commit'ten üç artifact üretir ve aynı upload CLI'ıyla IDP backend'e yollar.
+`IDP_URL` ve `IDP_PROJECT_ID` secret değildir; CI variable olarak tutulabilir.
+Backend `.env` içindeki `IDP_ARTIFACT_UPLOAD_TOKEN` bir **master** sırdır ve CI'a verilmez. Her proje için
+sunucuda bir kez aşağıdaki komut çalıştırılır; çıktı yalnız o `project-id` upload yollarında geçerlidir:
+
+```bash
+cd backend
+node scripts/derive-artifact-upload-token.js <IDP_PROJECT_ID>
+```
+
+Komutun çıktısı CI tarafında yine `IDP_ARTIFACT_UPLOAD_TOKEN` adıyla yalnız aşağıdaki korumalı kaynaklara konur:
+
+- Bitbucket: secured repository/workspace variable
+- GitHub: Actions repository/environment secret
+- Jenkins: Secret Text credential + `withCredentials`
+
+Komut izlemeyi (`set -x`, PowerShell transcript/verbose echo) secret bulunan publish adımında açmayın. Token'ı
+URL'ye, manifest'e, artifact'a veya pipeline parametresine koymayın. Bir proje tokenının sızması başka IDP
+projelerine upload yetkisi vermez; master sızarsa backend `.env` içinde döndürüp tüm proje tokenlarını yenileyin.
+
+Runtime backend `.env` dosyası Linux'ta agent tarafından yeni oluşturulduğunda `0600` yapılır. Windows'ta
+uygulamanın çalıştığı servis hesabı projeden projeye değişebildiği için agent bilinmeyen hesabı ACL'e ekleyemez:
+proje kökünün ACL'inde yalnız Administrators, SYSTEM ve uygulamanın gerçek servis hesabına erişim verin.
+IIS site physical path'ini proje kökü veya backend yerine yalnız `<proje>\frontend` olarak ayarlayın.
+
+### 4.1 Bitbucket Pipelines
+
+`examples/pipelines/bitbucket-pipelines.artifact-upload.yml`, IDP'nin doldurduğu `VERSION` custom pipeline
+değişkenini kullanır. Windows backend self-hosted Windows runner'da; Linux backend ile ortak frontend Node 24
+container'ında build edilir. Son adım önceki adımların artifact'larını alır, manifest üretir ve IDP'ye yollar.
+
+IDP ayarı: `build.provider: pipeline`, projenin `ciConfig.platform: bitbucket` ve `ciConfig.pipeline:
+idp-release`. Gerekli secured variable: `IDP_ARTIFACT_UPLOAD_TOKEN`; diğer variable'lar: `IDP_URL`,
+`IDP_PROJECT_ID`.
+
+### 4.2 GitHub Actions
+
+`examples/pipelines/github-actions.artifact-upload.yml` dosyasını uygulama reposunda
+`.github/workflows/idp-release.yml` olarak kullanın. `workflow_dispatch.inputs.VERSION` IDP'nin
+`versionVariable` alanıyla aynıdır. Windows ve Linux job'ları çıktıları geçici workflow artifact'larıyla yalnız
+publish job'ına taşır; kalıcı release kaynağı IDP backend'dir.
+
+Gerekli secret: `IDP_ARTIFACT_UPLOAD_TOKEN`; repository variable'ları: `IDP_URL`, `IDP_PROJECT_ID`.
+Workflow için `contents: read` yeterlidir; GitHub Release oluşturmaz ve `GITHUB_TOKEN` ile artifact yayınlamaz.
+
+### 4.3 Jenkins
+
+`examples/pipelines/Jenkinsfile.artifact-upload`, `VERSION` String Parameter'ı, Windows/Linux agent label'ları
+ve tek checkout'tan `stash/unstash` kullanır. `idp-artifact-upload-token` adlı Jenkins **Secret Text**
+credential yalnız publish stage'inde açılır. `IDP_URL` ve `IDP_PROJECT_ID` job/global variable olmalıdır.
+
+IDP ayarı: `build.provider: jenkins`. IDP `buildWithParameters` çağrısında `VERSION=<sürüm>` gönderir. Job
+başarısı ancak IDP finalize yanıtı başarılıysa döner.
+Folder içindeki job'larda IDP `Job Name` alanına `team/release` biçimindeki tam yolu kabul eder ve Jenkins
+Remote API için bunu `/job/team/job/release` yoluna dönüştürür.
+
+### 4.4 Legacy external import — yeni upload yolu değildir
+
+Aşağıdaki eski örnekler yalnız mevcut Bitbucket Downloads / GitHub Release asset'lerini IDP'ye **import** eden
+geriye uyumluluk yolunu açıklar. Yeni pipeline'lar bunları kullanmamalıdır. Legacy importta binary IDP'de
+saklanmaz; deploy sırasında external kaynaktan proxy edilir ve yerel son-üç retention kapsamına girmez.
+
+#### 4.4.1 Bitbucket Downloads (legacy)
 
 IDP ayarı: `build.provider: pipeline`, projenin `ciConfig.pipeline: release`, `artifactDeploy.source.platform:
 bitbucket`. Downloads'a yükleme için repository'de `BB_UPLOAD_TOKEN` (secured) değişkeni: `repository:write`
@@ -308,7 +449,7 @@ Notlar: Bitbucket Downloads aynı adlı dosyayı üzerine yazar; aynı sürümü
 değiştirir (IDP re-import ile yeni sha'yı alır). Windows runner'da script PowerShell'dir (`$env:VERSION`).
 Manuel adım ya da onay koymayın: onay noktası IDP'dir (bkz. `docs/CI-PIPELINE.md` §7).
 
-### 4.2 GitHub Actions (workflow_dispatch)
+#### 4.4.2 GitHub Release assets (legacy)
 
 IDP ayarı: `build.provider: pipeline`, `ciConfig.platform: github`, `ciConfig.pipeline: release.yml`,
 `artifactDeploy.source.platform: github`. Input adı `versionVariable` ile aynı olmalı.
@@ -365,7 +506,7 @@ IDP release'i önce `v<version>`, sonra `<version>` etiketiyle arar. IDP'nin kay
 **Contents: Read** yeterli (release + asset okuma); build'i tetikleyen `ciConfig` token'ı ayrıca **Actions: Read
 and write** ister.
 
-### 4.3 Jenkins
+#### 4.4.3 Jenkins external publish (legacy)
 
 - `build.provider: jenkins`; projenin `url`, `jobName`, `username`, `apiToken` alanları kullanılır. IDP job'ı
   `buildWithParameters` ile `<versionVariable>=<version>` parametresiyle tetikler; job bu adla bir **String
@@ -385,7 +526,10 @@ POST /api/projects/:id/targets
 { "name": "temsa-prod", "agentId": "TEMSA-WIN-01", "os": "windows", "environment": "Prod",
   "components": [ { "name": "backend", "runtime": { "type": "nssm", "serviceName": "temsa-backend" },
                     "health": { "url": "http://127.0.0.1:4000/health" } }, { "name": "frontend" } ],
-  "runtimeConfig": { "VITE_APP_MAIN_URL": "https://api.temsa.example", "VITE_COMPANY_NAME": "temsa" } }
+  "runtimeConfig": {
+    "backend": { "format": "env-file", "values": { "PORT": "4000", "DB_PASSWORD": "..." } },
+    "frontend": { "format": "frontend-config-js", "values": {
+      "VITE_APP_MAIN_URL": "https://api.temsa.example", "VITE_COMPANY_NAME": "temsa" } } } }
 ```
 
 | Alan | Açıklama |
@@ -395,7 +539,7 @@ POST /api/projects/:id/targets
 | `os` | `windows` \| `linux`: artifact seçimini belirler (`win-x64`/`linux-x64`, yoksa `any`) |
 | `environment` | `Dev` \| `Stage` \| `Prod` \| `null`. **Prod** ise (ya da hedef adı `prod` içeriyorsa, ya da ortam boş ve proje Prod ise) deploy ve rollback `confirmation` = hedef adı ister (T-51 ile aynı 400 gövdesi) |
 | `components` | Opsiyonel: bu sunucuda deploy edilecek bileşenler + sunucuya özel `runtime`/`health` override'ı. Boşsa projenin tüm bileşenleri |
-| `runtimeConfig` | `config.js`'e yazılacak anahtarlar (`^[A-Z][A-Z0-9_]*$`, değer ≤ 2000, en çok 100). Tarayıcıya servis edilir: **sır koymayın** |
+| `runtimeConfig` | Bileşen adına göre `{format, values}`. `env-file` → `.env`, `frontend-config-js` → `config.js`. Anahtar `^[A-Z][A-Z0-9_]*$`, değer ≤ 2000, bileşen başına en çok 100. `config.js` tarayıcıya servis edilir: **sır koymayın** |
 | `basePath`, `currentVersions`, `currentReleaseId` | Bilgi amaçlı; `POST /api/targets/:id/refresh-status` agent'tan (`artifact_status`) doldurur, başarılı deploy günceller |
 
 ## 6. Deploy akışı
@@ -428,12 +572,13 @@ POST /api/projects/:id/targets
 | `POST /api/projects/:id/releases` `{version, ref?}` | `release:create` (deployer) | 202 + build `deploymentId` (SSE). `ref` yalnız pipeline build |
 | `POST /api/projects/:id/releases/import` `{version}` | `release:create` | manifest'i okur; yeniden import artifact id'lerini korur |
 | `GET /api/releases/:id` | `project:read` | release + artifact'lar |
-| `DELETE /api/releases/:id` | `release:delete` (admin) | yalnız DB satırları |
+| `DELETE /api/releases/:id` | `release:delete` (admin) | local release binary + DB satırları; kurulu/aktif release silinmez |
 | `GET /api/projects/:id/targets` | `project:read` | |
 | `POST /api/projects/:id/targets` · `PUT/DELETE /api/targets/:id` | `project:write` (admin) | |
 | `POST /api/targets/:id/refresh-status` | `deploy:trigger` | `artifact_status` |
 | `POST /api/targets/:id/deploy` | `deploy:trigger` | `IDP_PUBLIC_URL` yoksa 503 |
 | `POST /api/targets/:id/rollback` | `deploy:trigger` | |
+| `POST /api/targets/:id/apply-config` | `deploy:trigger` | release değiştirmeden config + restart + health-check; Prod onayı gerekir |
 | `GET /api/deployments/:id/events` | `project:read` | |
 | `POST /api/deploy/:id/abort` | `deploy:abort` | iptal (mevcut uç) |
 | `GET /api/artifacts/:artifactId/download` | indirme token'ı | oturum yok |
@@ -471,6 +616,10 @@ IDP_PUBLIC_URL=https://idp.<alan>
 - **Repo token'ı** (`artifactDeploy.source.token` ya da `apiToken`) yalnız backend'de, şifreli saklanır; yalnız
   yapılandırılmış `https://` API host'una gönderilir; yönlendirmelerde depolama host'una gönderilmez; log ve hata
   mesajlarından ayıklanır.
+- **Hedef runtime config değerleri**, `IDP_SECRET_KEY`/OS safeStorage mevcutsa aynı secret store'da
+  AES-256-GCM ile saklanır; SQLite'ta yalnız `secret://` referansları bulunur. Secret store kapalıysa geriye
+  uyumluluk için düz metin kalır; sunucu kurulumunda `IDP_SECRET_KEY` zorunlu kabul edilmelidir. Frontend
+  `config.js` değerleri son kullanıcıya açıktır; parola/token koymayın.
 - **Payload'daki tek sır** bileşen başına indirme token'ıdır; token'lar loglanmaz, audit'e yazılmaz, yalnız
   hash'leri saklanır, 30 dk / 5 kullanım / artifact bağı / deploy bitince silme ile sınırlıdır.
 - Gateway `artifact-command` ucu: yalnız loopback kontrol dinleyicisi, kontrol token'ı zorunlu, `process` izin
@@ -506,7 +655,7 @@ IDP_PUBLIC_URL=https://idp.<alan>
 |---|---|
 | `backend/.env` | `IDP_PUBLIC_URL=https://idp.<alan>` (production'da https) |
 | `backend/.env` | `IDP_AGENT_API_URL=http://127.0.0.1:7004`, `IDP_AGENT_API_TOKEN=<gateway ile aynı>` (mevcut) |
-| `backend/.env` | `IDP_SECRET_KEY` (kaynak token'ı şifreli saklansın diye; mevcut) |
+| `backend/.env` | `IDP_SECRET_KEY` (kaynak token'ı ve hedef runtime `.env` değerleri şifreli saklansın diye; mevcut) |
 | Ters proxy / tünel | Yalnız `/api/artifacts/*/download` dışarı (ya da tüm API TLS + `IDP_COOKIE_SECURE=true`), `Authorization` iletilir, tamponlama kapalı |
 | Gateway | Güncel `idp-agent-gateway` (yeni `artifact-command` ucu ve iletilen process'ler) |
 | Proje ayarı | `artifactDeploy` (kaynak, build, bileşenler, hook'lar) |

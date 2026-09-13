@@ -55,6 +55,7 @@ const HOOK_COMMAND_PATTERN = /^[A-Za-z0-9._-]{1,64}$/;
 const MAX_HOOK_ARGS = 20;
 const MAX_HOOK_ARG_LENGTH = 512;
 const HOOK_ENV_KEY_PATTERN = /^[A-Z_][A-Z0-9_]*$/;
+const SAFE_HOOK_ENV_KEYS = new Set(['NODE_ENV']);
 const MAX_HOOK_ENV = 20;
 const MAX_HOOK_ENV_VALUE_LENGTH = 1024;
 const HOOK_TIMEOUT_SEC = { min: 1, max: 3600, default: 600 };
@@ -63,6 +64,9 @@ const HOOK_TIMEOUT_SEC = { min: 1, max: 3600, default: 600 };
 const RUNTIME_CONFIG_KEY_PATTERN = /^[A-Z][A-Z0-9_]*$/;
 const MAX_RUNTIME_CONFIG_KEYS = 100;
 const MAX_RUNTIME_CONFIG_VALUE_LENGTH = 2000;
+const RUNTIME_CONFIG_FORMATS = ['frontend-config-js', 'env-file'];
+// Leave headroom under the gateway's 256 KiB typed-command body limit.
+const MAX_RUNTIME_CONFIG_TOTAL_BYTES = 192 * 1024;
 
 const DEPLOY_STAGES = [
   'accepted', 'downloading', 'verifying', 'extracting', 'preserving', 'configuring', 'stopping',
@@ -73,7 +77,9 @@ const DEPLOY_EVENT_STATUSES = ['started', 'progress', 'done', 'failed', 'skipped
 /** Agent-side global deploy timeout bounds (payload `timeoutSec`). */
 const DEPLOY_TIMEOUT_SEC = { min: 1800, max: 4 * 3600, base: 900 };
 
-const ARTIFACT_COMMAND_PROCESSES = ['artifact_deploy', 'artifact_rollback', 'artifact_cancel', 'artifact_status'];
+const ARTIFACT_COMMAND_PROCESSES = [
+  'artifact_deploy', 'artifact_rollback', 'artifact_config_apply', 'artifact_cancel', 'artifact_status',
+];
 
 // ---------------------------------------------------------------------------
 // helpers
@@ -387,6 +393,11 @@ function validateHook(hook, path, errors) {
         // Messages name the key only — env values may be sensitive and must never be echoed.
         if (!HOOK_ENV_KEY_PATTERN.test(key)) {
           errors.push({ path: childPath(path, 'env'), message: `Variable name '${key.slice(0, 40)}' must match ^[A-Z_][A-Z0-9_]*$.` });
+        } else if (!SAFE_HOOK_ENV_KEYS.has(key)) {
+          errors.push({
+            path: childPath(path, 'env'),
+            message: `Hook variable '${key.slice(0, 40)}' is not allowlisted; target-specific values must be stored in encrypted env-file runtime config.`,
+          });
         }
         if (typeof value !== 'string' || value.length > MAX_HOOK_ENV_VALUE_LENGTH || value.includes('\u0000')) {
           errors.push({
@@ -656,10 +667,18 @@ const TARGET_KEYS = ['name', 'agentId', 'os', 'environment', 'basePath', 'compon
 const TARGET_COMPONENT_KEYS = ['name', 'runtime', 'health'];
 const AGENT_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]{2,127}$/;
 
-function validateRuntimeConfig(value, path, errors) {
+function validateRuntimeConfigValues(value, path, errors) {
   if (value === undefined || value === null) return;
   if (!isPlainObject(value)) {
     errors.push({ path, message: 'Must be an object of string values or null.' });
+    return;
+  }
+  try {
+    if (Buffer.byteLength(JSON.stringify(value), 'utf8') > MAX_RUNTIME_CONFIG_TOTAL_BYTES) {
+      errors.push({ path, message: `Must be at most ${MAX_RUNTIME_CONFIG_TOTAL_BYTES} UTF-8 bytes.` });
+    }
+  } catch {
+    errors.push({ path, message: 'Must be JSON serializable.' });
     return;
   }
   const entries = Object.entries(value);
@@ -674,6 +693,77 @@ function validateRuntimeConfig(value, path, errors) {
       errors.push({ path: childPath(path, key.slice(0, 40)), message: `Must be a string of at most ${MAX_RUNTIME_CONFIG_VALUE_LENGTH} characters.` });
     }
   }
+}
+
+function isLegacyRuntimeConfig(value) {
+  return isPlainObject(value) && Object.values(value).every((entry) => typeof entry === 'string');
+}
+
+function validateRuntimeConfig(value, path, errors) {
+  if (value === undefined || value === null) return;
+  if (!isPlainObject(value)) {
+    errors.push({ path, message: 'Must be a component config object, a legacy string map, or null.' });
+    return;
+  }
+  try {
+    if (Buffer.byteLength(JSON.stringify(value), 'utf8') > MAX_RUNTIME_CONFIG_TOTAL_BYTES) {
+      errors.push({ path, message: `Serialized runtime config must be at most ${MAX_RUNTIME_CONFIG_TOTAL_BYTES} UTF-8 bytes.` });
+      return;
+    }
+  } catch {
+    errors.push({ path, message: 'Must be JSON serializable.' });
+    return;
+  }
+  if (isLegacyRuntimeConfig(value)) {
+    validateRuntimeConfigValues(value, path, errors);
+    return;
+  }
+  if (Object.keys(value).length > MAX_COMPONENTS) {
+    errors.push({ path, message: `Must contain at most ${MAX_COMPONENTS} component entries.` });
+  }
+  for (const [componentName, spec] of Object.entries(value)) {
+    const specPath = childPath(path, componentName.slice(0, 40));
+    if (!COMPONENT_NAME_PATTERN.test(componentName)) {
+      errors.push({ path: specPath, message: 'Component name must match ^[a-z][a-z0-9-]{0,31}$.' });
+      continue;
+    }
+    if (!isPlainObject(spec)) {
+      errors.push({ path: specPath, message: 'Must be an object with format and values.' });
+      continue;
+    }
+    errors.push(...unknownKeyErrors(spec, ['format', 'values'], specPath));
+    if (!RUNTIME_CONFIG_FORMATS.includes(spec.format)) {
+      errors.push({ path: childPath(specPath, 'format'), message: `Must be one of: ${RUNTIME_CONFIG_FORMATS.join(', ')}.` });
+    }
+    if (!Object.prototype.hasOwnProperty.call(spec, 'values')) {
+      errors.push({ path: childPath(specPath, 'values'), message: 'Is required.' });
+    } else {
+      validateRuntimeConfigValues(spec.values, childPath(specPath, 'values'), errors);
+    }
+  }
+}
+
+function cloneRuntimeConfig(value) {
+  if (!isPlainObject(value)) return null;
+  if (isLegacyRuntimeConfig(value)) return { ...value };
+  return Object.fromEntries(Object.entries(value).map(([name, spec]) => [name, {
+    format: spec.format,
+    values: isPlainObject(spec.values) ? { ...spec.values } : spec.values,
+  }]));
+}
+
+/** Resolve a target config for one component. Legacy maps remain frontend config.js. */
+function runtimeConfigForComponent(runtimeConfig, component) {
+  if (!isPlainObject(runtimeConfig)) return null;
+  if (isLegacyRuntimeConfig(runtimeConfig)) {
+    return component.writeRuntimeConfig && Object.keys(runtimeConfig).length > 0
+      ? { format: 'frontend-config-js', values: { ...runtimeConfig } }
+      : null;
+  }
+  const spec = runtimeConfig[component.name];
+  return isPlainObject(spec) && isPlainObject(spec.values)
+    ? { format: spec.format, values: { ...spec.values } }
+    : null;
 }
 
 function validateTargetComponents(value, path, errors) {
@@ -742,7 +832,7 @@ function validateTargetInput(input, { partial = false } = {}) {
   }
   if (present('runtimeConfig')) {
     validateRuntimeConfig(input.runtimeConfig, 'runtimeConfig', errors);
-    value.runtimeConfig = isPlainObject(input.runtimeConfig) ? { ...input.runtimeConfig } : null;
+    value.runtimeConfig = cloneRuntimeConfig(input.runtimeConfig);
   }
   return { errors, value };
 }
@@ -858,8 +948,8 @@ function artifactDownloadUrl(publicUrl, artifactId) {
 }
 
 /**
- * Builds the `artifact_deploy` payload (contract 1.2). The only credential in
- * it is each component's short-lived download token.
+ * Builds the `artifact_deploy` payload (contract 1.2). It carries short-lived
+ * download tokens and target runtime values, so the agent transport must use WSS.
  *
  * @param {object} args
  * @param {string} args.deployId
@@ -891,9 +981,7 @@ function buildDeployPayload({ deployId, release, components, artifacts, tokens, 
         runtime: { ...component.runtime },
         preserve: [...component.preserve],
         health: component.health ? { ...component.health } : null,
-        runtimeConfig: component.writeRuntimeConfig && isPlainObject(runtimeConfig) && Object.keys(runtimeConfig).length > 0
-          ? { ...runtimeConfig }
-          : null,
+        runtimeConfig: runtimeConfigForComponent(runtimeConfig, component),
         hooks: component.hooks
           ? { preStart: component.hooks.preStart.map((hook) => ({ ...hook, args: [...hook.args], env: { ...hook.env } })) }
           : null,
@@ -937,6 +1025,8 @@ module.exports = {
   HOOK_TIMEOUT_SEC,
   HEALTH_TIMEOUT_SEC,
   MAX_COMPONENTS,
+  RUNTIME_CONFIG_FORMATS,
+  MAX_RUNTIME_CONFIG_TOTAL_BYTES,
   isPlainObject,
   isSafePreservePattern,
   isSafeSubdir,
@@ -947,6 +1037,8 @@ module.exports = {
   findMissingSourceFields,
   resolveSourceCredentials,
   validateTargetInput,
+  isLegacyRuntimeConfig,
+  runtimeConfigForComponent,
   isProdTarget,
   checkTargetConfirmation,
   targetArtifactOs,

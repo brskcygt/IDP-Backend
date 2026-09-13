@@ -15,9 +15,12 @@
  *   POST   /api/targets/:id/refresh-status         deploy:trigger
  *   POST   /api/targets/:id/deploy                 deploy:trigger  {releaseId, components?, confirmation?}
  *   POST   /api/targets/:id/rollback               deploy:trigger  {components?, confirmation?}
+ *   POST   /api/targets/:id/apply-config           deploy:trigger  {confirmation?}
  *   GET    /api/deployments/:id/events             project:read
  *
  *   GET    /api/artifacts/:artifactId/download     NO session — `Authorization: Bearer <download token>` only
+ *   PUT    /api/artifact-uploads/:projectId/:version/:fileName  CI bearer + raw .tar.gz
+ *   POST   /api/artifact-uploads/:projectId/:version/finalize  CI bearer + manifest JSON
  *
  * Cancel = the existing POST /api/deploy/:id/abort (deploy:abort).
  * Business logic lives in core/artifacts/*; this file maps HTTP in/out.
@@ -25,6 +28,7 @@
 
 const express = require('express');
 const { pipeline } = require('node:stream/promises');
+const { verifyArtifactUploadToken } = require('../auth/artifactUploadToken');
 const { requirePermission } = require('../auth/permissions');
 const { validate, string, array, object, optional } = require('../validation/schema');
 const { sendError } = require('../http/errorMapper');
@@ -52,6 +56,10 @@ const rollbackSchema = object({
   fields: { components: componentsRule(), confirmation: optional(string({ max: 200 })) },
   allowUnknown: false,
 });
+const applyConfigSchema = object({
+  fields: { confirmation: optional(string({ max: 200 })) },
+  allowUnknown: false,
+});
 
 function bearerToken(req) {
   const match = /^Bearer\s+(\S+)$/i.exec(String(req.get('authorization') || '').trim());
@@ -60,21 +68,26 @@ function bearerToken(req) {
 
 /**
  * @param {object} deps
- * @param {{ releaseService: object, targetService: object, artifactDeployService: object, downloadService: object }} deps.services
+ * @param {{ releaseService: object, targetService: object, artifactDeployService: object, uploadService?: object, downloadService: object }} deps.services
  * @param {(id: string) => object} deps.getProject
  * @param {{ log: Function }} deps.auditLogger
  * @param {string|null} deps.publicUrl - IDP_PUBLIC_URL (validated), null = artifact deploy disabled.
  * @param {string|null} [deps.publicUrlError]
- * @param {{ trigger?: Function, download?: Function }} [deps.rateLimits]
- * @returns {{ apiRouter: import('express').Router, downloadRouter: import('express').Router }}
+ * @param {{ token?: string|null, maxArtifactBytes?: number }} [deps.upload]
+ * @param {{ trigger?: Function, download?: Function, upload?: Function }} [deps.rateLimits]
+ * @returns {{ apiRouter: import('express').Router, downloadRouter: import('express').Router, uploadRouter: import('express').Router }}
  */
-function createArtifactRoutes({ services, getProject, auditLogger, publicUrl = null, publicUrlError = null, rateLimits = {} }) {
+function createArtifactRoutes({ services, getProject, auditLogger, publicUrl = null, publicUrlError = null, upload = {}, rateLimits = {} }) {
   if (!services) throw new Error('createArtifactRoutes: services are required.');
   if (!auditLogger) throw new Error('createArtifactRoutes: auditLogger is required.');
-  const { releaseService, targetService, artifactDeployService, downloadService } = services;
+  const { releaseService, targetService, artifactDeployService, uploadService, downloadService } = services;
   const trigger = rateLimits.trigger ? [rateLimits.trigger] : [];
   const actor = (req) => req.session?.user?.username;
   const invalid = (res, message, result) => res.status(400).json({ error: message, details: result.errors });
+
+  function validUploadBearer(req) {
+    return verifyArtifactUploadToken(upload.token, req.params.projectId, bearerToken(req));
+  }
 
   const api = express.Router();
 
@@ -133,9 +146,12 @@ function createArtifactRoutes({ services, getProject, auditLogger, publicUrl = n
 
   // ----------------------------------------------------------------- targets
 
-  api.get('/api/projects/:id/targets', requirePermission('project:read'), (req, res) => {
+  api.get('/api/projects/:id/targets', requirePermission('project:read'), async (req, res) => {
     try {
-      res.json(targetService.listTargets(req.params.id));
+      res.set('Cache-Control', 'no-store');
+      res.json(await targetService.listTargets(req.params.id, {
+        includeRuntimeConfig: req.session?.user?.role === 'admin',
+      }));
     } catch (err) {
       sendError(res, err);
     }
@@ -143,6 +159,7 @@ function createArtifactRoutes({ services, getProject, auditLogger, publicUrl = n
 
   api.post('/api/projects/:id/targets', requirePermission('project:write'), async (req, res) => {
     try {
+      res.set('Cache-Control', 'no-store');
       res.status(201).json(await targetService.createTarget(req.params.id, req.body ?? {}, actor(req)));
     } catch (err) {
       sendError(res, err);
@@ -151,15 +168,16 @@ function createArtifactRoutes({ services, getProject, auditLogger, publicUrl = n
 
   api.put('/api/targets/:id', requirePermission('project:write'), async (req, res) => {
     try {
+      res.set('Cache-Control', 'no-store');
       res.json(await targetService.updateTarget(req.params.id, req.body ?? {}, actor(req)));
     } catch (err) {
       sendError(res, err);
     }
   });
 
-  api.delete('/api/targets/:id', requirePermission('project:write'), (req, res) => {
+  api.delete('/api/targets/:id', requirePermission('project:write'), async (req, res) => {
     try {
-      targetService.deleteTarget(req.params.id, actor(req));
+      await targetService.deleteTarget(req.params.id, actor(req));
       res.status(204).end();
     } catch (err) {
       sendError(res, err);
@@ -190,7 +208,7 @@ function createArtifactRoutes({ services, getProject, auditLogger, publicUrl = n
     const body = validate(req.body ?? {}, deploySchema);
     if (!body.valid) return invalid(res, 'Invalid deploy request.', body);
     try {
-      const target = targetService.getTarget(req.params.id);
+      const target = await targetService.getTarget(req.params.id);
       const rejection = confirmationError(target, body.value.confirmation);
       if (rejection) return res.status(400).json(rejection);
       const result = await artifactDeployService.deploy({
@@ -214,12 +232,33 @@ function createArtifactRoutes({ services, getProject, auditLogger, publicUrl = n
     const body = validate(req.body ?? {}, rollbackSchema);
     if (!body.valid) return invalid(res, 'Invalid rollback request.', body);
     try {
-      const target = targetService.getTarget(req.params.id);
+      const target = await targetService.getTarget(req.params.id);
       const rejection = confirmationError(target, body.value.confirmation);
       if (rejection) return res.status(400).json(rejection);
       const result = await artifactDeployService.rollback({
         targetId: target.id,
         components: body.value.components,
+        triggeredBy: actor(req),
+      });
+      res.status(202).json({
+        ...result,
+        sseUrl: `/api/deploy/logs/${result.deploymentId}`,
+        eventsUrl: `/api/deployments/${result.deploymentId}/events`,
+      });
+    } catch (err) {
+      sendError(res, err);
+    }
+  });
+
+  api.post('/api/targets/:id/apply-config', requirePermission('deploy:trigger'), ...trigger, async (req, res) => {
+    const body = validate(req.body ?? {}, applyConfigSchema);
+    if (!body.valid) return invalid(res, 'Invalid config apply request.', body);
+    try {
+      const target = await targetService.getTarget(req.params.id);
+      const rejection = confirmationError(target, body.value.confirmation);
+      if (rejection) return res.status(400).json(rejection);
+      const result = await artifactDeployService.applyConfig({
+        targetId: target.id,
         triggeredBy: actor(req),
       });
       res.status(202).json({
@@ -314,7 +353,70 @@ function createArtifactRoutes({ services, getProject, auditLogger, publicUrl = n
     }
   });
 
-  return { apiRouter: api, downloadRouter: download };
+  // --------------------------------------------------------------- CI upload
+
+  const uploadRouter = express.Router();
+  const uploadGuards = rateLimits.upload ? [rateLimits.upload] : [];
+
+  function requireUploadToken(req, res, next) {
+    if (!upload.token || !uploadService) {
+      req.resume();
+      return res.status(503).json({ error: 'CI artifact upload is not configured.' });
+    }
+    if (!validUploadBearer(req)) {
+      req.resume();
+      auditLogger.log(null, 'ARTIFACT_UPLOAD_REJECTED', 'CI artifact upload rejected', {}, { outcome: 'failure' });
+      return res.status(401).json({ error: 'Unauthorized' });
+    }
+    return next();
+  }
+
+  uploadRouter.put('/api/artifact-uploads/:projectId/:version/:fileName', ...uploadGuards, requireUploadToken, async (req, res) => {
+    const type = String(req.get('content-type') || '').split(';', 1)[0].trim().toLowerCase();
+    if (!['application/gzip', 'application/x-gzip', 'application/octet-stream'].includes(type)) {
+      req.resume();
+      return res.status(415).json({ error: 'Content-Type must be application/gzip or application/octet-stream.' });
+    }
+    const rawLength = req.get('content-length');
+    const contentLength = rawLength === undefined ? null : Number(rawLength);
+    if (contentLength !== null && (!Number.isSafeInteger(contentLength) || contentLength < 0)) {
+      req.resume();
+      return res.status(400).json({ error: 'Invalid Content-Length.' });
+    }
+    if (contentLength !== null && upload.maxArtifactBytes && contentLength > upload.maxArtifactBytes) {
+      req.resume();
+      return res.status(413).json({ error: `Artifact exceeds the ${upload.maxArtifactBytes} byte upload limit.` });
+    }
+    try {
+      const result = await uploadService.uploadArtifact({
+        projectId: req.params.projectId,
+        version: req.params.version,
+        fileName: req.params.fileName,
+        stream: req,
+        sha256: String(req.get('x-artifact-sha256') || '').trim(),
+        contentLength,
+      });
+      return res.status(result.idempotent ? 200 : 201).json(result);
+    } catch (err) {
+      if (err.code === 'ARTIFACT_TOO_LARGE') return res.status(413).json({ error: err.message });
+      return sendError(res, err);
+    }
+  });
+
+  uploadRouter.post('/api/artifact-uploads/:projectId/:version/finalize', ...uploadGuards, requireUploadToken, async (req, res) => {
+    try {
+      const result = await uploadService.finalizeRelease({
+        projectId: req.params.projectId,
+        version: req.params.version,
+        manifest: req.body,
+      });
+      return res.status(result.idempotent ? 200 : 201).json(result);
+    } catch (err) {
+      return sendError(res, err);
+    }
+  });
+
+  return { apiRouter: api, downloadRouter: download, uploadRouter };
 }
 
 module.exports = { createArtifactRoutes, ARTIFACT_ID_PATTERN };

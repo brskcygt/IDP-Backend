@@ -420,6 +420,7 @@ test('artifact-command: izinli komutlar agent\'a gider, yanıt 200 {sent:true}',
   const payloads = {
     artifact_deploy: { deployId: 'dep_1', project: 'jetsrm', version: '2.5.0', timeoutSec: 1800, components: [] },
     artifact_rollback: { deployId: 'dep_2', components: null },
+    artifact_config_apply: { deployId: 'dep_3', timeoutSec: 300, components: [{ name: 'backend', runtimeConfig: { format: 'env-file', values: { PORT: '3000' } } }] },
     artifact_cancel: { deployId: 'dep_1' },
     artifact_status: { requestId: 'req_1' },
   };
@@ -473,7 +474,7 @@ test('artifact-command: çevrimdışı agent 404, kontrol token zorunlu, agent p
   assert.equal((await env.api('/agent/artifact-command/WIN-01', { method: 'POST', body, base: env.agentUrl })).status, 404);
 });
 
-test('deploy_event, deploy_result ve artifact_status_result aboneye akar', async (t) => {
+test('artifact deploy/config event, result ve status mesajları aboneye akar', async (t) => {
   const env = await startApp(t);
   const secret = await issue(env, 'WIN-01');
   const agent = await openAgent(env, 'WIN-01', secret);
@@ -484,6 +485,8 @@ test('deploy_event, deploy_result ve artifact_status_result aboneye akar', async
   const messages = {
     deploy_event: { deployId: 'dep_1', component: 'backend', stage: 'downloading', status: 'progress', progress: 40, message: '' },
     deploy_result: { deployId: 'dep_1', success: true, version: '2.5.0', rolledBack: false, durationMs: 10, components: [], error: null },
+    artifact_config_event: { deployId: 'dep_3', component: 'backend', stage: 'configuring', status: 'done', message: '.env written' },
+    artifact_config_result: { deployId: 'dep_3', success: true, version: '2.5.0', components: [] },
     artifact_status_result: { requestId: 'req_1', basePath: 'C:/inetpub/wwwroot/jetsrm', components: {} },
   };
   agent.send(agentMessage('WIN-01', 'not_forwarded', { secret: 'x' }));

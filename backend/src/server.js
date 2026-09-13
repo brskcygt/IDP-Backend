@@ -114,15 +114,22 @@ const artifactRoutes = createArtifactRoutes({
   auditLogger,
   publicUrl: serverConfig.artifactDeploy.publicUrl,
   publicUrlError: serverConfig.artifactDeploy.publicUrlError,
+  upload: {
+    token: serverConfig.artifactDeploy.uploadToken,
+    maxArtifactBytes: serverConfig.artifactDeploy.maxArtifactBytes,
+  },
   rateLimits: {
     // Release build/import, deploy, rollback, status refresh: each one
     // starts real work (CI run, agent command).
     trigger: createRateLimit({ windowMs: 60 * 1000, max: 20 }),
     // Agents download each component once (+ retries); failures are 401s.
     download: createRateLimit({ windowMs: 60 * 1000, max: 60 }),
+    // CI may upload several OS/component artifacts for one release.
+    upload: createRateLimit({ windowMs: 60 * 1000, max: 120 }),
   },
 });
 app.use(artifactRoutes.downloadRouter);
+app.use(artifactRoutes.uploadRouter);
 
 // Auth Middleware
 const requireAuth = (req, res, next) => {

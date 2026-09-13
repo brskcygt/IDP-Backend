@@ -5,8 +5,9 @@
  * token check + opening the source stream. The HTTP route only pipes.
  *
  * The agent never sees the repository token: it presents its per-deploy
- * download token here, the backend fetches from Bitbucket/GitHub with the
- * repository token and streams the body through.
+ * download token here. Locally uploaded releases stream from the IDP artifact
+ * store; legacy imports still proxy Bitbucket/GitHub without exposing the
+ * repository token.
  */
 
 const {
@@ -26,9 +27,10 @@ function defaultCreateSourceClient(source, credentials) {
  * @param {object} deps.tokens - download token service.
  * @param {(id: string) => object} deps.getProject
  * @param {(project: object) => Promise<object>} deps.resolveSecrets
+ * @param {object} [deps.localStore]
  * @param {Function} [deps.createSourceClient]
  */
-function createArtifactDownloadService({ repository, tokens, getProject, resolveSecrets, createSourceClient = defaultCreateSourceClient }) {
+function createArtifactDownloadService({ repository, tokens, getProject, resolveSecrets, localStore = null, createSourceClient = defaultCreateSourceClient }) {
   return {
     /**
      * Consumes one use of `token` for `artifactId`.
@@ -49,6 +51,10 @@ function createArtifactDownloadService({ repository, tokens, getProject, resolve
      * @returns {Promise<{ stream: import('node:stream').Readable, contentLength: number|null }>}
      */
     async open({ artifact, release }, { signal } = {}) {
+      if (release.sourcePlatform === 'local') {
+        if (!localStore) throw new Error('Local artifact storage is unavailable.');
+        return localStore.open({ artifact, release }, { signal });
+      }
       const project = getProject(release.projectId);
       const runtimeProject = await resolveSecrets(project);
       const config = normalizeArtifactDeployConfig(runtimeProject.config && runtimeProject.config.artifactDeploy);

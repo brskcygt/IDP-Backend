@@ -11,7 +11,9 @@ const crypto = require('crypto');
 const AGENT_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]{2,127}$/;
 
 /** Mirrors the gateway's allowlist for POST /agent/artifact-command/:agentId. */
-const ARTIFACT_COMMAND_PROCESSES = new Set(['artifact_deploy', 'artifact_rollback', 'artifact_cancel', 'artifact_status']);
+const ARTIFACT_COMMAND_PROCESSES = new Set([
+  'artifact_deploy', 'artifact_rollback', 'artifact_config_apply', 'artifact_cancel', 'artifact_status',
+]);
 
 function isValidAgentId(value) {
   return typeof value === 'string' && AGENT_ID_PATTERN.test(value);
@@ -80,8 +82,8 @@ class AgentGatewayClient {
   }
 
   /**
-   * Sends a typed artifact-deploy command (artifact_deploy, artifact_rollback,
-   * artifact_cancel, artifact_status) through the gateway control API.
+   * Sends a typed artifact command (deploy, rollback, config apply, cancel or status)
+   * through the gateway control API.
    * The payload may carry per-deploy download tokens: never log it.
    * @param {string} agentId
    * @param {string} process

@@ -146,6 +146,17 @@ test('validateAgentCredentialEnv: ws:// and wss:// accepted (trimmed, trailing s
   assert.equal(validateAgentCredentialEnv({ IDP_AGENT_PUBLIC_URL: 'ws://192.168.0.242:7003' }).publicUrl, 'ws://192.168.0.242:7003');
 });
 
+test('validateAgentCredentialEnv: production requires wss unless insecure LAN mode is explicit', () => {
+  const rejected = validateAgentCredentialEnv({ NODE_ENV: 'production', IDP_AGENT_PUBLIC_URL: 'ws://192.168.0.242:7003' });
+  assert.equal(rejected.publicUrl, null);
+  assert.match(rejected.publicUrlError, /wss:\/\//);
+  assert.equal(validateAgentCredentialEnv({
+    NODE_ENV: 'production',
+    IDP_AGENT_PUBLIC_URL: 'ws://192.168.0.242:7003',
+    IDP_ALLOW_INSECURE_AGENT_WS: 'true',
+  }).publicUrl, 'ws://192.168.0.242:7003');
+});
+
 test('validateAgentCredentialEnv: a non-ws URL is a warning (endpoint -> 503), never a startup error', () => {
   for (const value of ['http://agent.example.com', 'https://agent.example.com', 'agent.example.com', 'wss://user:pw@agent.example.com']) {
     const result = validateAgentCredentialEnv({ IDP_AGENT_PUBLIC_URL: value });

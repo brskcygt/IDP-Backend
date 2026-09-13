@@ -1,5 +1,7 @@
 'use strict';
 
+const { jenkinsJobPath } = require('../../../adapters/jenkinsPaths');
+
 /** T-73 Jenkins checks: API reachability/auth, then read-only job existence. */
 
 const { makeCheck, withTimeout } = require('./shared');
@@ -60,7 +62,7 @@ async function testJenkins({ config, appConfig, JenkinsAdapter, timeoutMs }) {
   } else {
     try {
       // Read-only: fetches the job's own /api/json, never triggers a build.
-      await withTimeout(adapter.client.get(`/job/${encodeURIComponent(jobName)}/api/json`), timeoutMs, 'Jenkins Job');
+      await withTimeout(adapter.client.get(`${jenkinsJobPath(jobName)}/api/json`), timeoutMs, 'Jenkins Job');
       checks.push(makeCheck('Jenkins Job', true, `Job '${jobName}' exists.`));
     } catch (err) {
       const status = err && err.response && err.response.status;

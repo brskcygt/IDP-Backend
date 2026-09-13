@@ -71,7 +71,8 @@ class DeploymentManager {
       startedAt,
       triggeredBy: meta.triggeredBy ?? null,
       environment: meta.environment ?? null,
-      // Artifact deploy: 'build' | 'artifact_deploy' | 'artifact_rollback';
+      // Artifact deploy: 'build' | 'artifact_deploy' | 'artifact_rollback' |
+      // 'artifact_config_apply';
       // null for the legacy provider deploy flow (unchanged callers).
       kind: meta.kind ?? null,
       releaseId: meta.releaseId ?? null,

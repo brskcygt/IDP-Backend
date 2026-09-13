@@ -44,7 +44,7 @@ class FakeGateway {
   }
 }
 
-function setup({ busy = () => false } = {}) {
+function setup({ busy = () => false, targetSecrets = {} } = {}) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'idp-target-service-'));
   const db = openDatabase(path.join(dir, 'test.db'));
   const repository = createArtifactDeployRepository(db);
@@ -73,6 +73,7 @@ function setup({ busy = () => false } = {}) {
     },
     getGateway: () => gateway,
     isTargetBusy: busy,
+    targetSecrets,
     timing: { statusTimeoutMs: 25, channelTimeoutMs: 25 },
   });
   return {
@@ -94,12 +95,21 @@ test('target CRUD enforces registered agents, one target per agent and configure
       }, 'alice'),
       ValidationError
     );
+    await assert.rejects(
+      env.service.createTarget('p1', {
+        name: 'bad-config-component', agentId: 'WIN-01', os: 'windows', components: [{ name: 'backend' }],
+        runtimeConfig: { frontend: { format: 'frontend-config-js', values: { VITE_API_URL: 'x' } } },
+      }, 'alice'),
+      ValidationError
+    );
 
     const target = await env.service.createTarget('p1', {
       name: 'temsa', agentId: 'WIN-01', os: 'windows', components: [{ name: 'backend' }],
+      runtimeConfig: { backend: { format: 'env-file', values: { PORT: '3000' } } },
     }, 'alice');
-    assert.equal(env.service.getTarget(target.id).agentId, 'WIN-01');
-    assert.deepEqual(env.service.listTargets('p1').map((entry) => entry.id), [target.id]);
+    assert.equal((await env.service.getTarget(target.id)).agentId, 'WIN-01');
+    assert.deepEqual((await env.service.listTargets('p1')).map((entry) => entry.id), [target.id]);
+    assert.deepEqual(target.runtimeConfig.backend, { format: 'env-file', values: { PORT: '3000' } });
     await assert.rejects(
       env.service.createTarget('p1', { name: 'duplicate', agentId: 'WIN-01', os: 'windows' }, 'alice'),
       ConflictError
@@ -108,8 +118,8 @@ test('target CRUD enforces registered agents, one target per agent and configure
     const updated = await env.service.updateTarget(target.id, { name: 'temsa-prod', agentId: 'WIN-02' }, 'alice');
     assert.equal(updated.name, 'temsa-prod');
     assert.equal(updated.agentId, 'WIN-02');
-    env.service.deleteTarget(target.id, 'alice');
-    assert.deepEqual(env.service.listTargets('p1'), []);
+    await env.service.deleteTarget(target.id, 'alice');
+    assert.deepEqual(await env.service.listTargets('p1'), []);
     assert.deepEqual(env.audit.map((entry) => entry.action), [
       'DEPLOY_TARGET_CREATED', 'DEPLOY_TARGET_UPDATED', 'DEPLOY_TARGET_DELETED',
     ]);
@@ -125,8 +135,46 @@ test('busy targets cannot be updated or deleted', async () => {
     const target = await env.service.createTarget('p1', { name: 'temsa', agentId: 'WIN-01', os: 'windows' }, 'alice');
     busyId = target.id;
     await assert.rejects(env.service.updateTarget(target.id, { name: 'new-name' }, 'alice'), ConflictError);
-    assert.throws(() => env.service.deleteTarget(target.id, 'alice'), ConflictError);
+    await assert.rejects(env.service.deleteTarget(target.id, 'alice'), ConflictError);
   } finally {
+    env.cleanup();
+  }
+});
+
+test('an update that awaited secret persistence cannot cross a newly started deploy', async () => {
+  let busyId = null;
+  let blockPersist = false;
+  let releasePersist;
+  let signalPersist;
+  const persistStarted = new Promise((resolve) => { signalPersist = resolve; });
+  const discarded = [];
+  const env = setup({
+    busy: (id) => id === busyId,
+    targetSecrets: {
+      persist: async (_id, runtimeConfig) => {
+        if (blockPersist) {
+          signalPersist();
+          await new Promise((resolve) => { releasePersist = resolve; });
+        }
+        return { runtimeConfig, createdRefs: blockPersist ? ['new-ref'] : [] };
+      },
+      discardCreated: async (refs) => discarded.push(...refs),
+    },
+  });
+  try {
+    const target = await env.service.createTarget('p1', { name: 'temsa', agentId: 'WIN-01', os: 'windows' }, 'alice');
+    blockPersist = true;
+    const update = env.service.updateTarget(target.id, {
+      runtimeConfig: { backend: { format: 'env-file', values: { PORT: '3000' } } },
+    }, 'alice');
+    await persistStarted;
+    busyId = target.id;
+    releasePersist();
+    await assert.rejects(update, ConflictError);
+    assert.deepEqual(discarded, ['new-ref']);
+    assert.equal(env.repository.findTarget(target.id).runtimeConfig, null);
+  } finally {
+    releasePersist?.();
     env.cleanup();
   }
 });
@@ -151,6 +199,27 @@ test('refreshStatus sanitizes the agent response and links a matching release', 
     assert.equal(refreshed.currentVersions['bad/name'], undefined);
     assert.equal(env.gateway.sent[0].process, 'artifact_status');
     assert.equal(env.gateway.closed, 1);
+  } finally {
+    env.cleanup();
+  }
+});
+
+test('refreshStatus never returns resolved runtime secret values', async () => {
+  const plaintext = 'TOP-SECRET';
+  const env = setup({
+    targetSecrets: {
+      resolve: async (target) => ({ ...target, runtimeConfig: { API_KEY: plaintext } }),
+      redact: (target) => ({ ...target, runtimeConfig: { API_KEY: '[stored]' } }),
+    },
+  });
+  try {
+    const target = await env.service.createTarget('p1', {
+      name: 'temsa', agentId: 'WIN-01', os: 'windows', runtimeConfig: { API_KEY: plaintext },
+    }, 'alice');
+    env.gateway.statusPayload = { basePath: 'C:\\Apps\\JetSRM', components: {} };
+    const refreshed = await env.service.refreshStatus(target.id);
+    assert.deepEqual(refreshed.runtimeConfig, { API_KEY: '[stored]' });
+    assert.equal(JSON.stringify(refreshed).includes(plaintext), false);
   } finally {
     env.cleanup();
   }

@@ -1,0 +1,79 @@
+// Required Jenkins credential: idp-artifact-upload-token (Secret text)
+// Required global/job variables: IDP_URL, IDP_PROJECT_ID
+pipeline {
+  agent none
+
+  parameters {
+    string(name: 'VERSION', trim: true, description: 'Immutable release version supplied by IDP')
+  }
+
+  stages {
+    stage('Checkout once') {
+      agent { label 'linux' }
+      steps {
+        deleteDir()
+        checkout scm
+        script {
+          env.RELEASE_COMMIT = sh(returnStdout: true, script: 'git rev-parse HEAD').trim()
+        }
+        stash name: 'release-source', includes: '**/*', excludes: '.git/**,node_modules/**,dist/**,artifacts/**,**/.env,**/.env.*,**/*secret*,**/*credential*', useDefaultExcludes: false
+      }
+    }
+
+    stage('Build once') {
+      parallel {
+        stage('Windows backend') {
+          agent { label 'windows' }
+          steps {
+            deleteDir()
+            unstash 'release-source'
+            bat 'npm ci'
+            bat 'npm run build:backend:win-x64'
+            bat 'if not exist artifacts mkdir artifacts'
+            bat 'tar -czf "artifacts\\jetsrm-backend-%VERSION%-win-x64.tar.gz" -C "dist\\backend\\win-x64" .'
+            stash name: 'backend-windows', includes: 'artifacts/*.tar.gz'
+          }
+        }
+        stage('Linux backend and shared frontend') {
+          agent { label 'linux' }
+          steps {
+            deleteDir()
+            unstash 'release-source'
+            sh '''
+              set -eu
+              npm ci
+              npm run build:backend:linux-x64
+              npm run build:frontend
+              mkdir -p artifacts
+              tar -czf "artifacts/jetsrm-backend-$VERSION-linux-x64.tar.gz" -C dist/backend/linux-x64 .
+              tar -czf "artifacts/jetsrm-frontend-$VERSION.tar.gz" -C dist/frontend .
+            '''
+            stash name: 'backend-linux-and-frontend', includes: 'artifacts/*.tar.gz'
+          }
+        }
+      }
+    }
+
+    stage('Verify and publish to IDP') {
+      agent { label 'linux' }
+      steps {
+        deleteDir()
+        unstash 'release-source'
+        unstash 'backend-windows'
+        unstash 'backend-linux-and-frontend'
+        withCredentials([string(credentialsId: 'idp-artifact-upload-token', variable: 'IDP_ARTIFACT_UPLOAD_TOKEN')]) {
+          sh '''
+            set -eu
+            test -n "$IDP_URL" && test -n "$IDP_PROJECT_ID" && test -n "$IDP_ARTIFACT_UPLOAD_TOKEN" && test -n "$VERSION"
+            node scripts/make-manifest.js jetsrm "$VERSION" "$RELEASE_COMMIT" \
+              "backend:win-x64:artifacts/jetsrm-backend-$VERSION-win-x64.tar.gz" \
+              "backend:linux-x64:artifacts/jetsrm-backend-$VERSION-linux-x64.tar.gz" \
+              "frontend:any:artifacts/jetsrm-frontend-$VERSION.tar.gz"
+            mv "jetsrm-$VERSION-manifest.json" artifacts/
+            node scripts/upload-artifacts.js --project-id "$IDP_PROJECT_ID" --version "$VERSION" --manifest "artifacts/jetsrm-$VERSION-manifest.json"
+          '''
+        }
+      }
+    }
+  }
+}

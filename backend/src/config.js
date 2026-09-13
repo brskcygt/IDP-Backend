@@ -200,6 +200,9 @@ function validateHttpServerEnv(env = process.env) {
 
   const artifactDeploy = validateArtifactPublicUrlEnv(env);
   warnings.push(...artifactDeploy.warnings);
+  const artifactStorage = validateArtifactStorageEnv(env);
+  errors.push(...artifactStorage.errors);
+  warnings.push(...artifactStorage.warnings);
 
   return {
     valid: errors.length === 0,
@@ -216,8 +219,46 @@ function validateHttpServerEnv(env = process.env) {
     artifactDeploy: {
       publicUrl: artifactDeploy.publicUrl,
       publicUrlError: artifactDeploy.publicUrlError,
+      storageRoot: artifactStorage.storageRoot,
+      maxArtifactBytes: artifactStorage.maxArtifactBytes,
+      uploadToken: artifactStorage.uploadToken,
     },
   };
+}
+
+const DEFAULT_ARTIFACT_MAX_BYTES = 1024 * 1024 * 1024;
+
+/** Pure validation for local artifact storage and CI bearer uploads. */
+function validateArtifactStorageEnv(env = process.env) {
+  const errors = [];
+  const warnings = [];
+  const configuredRoot = (env.IDP_ARTIFACT_STORAGE_ROOT || '').trim();
+  let storageRoot;
+  if (configuredRoot) {
+    if (!path.isAbsolute(configuredRoot)) errors.push('[SERVER] IDP_ARTIFACT_STORAGE_ROOT mutlak bir yol olmali.');
+    storageRoot = path.resolve(configuredRoot);
+  } else {
+    const dbPath = (env.IDP_DB_PATH || '').trim();
+    const dataRoot = dbPath && path.isAbsolute(dbPath) ? path.dirname(dbPath) : path.resolve(__dirname, '..', 'data');
+    storageRoot = path.join(dataRoot, 'artifacts');
+  }
+
+  const uploadToken = (env.IDP_ARTIFACT_UPLOAD_TOKEN || '').trim() || null;
+  if (uploadToken && (uploadToken.length < 32 || /\s/.test(uploadToken))) {
+    errors.push('[SERVER] IDP_ARTIFACT_UPLOAD_TOKEN en az 32 karakter olmali ve bosluk icermemeli.');
+  }
+
+  let maxArtifactBytes = DEFAULT_ARTIFACT_MAX_BYTES;
+  const rawMax = (env.IDP_ARTIFACT_MAX_BYTES || '').trim();
+  if (rawMax) {
+    const parsed = Number(rawMax);
+    if (!Number.isSafeInteger(parsed) || parsed < 1024 || parsed > 20 * 1024 * 1024 * 1024) {
+      errors.push('[SERVER] IDP_ARTIFACT_MAX_BYTES 1024 ile 21474836480 arasinda bir tam sayi olmali.');
+    } else {
+      maxArtifactBytes = parsed;
+    }
+  }
+  return { errors, warnings, storageRoot, maxArtifactBytes, uploadToken };
 }
 
 /**
@@ -286,6 +327,8 @@ function validateArtifactPublicUrlEnv(env = process.env) {
 function validateAgentCredentialEnv(env = process.env) {
   const errors = [];
   const warnings = [];
+  const isProduction = (env.NODE_ENV || 'development') === 'production';
+  const allowInsecureWs = (env.IDP_ALLOW_INSECURE_AGENT_WS || '').trim().toLowerCase() === 'true';
 
   let publicUrl = null;
   let publicUrlError = 'IDP_AGENT_PUBLIC_URL tanımlı değil.';
@@ -301,6 +344,8 @@ function validateAgentCredentialEnv(env = process.env) {
       publicUrlError = 'IDP_AGENT_PUBLIC_URL geçersiz: ws:// veya wss:// ile başlayan bir adres olmalı.';
     } else if (parsed.username || parsed.password) {
       publicUrlError = 'IDP_AGENT_PUBLIC_URL geçersiz: adres kullanıcı adı/parola içeremez.';
+    } else if (isProduction && parsed.protocol !== 'wss:' && !allowInsecureWs) {
+      publicUrlError = 'IDP_AGENT_PUBLIC_URL geçersiz: NODE_ENV=production iken wss:// olmalı (yalnız kontrollü LAN testi için IDP_ALLOW_INSECURE_AGENT_WS=true).';
     } else {
       publicUrl = rawPublicUrl.replace(/\/+$/, '');
       publicUrlError = null;
@@ -359,6 +404,9 @@ function loadHttpServerConfig() {
     artifactDeploy: Object.freeze({
       publicUrl: artifactDeploy.publicUrl,
       publicUrlError: artifactDeploy.publicUrlError,
+      storageRoot: artifactDeploy.storageRoot,
+      maxArtifactBytes: artifactDeploy.maxArtifactBytes,
+      uploadToken: artifactDeploy.uploadToken,
     }),
   });
 }
@@ -369,5 +417,6 @@ module.exports = {
   validateHttpServerEnv,
   validateAgentCredentialEnv,
   validateArtifactPublicUrlEnv,
+  validateArtifactStorageEnv,
   loadHttpServerConfig,
 };

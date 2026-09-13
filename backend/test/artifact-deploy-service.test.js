@@ -86,7 +86,7 @@ function makeProject() {
             runtime: { type: 'nssm', serviceName: 'jetsrm-backend' },
             preserve: ['.env', 'certificates/**', 'uploads/**'],
             health: { url: 'http://127.0.0.1:3000/health', timeoutSec: 90 },
-            hooks: { preStart: [{ name: 'migrate', command: 'node', args: ['node_modules/sequelize-cli/lib/sequelize', 'db:migrate'], env: { NODE_ENV: 'prod', DB_PASSWORD: 'HOOK-ENV-VALUE' } }] },
+            hooks: { preStart: [{ name: 'migrate', command: 'node', args: ['node_modules/sequelize-cli/lib/sequelize', 'db:migrate'], env: { NODE_ENV: 'prod' } }] },
           },
           { name: 'frontend', subdir: 'frontend', runtime: { type: 'iis-static' }, preserve: ['web.config'], writeRuntimeConfig: true },
         ],
@@ -181,7 +181,7 @@ test('deploy: payload per contract 1.2 — OS selection, runtimeConfig only wher
     assert.equal(backend.hooks.preStart[0].name, 'migrate');
     assert.equal(backend.hooks.preStart[0].timeoutSec, 600);
     assert.equal(frontend.download.url, `${PUBLIC_URL}/api/artifacts/${env.byKey['frontend/any'].id}/download`);
-    assert.deepEqual(frontend.runtimeConfig, env.target.runtimeConfig);
+    assert.deepEqual(frontend.runtimeConfig, { format: 'frontend-config-js', values: env.target.runtimeConfig });
     assert.equal(frontend.hooks, null);
     assert.notEqual(backend.download.token, frontend.download.token);
 
@@ -198,12 +198,12 @@ test('deploy: payload per contract 1.2 — OS selection, runtimeConfig only wher
 
     // Nothing sensitive in logs or audit: no token, no hook env value, no runtime config value.
     const logs = session.logs.join('\n');
-    for (const value of [backend.download.token, frontend.download.token, 'HOOK-ENV-VALUE', 'https://api.temsa']) {
+    for (const value of [backend.download.token, frontend.download.token, 'https://api.temsa']) {
       assert.ok(!logs.includes(value), `log leaked ${value}`);
       assert.ok(!JSON.stringify(env.audit).includes(value), `audit leaked ${value}`);
     }
     assert.ok(logs.includes('preStart: migrate'));
-    assert.ok(logs.includes('config.js keys: VITE_APP_MAIN_URL, VITE_COMPANY_NAME'));
+    assert.ok(logs.includes('frontend-config-js keys: VITE_APP_MAIN_URL, VITE_COMPANY_NAME'));
 
     // The token works for its artifact, bound to this deployment + agent.
     const binding = env.tokens.consume(backend.download.token, winBackend.id, { agentId: 'WIN-01' });
@@ -211,6 +211,82 @@ test('deploy: payload per contract 1.2 — OS selection, runtimeConfig only wher
     assert.equal(env.tokens.consume(backend.download.token, env.byKey['frontend/any'].id), null);
 
     env.gateway.emit('WIN-01', 'deploy_result', success(deployId));
+  } finally {
+    env.cleanup();
+  }
+});
+
+test('config apply: component specs, dedicated event/result correlation, SSE, audit and target lock', async () => {
+  const env = setup();
+  try {
+    env.repository.updateTarget(env.target.id, { runtimeConfig: {
+      backend: { format: 'env-file', values: { PORT: '3000', DB_PASSWORD: 'TOP-SECRET' } },
+      frontend: { format: 'frontend-config-js', values: { VITE_API_URL: 'https://api.customer' } },
+    } });
+    const { deploymentId, deployId } = await env.service.applyConfig({ targetId: env.target.id, triggeredBy: 'bob' });
+    const sent = env.gateway.last('artifact_config_apply');
+    assert.equal(sent.agentId, 'WIN-01');
+    assert.equal(sent.payload.deployId, deployId);
+    assert.deepEqual(sent.payload.components, [
+      { name: 'backend', runtimeConfig: { format: 'env-file', values: { PORT: '3000', DB_PASSWORD: 'TOP-SECRET' } } },
+      { name: 'frontend', runtimeConfig: { format: 'frontend-config-js', values: { VITE_API_URL: 'https://api.customer' } } },
+    ]);
+    const session = deploymentManager.getSession(deploymentId);
+    assert.equal(session.kind, 'artifact_config_apply');
+    assert.equal(session.releaseId, null);
+    assert.equal(env.service.isTargetBusy(env.target.id), true);
+    await assert.rejects(env.service.applyConfig({ targetId: env.target.id }), ConflictError);
+    for (const secret of ['TOP-SECRET', 'https://api.customer']) {
+      assert.ok(!session.logs.join('\n').includes(secret));
+      assert.ok(!JSON.stringify(env.audit).includes(secret));
+    }
+
+    env.gateway.emit('WIN-01', 'deploy_result', { deployId, success: false, error: 'wrong channel' });
+    env.gateway.emit('WIN-01', 'artifact_config_event', {
+      deployId, component: 'backend', stage: 'configuring', status: 'done', message: '.env written TOP-SECRET',
+    });
+    assert.equal(session.status, 'running');
+    assert.ok(session.logs.join('\n').includes('__EVENT__:{"type":"artifact_config_event"'));
+    assert.ok(!session.logs.join('\n').includes('TOP-SECRET'));
+    assert.ok(session.logs.join('\n').includes('[REDACTED]'));
+    env.gateway.emit('WIN-01', 'artifact_config_result', {
+      deployId, success: true, components: [
+        { name: 'backend', success: true, version: '2.5.0', rolledBack: false },
+        { name: 'frontend', success: true, version: '2.5.0', rolledBack: false },
+      ],
+    });
+    assert.equal(session.status, 'succeeded');
+    assert.equal(env.service.isTargetBusy(env.target.id), false);
+    assert.deepEqual(env.audit.map((entry) => entry.action), [
+      'ARTIFACT_CONFIG_APPLY_TRIGGERED', 'ARTIFACT_CONFIG_APPLY_SUCCEEDED',
+    ]);
+  } finally {
+    env.cleanup();
+  }
+});
+
+test('config apply: timeout and DeploymentManager abort send artifact_cancel and release the lock on result', async () => {
+  const env = setup({ timing: { resultTimeoutMs: 30 } });
+  try {
+    env.repository.updateTarget(env.target.id, { runtimeConfig: {
+      backend: { format: 'env-file', values: { PORT: '3000' } },
+    } });
+    let run = await env.service.applyConfig({ targetId: env.target.id, triggeredBy: 'bob' });
+    await waitFor(() => deploymentManager.getSession(run.deploymentId).status === 'failed');
+    assert.match(deploymentManager.getSession(run.deploymentId).lastError, /artifact_config_result/);
+    assert.deepEqual(env.gateway.last('artifact_cancel').payload, { deployId: run.deployId });
+    assert.equal(env.service.isTargetBusy(env.target.id), false);
+
+    run = await env.service.applyConfig({ targetId: env.target.id, triggeredBy: 'bob' });
+    await deploymentManager.abort(run.deploymentId);
+    assert.equal(deploymentManager.getSession(run.deploymentId).status, 'aborted');
+    assert.equal(env.service.isTargetBusy(env.target.id), true);
+    assert.deepEqual(env.gateway.last('artifact_cancel').payload, { deployId: run.deployId });
+    env.gateway.emit('WIN-01', 'artifact_config_result', {
+      deployId: run.deployId, success: false, rolledBack: true, error: 'cancelled', components: [],
+    });
+    assert.equal(env.service.isTargetBusy(env.target.id), false);
+    assert.equal(env.audit.at(-1).action, 'ARTIFACT_CONFIG_APPLY_CANCELLED');
   } finally {
     env.cleanup();
   }

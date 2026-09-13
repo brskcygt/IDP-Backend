@@ -13,7 +13,7 @@ const { test } = require('node:test');
 
 const contracts = require('../src/core/artifacts/contracts');
 const { validateProjectConfig } = require('../src/validation/projectSchemas');
-const { validateArtifactPublicUrlEnv, validateHttpServerEnv } = require('../src/config');
+const { validateArtifactPublicUrlEnv, validateArtifactStorageEnv, validateHttpServerEnv } = require('../src/config');
 
 const {
   validateManifest,
@@ -175,6 +175,8 @@ test('validateArtifactDeployConfig: preStart hook rules', () => {
   assert.ok(hookErrors({ ...valid, args: [`a${NUL}b`] }).some((p) => p.endsWith('.args.0')));
   assert.ok(hookErrors({ ...valid, args: [1] }).some((p) => p.endsWith('.args.0')));
   assert.ok(hookErrors({ ...valid, env: { node_env: 'prod' } }).some((p) => p.endsWith('.env')));
+  assert.ok(hookErrors({ ...valid, env: { DB_PASSWORD: 'secret' } }).some((p) => p.endsWith('.env')));
+  assert.ok(hookErrors({ ...valid, env: { DATABASE_URL: 'postgres://secret' } }).some((p) => p.endsWith('.env')));
   assert.ok(hookErrors({ ...valid, env: { A: 'x'.repeat(1025) } }).some((p) => p.endsWith('.env')));
   const tooMany = Object.fromEntries(Array.from({ length: 21 }, (_, i) => [`K${i}`, 'v']));
   assert.ok(hookErrors({ ...valid, env: tooMany }).some((p) => p.endsWith('.env')));
@@ -242,6 +244,23 @@ test('validateTargetInput: create requires name/agentId/os, update is partial', 
   assert.deepEqual(paths(validateTargetInput({}).errors).sort(), ['agentId', 'name', 'os']);
   assert.deepEqual(validateTargetInput({ name: 'x' }, { partial: true }).errors, []);
   assert.ok(paths(validateTargetInput({ runtimeConfig: { lower: 'x' } }, { partial: true }).errors).some((p) => p.startsWith('runtimeConfig')));
+  const structured = validateTargetInput({ runtimeConfig: {
+    backend: { format: 'env-file', values: { PORT: '3000', DB_URL: 'secret' } },
+    frontend: { format: 'frontend-config-js', values: { VITE_API_URL: 'https://api' } },
+  } }, { partial: true });
+  assert.deepEqual(structured.errors, []);
+  assert.deepEqual(structured.value.runtimeConfig.backend, { format: 'env-file', values: { PORT: '3000', DB_URL: 'secret' } });
+  assert.ok(paths(validateTargetInput({ runtimeConfig: {
+    backend: { format: 'dotenv', values: {} },
+  } }, { partial: true }).errors).includes('runtimeConfig.backend.format'));
+  const oversized = Object.fromEntries(Array.from({ length: 100 }, (_unused, index) => [`KEY_${index}`, 'ş'.repeat(1000)]));
+  assert.ok(validateTargetInput({ runtimeConfig: oversized }, { partial: true }).errors
+    .some((error) => error.message.includes('UTF-8 bytes')));
+  const largeComponent = Object.fromEntries(Array.from({ length: 100 }, (_unused, index) => [`KEY_${index}`, 'x'.repeat(1200)]));
+  assert.ok(validateTargetInput({ runtimeConfig: {
+    backend: { format: 'env-file', values: largeComponent },
+    frontend: { format: 'frontend-config-js', values: largeComponent },
+  } }, { partial: true }).errors.some((error) => error.message.includes('Serialized runtime config')));
   assert.ok(paths(validateTargetInput({ agentId: '-x' }, { partial: true }).errors).includes('agentId'));
   assert.ok(paths(validateTargetInput({ os: 'mac' }, { partial: true }).errors).includes('os'));
   assert.ok(paths(validateTargetInput({ environment: 'QA' }, { partial: true }).errors).includes('environment'));
@@ -328,7 +347,7 @@ test('buildDeployPayload matches contract 1.2: runtimeConfig only where flagged,
     preStart: [{ name: 'migrate', command: 'node', args: ['node_modules/sequelize-cli/lib/sequelize', 'db:migrate'], env: { NODE_ENV: 'prod' }, timeoutSec: 600 }],
   });
   assert.deepEqual(backend.health, { url: 'http://127.0.0.1:3000/health', expectVersionPath: null, timeoutSec: 90 });
-  assert.deepEqual(frontend.runtimeConfig, runtimeConfig);
+  assert.deepEqual(frontend.runtimeConfig, { format: 'frontend-config-js', values: runtimeConfig });
   assert.equal(frontend.hooks, null);
   assert.deepEqual(frontend.runtime, { type: 'iis-static', serviceName: null, appPool: null });
   assert.ok(!JSON.stringify(payload).includes('SOURCE-TOKEN-SECRET'));
@@ -336,6 +355,27 @@ test('buildDeployPayload matches contract 1.2: runtimeConfig only where flagged,
   // Hooks are copies: mutating the payload never touches the project config.
   backend.hooks.preStart[0].env.NODE_ENV = 'changed';
   assert.equal(components[0].hooks.preStart[0].env.NODE_ENV, 'prod');
+});
+
+test('buildDeployPayload sends component-specific frontend config.js and backend .env specs', () => {
+  const { components } = normalizeArtifactDeployConfig(artifactDeploy());
+  const release = { id: 'rel_1', version: '2.5.0', manifest: { project: 'jetsrm' } };
+  const artifacts = new Map([
+    ['backend', { id: 'art_backend', sha256: SHA_A, size: 123 }],
+    ['frontend', { id: 'art_frontend', sha256: SHA_B, size: 456 }],
+  ]);
+  const payload = buildDeployPayload({
+    deployId: 'dep_x', release, components, artifacts,
+    tokens: new Map([['backend', 'T'], ['frontend', 'U']]), publicUrl: 'https://idp.example',
+    runtimeConfig: {
+      backend: { format: 'env-file', values: { PORT: '3000' } },
+      frontend: { format: 'frontend-config-js', values: { VITE_API_URL: 'https://api' } },
+    },
+  });
+  assert.deepEqual(payload.components[0].runtimeConfig, { format: 'env-file', values: { PORT: '3000' } });
+  assert.deepEqual(payload.components[1].runtimeConfig, {
+    format: 'frontend-config-js', values: { VITE_API_URL: 'https://api' },
+  });
 });
 
 test('computeDeployTimeoutSec: at least 30 min, grows with health + hook budgets, capped at 4 h', () => {
@@ -364,4 +404,27 @@ test('IDP_PUBLIC_URL validation', () => {
   // Never blocks startup.
   assert.equal(validateHttpServerEnv({ IDP_PUBLIC_URL: 'ftp://x' }).valid, true);
   assert.equal(validateHttpServerEnv({ IDP_PUBLIC_URL: 'https://idp.example' }).artifactDeploy.publicUrl, 'https://idp.example');
+});
+
+test('local artifact storage env uses a safe data default and validates CI upload controls', () => {
+  const defaulted = validateArtifactStorageEnv({ IDP_DB_PATH: '/srv/idp/idp.db' });
+  assert.equal(defaulted.storageRoot, '/srv/idp/artifacts');
+  assert.equal(defaulted.maxArtifactBytes, 1024 * 1024 * 1024);
+  assert.equal(defaulted.uploadToken, null);
+  assert.deepEqual(defaulted.warnings, []);
+
+  const configured = validateArtifactStorageEnv({
+    IDP_ARTIFACT_STORAGE_ROOT: '/data/idp-artifacts',
+    IDP_ARTIFACT_UPLOAD_TOKEN: 'x'.repeat(32),
+    IDP_ARTIFACT_MAX_BYTES: '2048',
+  });
+  assert.deepEqual(configured.errors, []);
+  assert.equal(configured.storageRoot, '/data/idp-artifacts');
+  assert.equal(configured.maxArtifactBytes, 2048);
+  assert.equal(configured.uploadToken, 'x'.repeat(32));
+
+  assert.ok(validateArtifactStorageEnv({ IDP_ARTIFACT_STORAGE_ROOT: 'relative' }).errors.length > 0);
+  assert.ok(validateArtifactStorageEnv({ IDP_ARTIFACT_UPLOAD_TOKEN: 'short' }).errors.length > 0);
+  assert.ok(validateArtifactStorageEnv({ IDP_ARTIFACT_MAX_BYTES: '10' }).errors.length > 0);
+  assert.equal(validateHttpServerEnv({ IDP_ARTIFACT_UPLOAD_TOKEN: 'short' }).valid, false);
 });

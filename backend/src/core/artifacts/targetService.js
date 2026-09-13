@@ -14,6 +14,7 @@ const {
   validateTargetInput,
   normalizeArtifactDeployConfig,
   isPlainObject,
+  isLegacyRuntimeConfig,
   sanitizeAgentText,
   sanitizeVersion,
   COMPONENT_NAME_PATTERN,
@@ -50,15 +51,22 @@ function sanitizeStatusResult(payload) {
  * @param {(targetId: string) => boolean} [deps.isTargetBusy]
  * @param {{ statusTimeoutMs?: number, channelTimeoutMs?: number }} [deps.timing]
  */
-function createTargetService({ repository, auditLogger, getProject, getGateway, isTargetBusy = () => false, timing = {} }) {
+function createTargetService({ repository, auditLogger, getProject, getGateway, isTargetBusy = () => false, targetSecrets = {}, timing = {} }) {
   const statusTimeoutMs = timing.statusTimeoutMs ?? 15_000;
   const channelTimeoutMs = timing.channelTimeoutMs ?? 10_000;
 
-  function requireTarget(id) {
+  function requireStoredTarget(id) {
     const target = repository.findTarget(id);
     if (!target) throw new NotFoundError('Deploy target not found');
     return target;
   }
+
+  const persistRuntimeConfig = targetSecrets.persist || (async (_id, runtimeConfig) => ({ runtimeConfig, createdRefs: [] }));
+  const resolveTarget = targetSecrets.resolve || (async (target) => target);
+  const redactTarget = targetSecrets.redact || ((target) => target);
+  const discardCreated = targetSecrets.discardCreated || (async () => {});
+  const deleteReplaced = targetSecrets.deleteReplaced || (async () => {});
+  const deleteAll = targetSecrets.deleteAll || (async () => {});
 
   function componentErrors(project, components) {
     if (!Array.isArray(components) || components.length === 0) return [];
@@ -69,6 +77,21 @@ function createTargetService({ repository, auditLogger, getProject, getGateway, 
       .map((entry) => ({
         path: 'components',
         message: `Component '${entry.name}' is not defined in the project's artifactDeploy.components.`,
+      }));
+  }
+
+  function runtimeConfigComponentErrors(project, runtimeConfig, targetComponents = null) {
+    if (!isPlainObject(runtimeConfig) || isLegacyRuntimeConfig(runtimeConfig)) return [];
+    const config = normalizeArtifactDeployConfig(project.config && project.config.artifactDeploy);
+    const known = new Set(config ? config.components.map((component) => component.name) : []);
+    const selected = Array.isArray(targetComponents) && targetComponents.length > 0
+      ? new Set(targetComponents.map((component) => component.name))
+      : null;
+    return Object.keys(runtimeConfig)
+      .filter((name) => !known.has(name) || (selected && !selected.has(name)))
+      .map((name) => ({
+        path: `runtimeConfig.${name}`,
+        message: `Component '${name}' is not deployable on this target.`,
       }));
   }
 
@@ -98,41 +121,59 @@ function createTargetService({ repository, auditLogger, getProject, getGateway, 
   }
 
   return {
-    listTargets(projectId) {
+    async listTargets(projectId, { includeRuntimeConfig = false } = {}) {
       getProject(projectId);
-      return repository.listTargets(projectId);
+      const targets = repository.listTargets(projectId);
+      return includeRuntimeConfig ? Promise.all(targets.map(resolveTarget)) : targets.map(redactTarget);
     },
 
-    getTarget(id) {
-      return requireTarget(id);
+    async getTarget(id) {
+      return resolveTarget(requireStoredTarget(id));
     },
 
     async createTarget(projectId, input, actor) {
       const project = getProject(projectId);
       const { errors, value } = validateTargetInput(input);
       errors.push(...componentErrors(project, value.components));
+      errors.push(...runtimeConfigComponentErrors(project, value.runtimeConfig, value.components));
       if (errors.length > 0) throw new ValidationError('Invalid deploy target.', errors);
 
       ensureAgentFree(value.agentId);
       await ensureAgentRegistered(value.agentId);
       ensureAgentFree(value.agentId); // the gateway call awaited: re-check
 
-      const target = withUniqueGuard(() => repository.createTarget({ projectId, ...value }), value.agentId);
+      const id = `tgt_${crypto.randomBytes(12).toString('hex')}`;
+      const protectedConfig = await persistRuntimeConfig(id, value.runtimeConfig);
+      let target;
+      try {
+        target = withUniqueGuard(
+          () => repository.createTarget({ id, projectId, ...value, runtimeConfig: protectedConfig.runtimeConfig }),
+          value.agentId
+        );
+      } catch (err) {
+        await discardCreated(protectedConfig.createdRefs);
+        throw err;
+      }
       auditLogger.log(actor, 'DEPLOY_TARGET_CREATED', `Created deploy target '${target.name}' for project: ${project.name}`, {
         projectId,
         targetId: target.id,
         agentId: target.agentId,
       });
-      return target;
+      return resolveTarget(target);
     },
 
     async updateTarget(id, input, actor) {
-      const target = requireTarget(id);
+      const target = requireStoredTarget(id);
       const project = getProject(target.projectId);
       if (isTargetBusy(id)) throw new ConflictError('A deployment is running on this target.');
 
       const { errors, value } = validateTargetInput(input, { partial: true });
       errors.push(...componentErrors(project, value.components));
+      errors.push(...runtimeConfigComponentErrors(
+        project,
+        value.runtimeConfig !== undefined ? value.runtimeConfig : (value.components !== undefined ? target.runtimeConfig : undefined),
+        value.components !== undefined ? value.components : target.components
+      ));
       if (errors.length > 0) throw new ValidationError('Invalid deploy target.', errors);
 
       const agentChanged = value.agentId !== undefined && value.agentId !== target.agentId;
@@ -144,20 +185,38 @@ function createTargetService({ repository, auditLogger, getProject, getGateway, 
         Object.assign(value, { currentReleaseId: null, currentVersions: null, basePath: value.basePath ?? null });
       }
 
-      const updated = withUniqueGuard(() => repository.updateTarget(id, value), value.agentId);
+      let protectedConfig = null;
+      if (value.runtimeConfig !== undefined) {
+        protectedConfig = await persistRuntimeConfig(id, value.runtimeConfig);
+        value.runtimeConfig = protectedConfig.runtimeConfig;
+      }
+      let updated;
+      try {
+        const current = requireStoredTarget(id);
+        if (isTargetBusy(id)) throw new ConflictError('A deployment started while this target update was being prepared.');
+        if (JSON.stringify(current) !== JSON.stringify(target)) {
+          throw new ConflictError('The deploy target changed while this update was being prepared. Reload and retry.');
+        }
+        updated = withUniqueGuard(() => repository.updateTarget(id, value), value.agentId);
+      } catch (err) {
+        if (protectedConfig) await discardCreated(protectedConfig.createdRefs);
+        throw err;
+      }
+      if (protectedConfig) await deleteReplaced(target.runtimeConfig, protectedConfig.runtimeConfig);
       auditLogger.log(actor, 'DEPLOY_TARGET_UPDATED', `Updated deploy target '${updated.name}'`, {
         projectId: target.projectId,
         targetId: id,
         agentId: updated.agentId,
         fields: Object.keys(value),
       });
-      return updated;
+      return resolveTarget(updated);
     },
 
-    deleteTarget(id, actor) {
-      const target = requireTarget(id);
+    async deleteTarget(id, actor) {
+      const target = requireStoredTarget(id);
       if (isTargetBusy(id)) throw new ConflictError('A deployment is running on this target.');
       repository.deleteTarget(id);
+      await deleteAll(target.runtimeConfig);
       auditLogger.log(actor, 'DEPLOY_TARGET_DELETED', `Deleted deploy target '${target.name}'`, {
         projectId: target.projectId,
         targetId: id,
@@ -171,7 +230,7 @@ function createTargetService({ repository, auditLogger, getProject, getGateway, 
      * when every component runs the same known release.
      */
     async refreshStatus(id) {
-      const target = requireTarget(id);
+      const target = requireStoredTarget(id);
       const gateway = getGateway();
       const requestId = `req_${crypto.randomBytes(12).toString('hex')}`;
 
@@ -203,11 +262,11 @@ function createTargetService({ repository, auditLogger, getProject, getGateway, 
         const status = sanitizeStatusResult(payload);
         const versions = [...new Set(Object.values(status.components).map((entry) => entry.version).filter(Boolean))];
         const release = versions.length === 1 ? repository.findReleaseByVersion(target.projectId, versions[0]) : null;
-        return repository.updateTarget(id, {
+        return redactTarget(repository.updateTarget(id, {
           currentVersions: status.components,
           basePath: status.basePath ?? target.basePath,
           currentReleaseId: release ? release.id : null,
-        });
+        }));
       } finally {
         clearTimeout(timer);
         channel.close();

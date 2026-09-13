@@ -37,6 +37,10 @@ function sqlValue(value) {
   return value;
 }
 
+function isObject(value) {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
 function rowToRelease(row) {
   if (!row) return null;
   return {
@@ -211,6 +215,43 @@ function createArtifactDeployRepository(db) {
       return db.prepare('SELECT * FROM releases WHERE project_id = ? ORDER BY created_at DESC, rowid DESC LIMIT ?')
         .all(projectId, limit)
         .map(rowToRelease);
+    },
+
+    /** All locally stored successful releases, newest first (retention input). */
+    listReadyLocalReleases(projectId) {
+      return db.prepare(`
+        SELECT * FROM releases
+        WHERE project_id = ? AND status = 'ready' AND source_platform = 'local'
+        ORDER BY ready_order DESC, updated_at DESC, rowid DESC
+      `).all(projectId).map(rowToRelease);
+    },
+
+    /** Monotonic per-project finalization order; avoids created_at/clock ties. */
+    markReleaseFinalized(releaseId, projectId) {
+      return db.prepare(`
+        UPDATE releases
+        SET ready_order = (
+          SELECT COALESCE(MAX(ready_order), 0) + 1 FROM releases WHERE project_id = ?
+        )
+        WHERE id = ? AND project_id = ?
+      `).run(projectId, releaseId, projectId).changes > 0;
+    },
+
+    /** A target reporting this release is protected from delete/prune. */
+    isReleaseCurrent(releaseId) {
+      if (db.prepare('SELECT 1 FROM deploy_targets WHERE current_release_id = ? LIMIT 1').get(releaseId)) return true;
+      const release = repo.findRelease(releaseId);
+      if (!release) return false;
+      // A partial/component-only deploy deliberately leaves current_release_id
+      // null. Protect any local release still reported in currentVersions too.
+      const rows = db.prepare('SELECT current_versions_json FROM deploy_targets WHERE project_id = ? AND current_versions_json IS NOT NULL')
+        .all(release.projectId);
+      return rows.some((row) => {
+        const versions = parseJson(row.current_versions_json);
+        return isObject(versions) && Object.values(versions).some(
+          (entry) => isObject(entry) && entry.version === release.version
+        );
+      });
     },
 
     updateRelease(id, patch) {

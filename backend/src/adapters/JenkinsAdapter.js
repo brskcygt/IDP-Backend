@@ -1,5 +1,6 @@
 const DeploymentAdapter = require('./DeploymentAdapter');
 const { assertTriggerResult } = DeploymentAdapter;
+const { jenkinsJobPath } = require('./jenkinsPaths');
 const axios = require('axios');
 
 /**
@@ -74,12 +75,12 @@ class JenkinsAdapter extends DeploymentAdapter {
    *   Poll queue URL/api/json until `executable.number` is present
    */
   async trigger(params) {
-    const jobName = encodeURIComponent(this.config.jobName);
+    const jobPath = jenkinsJobPath(this.config.jobName);
     this.log(`Triggering job "${this.config.jobName}" with params: ${JSON.stringify(params)}`);
 
     try {
       // 1. Trigger the build
-      const triggerUrl = `/job/${jobName}/buildWithParameters`;
+      const triggerUrl = `${jobPath}/buildWithParameters`;
       const res = await this.client.post(triggerUrl, null, {
         params: params || {},
         validateStatus: (status) => status < 400,
@@ -141,8 +142,8 @@ class JenkinsAdapter extends DeploymentAdapter {
           }
         } else {
           // No queue ID — try fetching the latest build number
-          const jobName = encodeURIComponent(this.config.jobName);
-          const res = await this.client.get(`/job/${jobName}/lastBuild/api/json`);
+          const jobPath = jenkinsJobPath(this.config.jobName);
+          const res = await this.client.get(`${jobPath}/lastBuild/api/json`);
           if (res.data?.number) {
             return res.data.number;
           }
@@ -172,14 +173,14 @@ class JenkinsAdapter extends DeploymentAdapter {
       return;
     }
 
-    const jobName = encodeURIComponent(this.config.jobName);
+    const jobPath = jenkinsJobPath(this.config.jobName);
     let textOffset = 0;
 
     while (!this.aborted) {
       try {
         // 1. Fetch progressive text
         const res = await this.client.get(
-          `/job/${jobName}/${this.buildNumber}/logText/progressiveText`,
+          `${jobPath}/${this.buildNumber}/logText/progressiveText`,
           {
             params: { start: textOffset },
             headers: { Accept: 'text/plain' },
@@ -200,7 +201,7 @@ class JenkinsAdapter extends DeploymentAdapter {
         }
 
         // 2. Fetch build status
-        const statusRes = await this.client.get(`/job/${jobName}/${this.buildNumber}/api/json`);
+        const statusRes = await this.client.get(`${jobPath}/${this.buildNumber}/api/json`);
         const buildInfo = statusRes.data;
 
         // If the build is no longer running and no more data is available in the progressive log stream
@@ -247,9 +248,9 @@ class JenkinsAdapter extends DeploymentAdapter {
     if (this._logTimer) clearTimeout(this._logTimer);
 
     if (this.buildNumber) {
-      const jobName = encodeURIComponent(this.config.jobName);
+      const jobPath = jenkinsJobPath(this.config.jobName);
       try {
-        await this.client.post(`/job/${jobName}/${this.buildNumber}/stop`);
+        await this.client.post(`${jobPath}/${this.buildNumber}/stop`);
         this.log(`✓ Build #${this.buildNumber} abort signal sent to Jenkins.`);
       } catch (err) {
         this.log(`⚠ Failed to abort build on Jenkins: ${err.message}`);

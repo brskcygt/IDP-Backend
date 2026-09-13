@@ -1,0 +1,92 @@
+# Copy as .github/workflows/idp-release.yml in the application repository.
+# Repository secret: IDP_ARTIFACT_UPLOAD_TOKEN
+# Repository variables: IDP_URL, IDP_PROJECT_ID
+name: IDP release
+run-name: IDP release ${{ inputs.VERSION }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      VERSION:
+        description: Immutable release version
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  backend-windows:
+    runs-on: windows-latest
+    env:
+      VERSION: ${{ inputs.VERSION }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+      - run: npm ci
+      - run: npm run build:backend:win-x64
+      - shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force artifacts | Out-Null
+          tar -czf "artifacts/jetsrm-backend-$env:VERSION-win-x64.tar.gz" -C "dist/backend/win-x64" .
+      - uses: actions/upload-artifact@v4
+        with:
+          name: backend-windows
+          path: artifacts/*.tar.gz
+          if-no-files-found: error
+
+  backend-linux-and-frontend:
+    runs-on: ubuntu-latest
+    env:
+      VERSION: ${{ inputs.VERSION }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+      - run: npm ci
+      - run: npm run build:backend:linux-x64
+      - run: npm run build:frontend
+      - run: |
+          set -euo pipefail
+          mkdir -p artifacts
+          tar -czf "artifacts/jetsrm-backend-$VERSION-linux-x64.tar.gz" -C dist/backend/linux-x64 .
+          tar -czf "artifacts/jetsrm-frontend-$VERSION.tar.gz" -C dist/frontend .
+      - uses: actions/upload-artifact@v4
+        with:
+          name: backend-linux-and-frontend
+          path: artifacts/*.tar.gz
+          if-no-files-found: error
+
+  publish:
+    needs: [backend-windows, backend-linux-and-frontend]
+    runs-on: ubuntu-latest
+    env:
+      VERSION: ${{ inputs.VERSION }}
+      IDP_URL: ${{ vars.IDP_URL }}
+      IDP_PROJECT_ID: ${{ vars.IDP_PROJECT_ID }}
+      IDP_ARTIFACT_UPLOAD_TOKEN: ${{ secrets.IDP_ARTIFACT_UPLOAD_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+      - name: Create manifest and publish
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "$IDP_URL" && test -n "$IDP_PROJECT_ID" && test -n "$IDP_ARTIFACT_UPLOAD_TOKEN" && test -n "$VERSION"
+          node scripts/make-manifest.js jetsrm "$VERSION" "$GITHUB_SHA" \
+            "backend:win-x64:artifacts/jetsrm-backend-$VERSION-win-x64.tar.gz" \
+            "backend:linux-x64:artifacts/jetsrm-backend-$VERSION-linux-x64.tar.gz" \
+            "frontend:any:artifacts/jetsrm-frontend-$VERSION.tar.gz"
+          mv "jetsrm-$VERSION-manifest.json" artifacts/
+          node scripts/upload-artifacts.js --project-id "$IDP_PROJECT_ID" --version "$VERSION" --manifest "artifacts/jetsrm-$VERSION-manifest.json"

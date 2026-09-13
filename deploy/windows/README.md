@@ -117,6 +117,16 @@ ve betik durur.
 
 ## Kurulumdan sonra
 
+Her proje için CI upload tokenını sunucuda üretip yalnız ilgili Bitbucket/GitHub/Jenkins secret store'una koyun:
+
+```powershell
+Set-Location C:\IDP\idp-server\backend
+node.exe scripts\derive-artifact-upload-token.js <IDP_PROJECT_ID>
+```
+
+Çıktıyı CI'da `IDP_ARTIFACT_UPLOAD_TOKEN` adıyla saklayın. `backend\.env` içindeki master değeri CI'a
+kopyalamayın.
+
 - **Arayüz yalnızca Electron'da.** Backend frontend dosyalarını sunmaz; `http://<ip>:3001`
   adresini tarayıcıda açmak arayüz getirmez (sadece `/api/...` uçları yanıt verir). Betik sonunda
   makinenin tüm iç IP'lerini listeler. Kullanıcı adı `admin`.

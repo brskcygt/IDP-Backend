@@ -997,6 +997,18 @@ try {
         Write-Info 'IDP_SECRET_KEY: mevcut deger korundu (format dogrulandi).'
     }
 
+    $artifactUploadToken = Get-EnvValue $backendLines 'IDP_ARTIFACT_UPLOAD_TOKEN'
+    if ([string]::IsNullOrWhiteSpace($artifactUploadToken)) {
+        Set-EnvValue $backendLines 'IDP_ARTIFACT_UPLOAD_TOKEN' (New-HexSecret 32)
+        Write-Info 'IDP_ARTIFACT_UPLOAD_TOKEN: yeni ana token uretildi (konsola yazdirilmadi).'
+    }
+    else {
+        if ($artifactUploadToken.Length -lt 32 -or $artifactUploadToken -match '\s') {
+            throw 'Mevcut IDP_ARTIFACT_UPLOAD_TOKEN en az 32 karakter olmali ve bosluk icermemeli.'
+        }
+        Write-Info 'IDP_ARTIFACT_UPLOAD_TOKEN: mevcut deger korundu.'
+    }
+
     $tokenBackend = Get-EnvValue $backendLines 'IDP_AGENT_API_TOKEN'
     $tokenGateway = Get-EnvValue $gatewayLines 'IDP_AGENT_API_TOKEN'
     if ((-not [string]::IsNullOrWhiteSpace($tokenBackend)) -and (-not [string]::IsNullOrWhiteSpace($tokenGateway)) -and ($tokenBackend -cne $tokenGateway)) {
@@ -1050,6 +1062,13 @@ try {
         $agentPublicUrlSummary = 'ws://' + $publicHost + ':' + $GatewayPort
         Set-EnvValue $backendLines 'IDP_AGENT_PUBLIC_URL' $agentPublicUrlSummary
         Write-Info ('IDP_AGENT_PUBLIC_URL: ' + $agentPublicUrlSummary + ' (varsayilan, ic ag). Internetten erisim icin -AgentPublicUrl wss://... verin.')
+    }
+    if ($agentPublicUrlSummary -match '^ws://') {
+        Set-EnvValue $backendLines 'IDP_ALLOW_INSECURE_AGENT_WS' 'true'
+        Write-Warn 'Agent WebSocket duz ws://: yalniz kontrollu LAN testi icindir. Public kullanimdan once wss:// yapin.'
+    }
+    else {
+        [void](Remove-EnvKey $backendLines 'IDP_ALLOW_INSECURE_AGENT_WS')
     }
 
     # Cloudflare Access cifti: parametre verildiyse ikisi birlikte yazilir; verilmediyse mevcut degerler korunur.
@@ -1219,7 +1238,7 @@ try {
     Write-Host ('    ' + $GatewayLog)
     Write-Host ('  Gorevler: ' + $BackendTaskName + ', ' + $GatewayTaskName + ' (hesap: ' + $ServiceAccount + ')')
     Write-Host '  Yedeklenecekler:'
-    Write-Host ('    ' + $BackendEnvPath + '  (IDP_SECRET_KEY, SESSION_SECRET, IDP_AGENT_API_TOKEN)')
+    Write-Host ('    ' + $BackendEnvPath + '  (IDP_SECRET_KEY, SESSION_SECRET, IDP_AGENT_API_TOKEN, IDP_ARTIFACT_UPLOAD_TOKEN)')
     Write-Host ('    ' + $GatewayEnvPath)
     Write-Host ('    ' + $DataDir + '  (idp.db*, users.json, secrets.enc.json, agents.json)')
     if ($publicProfileCount -gt 0) {

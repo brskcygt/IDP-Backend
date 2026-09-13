@@ -104,6 +104,7 @@ function setup({
   adapter = new FakeBuildAdapter(),
   manifestFor = (v) => makeManifest(v),
   isReleaseBusy = () => false,
+  deleteLocalRelease = null,
 } = {}) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'idp-release-'));
   const db = openDatabase(path.join(dir, 'test.db'));
@@ -131,6 +132,7 @@ function setup({
       return client;
     },
     isReleaseBusy,
+    deleteLocalRelease,
     timing: { manifestRetryMs: 1 },
   });
   return {
@@ -202,6 +204,59 @@ test('createRelease: a failed build marks the release failed', async () => {
     assert.equal(env.audit.at(-1).action, 'RELEASE_BUILD_FAILED');
     assert.equal(env.adapter.released, true);
   } finally {
+    env.cleanup();
+  }
+});
+
+test('createRelease accepts CI-finalized local artifacts and skips external import', async () => {
+  let finishBuild;
+  const gate = new Promise((resolve) => { finishBuild = resolve; });
+  const env = setup({ adapter: new FakeBuildAdapter({ gate }) });
+  try {
+    const { release } = await env.service.createRelease({ projectId: 'p1', version: '2.5.0' });
+    env.repository.replaceArtifacts(release.id, makeManifest('2.5.0').artifacts.map((artifact) => ({
+      ...artifact, sourceRef: artifact.file,
+    })));
+    env.repository.updateRelease(release.id, {
+      status: 'ready',
+      sourcePlatform: 'local',
+      sourceIdentity: { storage: 'local', projectId: 'p1', version: '2.5.0' },
+      manifest: makeManifest('2.5.0'),
+    });
+    finishBuild();
+    await env.service.waitForBuild(release.id);
+    assert.equal(env.service.getRelease(release.id).status, 'ready');
+    assert.equal(env.client.asked.length, 0);
+    assert.ok(deploymentManager.getSession(release.buildDeploymentId).logs.some((line) => line.includes('already uploaded')));
+  } finally {
+    finishBuild();
+    env.cleanup();
+  }
+});
+
+test('a polling failure cannot downgrade an immutable CI-finalized local release', async () => {
+  let finishBuild;
+  const gate = new Promise((resolve) => { finishBuild = resolve; });
+  const env = setup({ adapter: new FakeBuildAdapter({ gate, fail: true }) });
+  try {
+    const { release, deploymentId } = await env.service.createRelease({ projectId: 'p1', version: '2.5.0' });
+    env.repository.replaceArtifacts(release.id, makeManifest('2.5.0').artifacts.map((artifact) => ({
+      ...artifact, sourceRef: artifact.file,
+    })));
+    env.repository.updateRelease(release.id, {
+      status: 'ready',
+      sourcePlatform: 'local',
+      sourceIdentity: { storage: 'local', projectId: 'p1', version: '2.5.0' },
+      manifest: makeManifest('2.5.0'),
+    });
+    finishBuild();
+    await env.service.waitForBuild(release.id);
+    assert.equal(env.service.getRelease(release.id).status, 'ready');
+    assert.equal(deploymentManager.getSession(deploymentId).status, 'succeeded');
+    assert.equal(env.audit.at(-1).action, 'RELEASE_BUILD_SUCCEEDED');
+    assert.ok(deploymentManager.getSession(deploymentId).logs.some((line) => line.includes('polling failed')));
+  } finally {
+    finishBuild();
     env.cleanup();
   }
 });
@@ -336,6 +391,37 @@ test('a release used by an active deploy cannot be re-imported or deleted', asyn
       (err) => err instanceof ConflictError && /being deployed/.test(err.message)
     );
     assert.equal(env.service.getRelease(release.id).status, 'ready');
+  } finally {
+    env.cleanup();
+  }
+});
+
+test('an installed release cannot be deleted; deleting a local release removes its binary first', () => {
+  const removed = [];
+  const env = setup({
+    provider: 'none',
+    deleteLocalRelease: (projectId, version) => removed.push({ projectId, version }),
+  });
+  try {
+    const installed = env.repository.createRelease({
+      projectId: 'p1', version: '1.0.0', status: 'ready', sourcePlatform: 'local',
+    });
+    env.repository.createTarget({
+      projectId: 'p1', name: 'customer-a', agentId: 'WIN-01', os: 'windows',
+      components: [], runtimeConfig: {}, currentReleaseId: installed.id,
+    });
+    assert.throws(
+      () => env.service.deleteRelease(installed.id, 'admin'),
+      (err) => err instanceof ConflictError && /currently installed/.test(err.message)
+    );
+    assert.deepEqual(removed, []);
+
+    const unused = env.repository.createRelease({
+      projectId: 'p1', version: '2.0.0', status: 'ready', sourcePlatform: 'local',
+    });
+    env.service.deleteRelease(unused.id, 'admin');
+    assert.deepEqual(removed, [{ projectId: 'p1', version: '2.0.0' }]);
+    assert.equal(env.repository.findRelease(unused.id), null);
   } finally {
     env.cleanup();
   }

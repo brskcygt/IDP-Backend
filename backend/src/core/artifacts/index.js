@@ -25,6 +25,17 @@ const { createReleaseService } = require('./releaseService');
 const { createTargetService } = require('./targetService');
 const { createArtifactDeployService } = require('./artifactDeployService');
 const { createArtifactDownloadService } = require('./artifactDownloadService');
+const { createArtifactUploadService } = require('./artifactUploadService');
+const { createLocalArtifactStore } = require('./localArtifactStore');
+const { validateArtifactStorageEnv } = require('../../config');
+const {
+  persistTargetRuntimeConfig,
+  resolveTargetSecrets,
+  discardCreatedTargetSecrets,
+  deleteReplacedTargetSecrets,
+  deleteTargetSecrets,
+  redactTargetRuntimeConfig,
+} = require('./targetSecrets');
 
 function getGateway() {
   try {
@@ -36,7 +47,16 @@ function getGateway() {
 
 const getProject = (id) => projectService.getProject(id);
 const resolveSecrets = (project) => resolveProjectSecrets(project, secretStore);
+const targetSecretOptions = { requireEncryption: process.env.NODE_ENV === 'production' };
 const tokens = createDownloadTokenService({ repository });
+const storageConfig = validateArtifactStorageEnv(process.env);
+if (storageConfig.errors.length > 0) throw new Error(storageConfig.errors.join(' '));
+const localStore = createLocalArtifactStore({
+  root: storageConfig.storageRoot,
+  maxArtifactBytes: storageConfig.maxArtifactBytes,
+});
+const abandonedStaging = localStore.cleanupStagingSync();
+if (abandonedStaging > 0) console.log(`Removed ${abandonedStaging} abandoned artifact staging directorie(s).`);
 
 // A process restart cannot resume a CI adapter. Reconcile the release rows
 // alongside DeploymentManager's interrupted-deployment recovery.
@@ -56,6 +76,7 @@ const releaseService = createReleaseService({
   getProject,
   resolveSecrets,
   isReleaseBusy: (releaseId) => artifactDeployService ? artifactDeployService.isReleaseBusy(releaseId) : false,
+  deleteLocalRelease: (projectId, version) => localStore.removeReleaseSync(projectId, version),
 });
 artifactDeployService = createArtifactDeployService({
   repository,
@@ -65,6 +86,7 @@ artifactDeployService = createArtifactDeployService({
   tokens,
   getGateway,
   refreshTargetStatus: (targetId) => targetService.refreshStatus(targetId),
+  resolveTarget: (target) => resolveTargetSecrets(target, secretStore, targetSecretOptions),
 });
 targetService = createTargetService({
   repository,
@@ -72,9 +94,26 @@ targetService = createTargetService({
   getProject,
   getGateway,
   isTargetBusy: (targetId) => artifactDeployService.isTargetBusy(targetId),
+  targetSecrets: {
+    persist: (targetId, runtimeConfig) => persistTargetRuntimeConfig(targetId, runtimeConfig, secretStore, {
+      requireEncryption: process.env.NODE_ENV === 'production',
+    }),
+    resolve: (target) => resolveTargetSecrets(target, secretStore, targetSecretOptions),
+    redact: (target) => ({ ...target, runtimeConfig: redactTargetRuntimeConfig(target.runtimeConfig) }),
+    discardCreated: (refs) => discardCreatedTargetSecrets(refs, secretStore),
+    deleteReplaced: (previous, next) => deleteReplacedTargetSecrets(previous, next, secretStore),
+    deleteAll: (runtimeConfig) => deleteTargetSecrets(runtimeConfig, secretStore),
+  },
 });
 
-const downloadService = createArtifactDownloadService({ repository, tokens, getProject, resolveSecrets });
+const uploadService = createArtifactUploadService({
+  repository,
+  store: localStore,
+  auditLogger,
+  getProject,
+  isReleaseBusy: (releaseId) => artifactDeployService ? artifactDeployService.isReleaseBusy(releaseId) : false,
+});
+const downloadService = createArtifactDownloadService({ repository, tokens, getProject, resolveSecrets, localStore });
 
 module.exports = {
   contracts,
@@ -83,5 +122,7 @@ module.exports = {
   releaseService,
   targetService,
   artifactDeployService,
+  uploadService,
   downloadService,
+  localStore,
 };

@@ -88,6 +88,7 @@ function sleep(ms) {
  * @param {Function} [deps.createBuildAdapter] - test seam: ({provider, config, version, versionVariable, ref}) → {adapter, triggerParams}.
  * @param {Function} [deps.createSourceClient] - test seam: (source, {token, username}) → source client.
  * @param {(releaseId: string) => boolean} [deps.isReleaseBusy] - true while an agent deploy uses the release.
+ * @param {(projectId: string, version: string) => void} [deps.deleteLocalRelease]
  * @param {{ manifestRetryMs?: number }} [deps.timing]
  */
 function createReleaseService({
@@ -99,6 +100,7 @@ function createReleaseService({
   createBuildAdapter = defaultCreateBuildAdapter,
   createSourceClient = defaultCreateSourceClient,
   isReleaseBusy = () => false,
+  deleteLocalRelease = null,
   timing = {},
 }) {
   const manifestRetryMs = timing.manifestRetryMs ?? 5_000;
@@ -213,11 +215,16 @@ function createReleaseService({
       await adapter.streamLogs(log);
       throwIfAborted();
 
-      log('[Release] ✓ Build finished — reading the manifest from the artifact source...');
-      const ready = await ingestManifest(release, runtimeProject, {
-        attempts: MANIFEST_ATTEMPTS,
-        onRetry: (err, attempt) => log(`[Release] ⚠ ${err.message} Retrying (${attempt}/${MANIFEST_ATTEMPTS - 1})...`),
-      });
+      let ready = repository.findRelease(release.id);
+      if (ready && ready.status === 'ready' && ready.sourcePlatform === 'local') {
+        log('[Release] ✓ Build finished — CI already uploaded and finalized the local artifacts.');
+      } else {
+        log('[Release] ✓ Build finished — reading the manifest from the external artifact source...');
+        ready = await ingestManifest(release, runtimeProject, {
+          attempts: MANIFEST_ATTEMPTS,
+          onRetry: (err, attempt) => log(`[Release] ⚠ ${err.message} Retrying (${attempt}/${MANIFEST_ATTEMPTS - 1})...`),
+        });
+      }
       const artifacts = repository.listArtifacts(release.id);
       for (const artifact of artifacts) {
         log(`[Release] ✓ ${artifact.component} (${artifact.os}) ${artifact.fileName} — ${artifact.size} bytes, sha256 ${artifact.sha256.slice(0, 12)}…`);
@@ -235,6 +242,23 @@ function createReleaseService({
     } catch (err) {
       const session = deploymentManager.getSession(deploymentId);
       const wasAborted = session && session.status === 'aborted';
+      const finalized = repository.findRelease(release.id);
+      if (finalized && finalized.status === 'ready' && finalized.sourcePlatform === 'local') {
+        log(`[Release] ⚠ CI status polling failed after the immutable local artifacts were finalized: ${err.message}`);
+        log(`[Release] ✓ Release ${finalized.version} remains ready; verified uploaded artifacts take precedence over the polling error.`);
+        if (!wasAborted) deploymentManager.setStatus(deploymentId, 'succeeded');
+        auditLogger.log(triggeredBy, 'RELEASE_BUILD_SUCCEEDED', `Release ${release.version} finalized for project: ${project.name}`, {
+          projectId: project.id,
+          releaseId: release.id,
+          version: release.version,
+          deploymentId,
+          provider,
+          durationMs: Date.now() - startedAt,
+          pollingWarning: String(err.message || err).slice(0, 500),
+          abortedAfterFinalize: Boolean(wasAborted),
+        });
+        return;
+      }
       fail(release, wasAborted ? new Error('Build aborted by user.') : err);
       if (!wasAborted) {
         log(`[Release] ✗ Release ${release.version} failed: ${err.message}`);
@@ -346,6 +370,10 @@ function createReleaseService({
       const project = getProject(projectId);
       requireVersion(version);
       requireConfig(project);
+      const existing = repository.findReleaseByVersion(projectId, version);
+      if (existing && existing.status === 'ready' && existing.sourcePlatform === 'local') {
+        throw new ConflictError(`Release ${version} was uploaded locally and is immutable.`);
+      }
       const runtimeProject = await resolveSecrets(project);
 
       const release = claimReleaseRow(project, version, triggeredBy, { allowReady: true });
@@ -374,7 +402,7 @@ function createReleaseService({
       }
     },
 
-    /** Deletes the DB rows only — artifacts stay at the source. */
+    /** Deletes DB rows; local binaries are removed by `deleteLocalRelease`. */
     deleteRelease(id, actor) {
       const release = repository.findRelease(id);
       if (!release) throw new NotFoundError('Release not found');
@@ -384,7 +412,19 @@ function createReleaseService({
       if (isReleaseBusy(release.id)) {
         throw new ConflictError('The release is being deployed and cannot be deleted.');
       }
+      if (repository.isReleaseCurrent(release.id)) {
+        throw new ConflictError('The release is currently installed on a target and cannot be deleted.');
+      }
       repository.deleteRelease(id);
+      if (deleteLocalRelease) {
+        try {
+          deleteLocalRelease(release.projectId, release.version);
+        } catch (err) {
+          // The release is no longer deployable. Leaving orphaned bytes is
+          // safer than leaving metadata that points at a partly deleted file.
+          console.error(`[artifacts] Failed to remove deleted release ${release.id}: ${err.message}`);
+        }
+      }
       auditLogger.log(actor, 'RELEASE_DELETED', `Deleted release ${release.version}`, {
         projectId: release.projectId,
         releaseId: id,

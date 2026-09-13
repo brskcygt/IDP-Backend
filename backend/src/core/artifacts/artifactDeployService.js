@@ -28,6 +28,7 @@ const {
   selectArtifact,
   targetArtifactOs,
   buildDeployPayload,
+  runtimeConfigForComponent,
   computeDeployTimeoutSec,
   sanitizeAgentText,
   sanitizeVersion,
@@ -37,12 +38,32 @@ const { openAgentChannel, sendAgentCommand, listGatewayAgents } = require('./age
 /** Extra wait on top of the agent-side `timeoutSec` before we give up on a result. */
 const RESULT_GRACE_MS = 60_000;
 const ROLLBACK_TIMEOUT_BASE_SEC = 900;
+const CONFIG_APPLY_TIMEOUT_BASE_SEC = 300;
 const MAX_EVENTS_PER_DEPLOYMENT = 2000;
 const MAX_RESULT_COMPONENTS = 20;
 const MAX_RECONNECT_DELAY_MS = 30_000;
 
-const LABELS = { artifact_deploy: 'Deploy', artifact_rollback: 'Rollback' };
-const AUDIT_PREFIX = { artifact_deploy: 'ARTIFACT_DEPLOY', artifact_rollback: 'ARTIFACT_ROLLBACK' };
+const LABELS = { artifact_deploy: 'Deploy', artifact_rollback: 'Rollback', artifact_config_apply: 'Config apply' };
+const AUDIT_PREFIX = {
+  artifact_deploy: 'ARTIFACT_DEPLOY',
+  artifact_rollback: 'ARTIFACT_ROLLBACK',
+  artifact_config_apply: 'ARTIFACT_CONFIG_APPLY',
+};
+const EVENT_PROCESS = {
+  artifact_deploy: 'deploy_event',
+  artifact_rollback: 'deploy_event',
+  artifact_config_apply: 'artifact_config_event',
+};
+const RESULT_PROCESS = {
+  artifact_deploy: 'deploy_result',
+  artifact_rollback: 'deploy_result',
+  artifact_config_apply: 'artifact_config_result',
+};
+const SSE_EVENT = {
+  artifact_deploy: 'artifact_deploy_event',
+  artifact_rollback: 'artifact_deploy_event',
+  artifact_config_apply: 'artifact_config_event',
+};
 
 function newDeployId() {
   return `dep_${crypto.randomBytes(12).toString('hex')}`;
@@ -62,6 +83,23 @@ function requireComponentNames(components) {
   return components.length > 0 ? [...new Set(components)] : null;
 }
 
+function collectSensitiveValues(runtimeConfig, components = []) {
+  const values = [];
+  if (isPlainObject(runtimeConfig)) {
+    for (const entry of Object.values(runtimeConfig)) {
+      if (typeof entry === 'string') values.push(entry);
+      else if (isPlainObject(entry) && isPlainObject(entry.values)) values.push(...Object.values(entry.values));
+    }
+  }
+  for (const component of components) {
+    for (const hook of (component.hooks && component.hooks.preStart) || []) {
+      if (isPlainObject(hook.env)) values.push(...Object.values(hook.env));
+    }
+  }
+  return [...new Set(values.filter((value) => typeof value === 'string' && value.length > 0))]
+    .sort((a, b) => b.length - a.length);
+}
+
 /**
  * @param {object} deps
  * @param {object} deps.repository - artifactDeployRepository.
@@ -71,6 +109,7 @@ function requireComponentNames(components) {
  * @param {object} deps.tokens - download token service.
  * @param {() => object} deps.getGateway - AgentGatewayClient factory.
  * @param {(targetId: string) => Promise<object>} [deps.refreshTargetStatus] - run after a successful rollback.
+ * @param {(target: object) => Promise<object>} [deps.resolveTarget] - decrypts target runtime config into a copy.
  * @param {{ resultGraceMs?: number, resultTimeoutMs?: number, resubscribeDelayMs?: number, channelTimeoutMs?: number }} [deps.timing]
  */
 function createArtifactDeployService({
@@ -81,6 +120,7 @@ function createArtifactDeployService({
   tokens,
   getGateway,
   refreshTargetStatus = null,
+  resolveTarget = async (target) => target,
   timing = {},
 }) {
   const resultGraceMs = timing.resultGraceMs ?? RESULT_GRACE_MS;
@@ -88,11 +128,19 @@ function createArtifactDeployService({
   const channelTimeoutMs = timing.channelTimeoutMs ?? 10_000;
   /** targetId → run: the per-target lock. */
   const activeTargets = new Map();
+  /** targetId → releaseId|null while online checks/secret resolution finish. */
+  const preparingTargets = new Map();
   /** deploymentId → run */
   const runs = new Map();
 
   function log(run, line) {
     deploymentManager.pushLog(run.deploymentId, `[${LABELS[run.kind]}] ${line}`);
+  }
+
+  function cleanAgentText(run, value, max) {
+    let text = value === undefined || value === null ? '' : String(value);
+    for (const secret of run.sensitiveValues) text = text.split(secret).join('[REDACTED]');
+    return sanitizeAgentText(text, max);
   }
 
   function auditMeta(run, extra = {}) {
@@ -108,15 +156,27 @@ function createArtifactDeployService({
     };
   }
 
-  function requireTarget(id) {
+  async function requireTarget(id) {
     const target = repository.findTarget(id);
     if (!target) throw new NotFoundError('Deploy target not found');
-    return target;
+    return resolveTarget(target);
   }
 
   function assertUnlocked(target) {
-    if (activeTargets.has(target.id)) {
+    if (activeTargets.has(target.id) || preparingTargets.has(target.id)) {
       throw new ConflictError(`A deployment is already running on target '${target.name}'.`);
+    }
+  }
+
+  function reservePreparation(target, releaseId = null) {
+    assertUnlocked(target);
+    preparingTargets.set(target.id, releaseId);
+  }
+
+  function assertTargetUnchanged(target) {
+    const fresh = repository.findTarget(target.id);
+    if (!fresh || fresh.updatedAt !== target.updatedAt || fresh.agentId !== target.agentId) {
+      throw new ConflictError(`Deploy target '${target.name}' changed while the deployment was being prepared. Retry.`);
     }
   }
 
@@ -170,8 +230,8 @@ function createArtifactDeployService({
     if (message.type !== 'agent' || message.agentId !== run.target.agentId) return;
     const payload = message.payload;
     if (!isPlainObject(payload) || payload.deployId !== run.deployId) return;
-    if (message.process === 'deploy_event') handleEvent(run, payload);
-    else if (message.process === 'deploy_result') handleResult(run, payload);
+    if (message.process === EVENT_PROCESS[run.kind]) handleEvent(run, payload);
+    else if (message.process === RESULT_PROCESS[run.kind]) handleResult(run, payload);
   }
 
   function handleEvent(run, payload) {
@@ -181,7 +241,7 @@ function createArtifactDeployService({
     const progress = typeof payload.progress === 'number' && Number.isFinite(payload.progress)
       ? Math.max(0, Math.min(100, Math.round(payload.progress * 10) / 10))
       : null;
-    const message = sanitizeAgentText(payload.message, 300);
+    const message = cleanAgentText(run, payload.message, 300);
 
     // Progress events arrive up to once a second; keep one per 10% step.
     if (status === 'progress') {
@@ -192,7 +252,7 @@ function createArtifactDeployService({
     }
 
     log(run, `${component || '-'} · ${stage} ${status}${progress !== null ? ` ${progress}%` : ''}${message ? ` — ${message}` : ''}`);
-    deploymentManager.pushEvent(run.deploymentId, 'artifact_deploy_event', { component, stage, status, progress, message });
+    deploymentManager.pushEvent(run.deploymentId, SSE_EVENT[run.kind], { component, stage, status, progress, message });
     if (run.eventCount < MAX_EVENTS_PER_DEPLOYMENT) {
       run.eventCount += 1;
       try {
@@ -215,7 +275,7 @@ function createArtifactDeployService({
         success: entry.success === true,
         rolledBack: entry.rolledBack === true,
         previousVersion: sanitizeVersion(entry.previousVersion),
-        error: entry.error ? sanitizeAgentText(entry.error, 300) : null,
+        error: entry.error ? cleanAgentText(run, entry.error, 300) : null,
       }));
     for (const entry of components) {
       const rolled = entry.rolledBack ? ` rolled back${entry.previousVersion ? ` to ${entry.previousVersion}` : ''}` : '';
@@ -228,7 +288,9 @@ function createArtifactDeployService({
         success: true,
         message: run.kind === 'artifact_deploy'
           ? `✓ ${run.release.version} deployed to '${run.target.name}'.`
-          : `✓ Rolled back on '${run.target.name}'.`,
+          : run.kind === 'artifact_rollback'
+            ? `✓ Rolled back on '${run.target.name}'.`
+            : `✓ Runtime config applied on '${run.target.name}'.`,
       });
       if (run.kind === 'artifact_rollback' && refreshTargetStatus) {
         Promise.resolve()
@@ -238,9 +300,13 @@ function createArtifactDeployService({
       return;
     }
 
-    let error = sanitizeAgentText(payload.error, 500) || 'The agent reported a failure.';
+    let error = cleanAgentText(run, payload.error, 500) || 'The agent reported a failure.';
     if (error === 'busy') error = 'The agent is busy with another deployment (busy).';
-    if (payload.rolledBack === true) error = `${error.replace(/[.!?]+$/, '')}. Switched components were rolled back.`;
+    if (payload.rolledBack === true) {
+      error = run.kind === 'artifact_config_apply'
+        ? `${error.replace(/[.!?]+$/, '')}. The previous runtime config was restored.`
+        : `${error.replace(/[.!?]+$/, '')}. Switched components were rolled back.`;
+    }
     finish(run, { success: false, error });
   }
 
@@ -303,7 +369,7 @@ function createArtifactDeployService({
     sendAgentCommand(getGateway(), run.target.agentId, 'artifact_cancel', { deployId: run.deployId }).catch(() => {});
     finish(run, {
       success: false,
-      error: `No deploy_result from the agent within ${seconds}s. The server state is unknown — refresh the target status.`,
+      error: `No ${RESULT_PROCESS[run.kind]} from the agent within ${seconds}s. The server state is unknown — refresh the target status.`,
     });
   }
 
@@ -311,7 +377,9 @@ function createArtifactDeployService({
   async function requestCancel(run) {
     if (run.finished || run.cancelRequested) return;
     run.cancelRequested = true;
-    log(run, '■ Cancel requested — the agent stops and rolls back any switched component.');
+    log(run, run.kind === 'artifact_config_apply'
+      ? '■ Cancel requested — the agent stops and restores any changed runtime config.'
+      : '■ Cancel requested — the agent stops and rolls back any switched component.');
     auditLogger.log(null, `${AUDIT_PREFIX[run.kind]}_CANCEL_REQUESTED`, `Cancel requested on target '${run.target.name}'`, auditMeta(run));
     try {
       await sendAgentCommand(getGateway(), run.target.agentId, 'artifact_cancel', { deployId: run.deployId });
@@ -321,7 +389,7 @@ function createArtifactDeployService({
     // The run stays locked until the agent's terminal deploy_result (or the timeout).
   }
 
-  async function startRun({ kind, target, project, release, triggeredBy, components, timeoutSec, buildPayload, description }) {
+  async function startRun({ kind, target, project, release, triggeredBy, components, timeoutSec, buildPayload, description, sensitiveValues = [] }) {
     const run = {
       kind,
       deployId: newDeployId(),
@@ -341,6 +409,7 @@ function createArtifactDeployService({
       startedAt: Date.now(),
       progressBuckets: new Map(),
       eventCount: 0,
+      sensitiveValues: [...new Set(sensitiveValues)].sort((a, b) => b.length - a.length),
     };
     activeTargets.set(target.id, run);
 
@@ -380,14 +449,14 @@ function createArtifactDeployService({
 
   return {
     isTargetBusy(targetId) {
-      return activeTargets.has(targetId);
+      return activeTargets.has(targetId) || preparingTargets.has(targetId);
     },
 
     isReleaseBusy(releaseId) {
       for (const run of activeTargets.values()) {
         if (!run.finished && run.release && run.release.id === releaseId) return true;
       }
-      return false;
+      return [...preparingTargets.values()].includes(releaseId);
     },
 
     /**
@@ -397,7 +466,7 @@ function createArtifactDeployService({
     async deploy({ targetId, releaseId, components, triggeredBy, publicUrl }) {
       if (!publicUrl) throw new ValidationError('IDP_PUBLIC_URL is not configured — agents need it to download artifacts.');
       const requested = requireComponentNames(components);
-      const target = requireTarget(targetId);
+      const target = await requireTarget(targetId);
       const release = repository.findRelease(releaseId);
       if (!release || release.projectId !== target.projectId) throw new NotFoundError("Release not found for this target's project");
       if (release.status !== 'ready') throw new ConflictError(`Release ${release.version} is not ready (status: ${release.status}).`);
@@ -423,11 +492,14 @@ function createArtifactDeployService({
         throw new ValidationError(`Release ${release.version} has no ${targetArtifactOs(target.os)} or 'any' artifact for: ${missing.join(', ')}.`);
       }
 
-      assertUnlocked(target);
-      await ensureAgentOnline(target.agentId);
-      assertUnlocked(target);
-
-      return startRun({
+      reservePreparation(target, release.id);
+      try {
+        await ensureAgentOnline(target.agentId);
+        assertTargetUnchanged(target);
+        const freshRelease = repository.findRelease(release.id);
+        if (!freshRelease || freshRelease.status !== 'ready') throw new ConflictError(`Release ${release.version} changed while deployment was being prepared.`);
+        preparingTargets.delete(target.id);
+        return await startRun({
         kind: 'artifact_deploy',
         target,
         project,
@@ -435,6 +507,7 @@ function createArtifactDeployService({
         triggeredBy,
         components: resolved.components.map((component) => component.name),
         timeoutSec: computeDeployTimeoutSec(resolved.components),
+        sensitiveValues: collectSensitiveValues(target.runtimeConfig, resolved.components),
         description: `Artifact deploy of ${release.version} to target '${target.name}' (project: ${project.name})`,
         buildPayload: (run) => {
           const issued = new Map();
@@ -445,10 +518,11 @@ function createArtifactDeployService({
               deploymentId: run.deploymentId,
             }));
             const artifact = selected.get(component.name);
+            const componentConfig = runtimeConfigForComponent(target.runtimeConfig, component);
             const extras = [
               component.hooks ? `preStart: ${component.hooks.preStart.map((hook) => hook.name).join(', ')}` : null,
-              component.writeRuntimeConfig && isPlainObject(target.runtimeConfig)
-                ? `config.js keys: ${Object.keys(target.runtimeConfig).join(', ') || '(none)'}`
+              componentConfig
+                ? `${componentConfig.format} keys: ${Object.keys(componentConfig.values).join(', ') || '(none)'}`
                 : null,
             ].filter(Boolean);
             log(run, `${component.name}: ${artifact.fileName} (${artifact.os}, ${artifact.size} bytes) → ${component.subdir}/ via ${component.runtime.type}${extras.length ? `; ${extras.join('; ')}` : ''}`);
@@ -464,7 +538,10 @@ function createArtifactDeployService({
             publicUrl,
           });
         },
-      });
+        });
+      } finally {
+        preparingTargets.delete(target.id);
+      }
     },
 
     /**
@@ -473,7 +550,7 @@ function createArtifactDeployService({
      */
     async rollback({ targetId, components, triggeredBy }) {
       const requested = requireComponentNames(components);
-      const target = requireTarget(targetId);
+      const target = await requireTarget(targetId);
       const project = getProject(target.projectId);
       const config = normalizeArtifactDeployConfig(project.config && project.config.artifactDeploy);
       const known = config ? config.components : [];
@@ -482,13 +559,15 @@ function createArtifactDeployService({
         if (unknown.length > 0) throw new ValidationError(`Unknown component(s): ${unknown.join(', ')}.`);
       }
 
-      assertUnlocked(target);
-      await ensureAgentOnline(target.agentId);
-      assertUnlocked(target);
+      reservePreparation(target);
+      try {
+        await ensureAgentOnline(target.agentId);
+        assertTargetUnchanged(target);
+        preparingTargets.delete(target.id);
 
-      const relevant = requested ? known.filter((component) => requested.includes(component.name)) : known;
-      const healthSec = relevant.reduce((sum, component) => sum + (component.health ? component.health.timeoutSec : 0), 0);
-      return startRun({
+        const relevant = requested ? known.filter((component) => requested.includes(component.name)) : known;
+        const healthSec = relevant.reduce((sum, component) => sum + (component.health ? component.health.timeoutSec : 0), 0);
+        return await startRun({
         kind: 'artifact_rollback',
         target,
         project,
@@ -501,10 +580,71 @@ function createArtifactDeployService({
           log(run, `Rolling back ${requested ? requested.join(', ') : 'every component with a previous release'} on '${target.name}' (agent ${target.agentId}).`);
           return { deployId: run.deployId, components: requested };
         },
-      });
+        });
+      } finally {
+        preparingTargets.delete(target.id);
+      }
     },
 
-    /** Cancels a running artifact deploy/rollback through DeploymentManager.abort(). */
+    /** Applies the stored target config without changing the installed release. */
+    async applyConfig({ targetId, triggeredBy }) {
+      const target = await requireTarget(targetId);
+      const project = getProject(target.projectId);
+      const config = normalizeArtifactDeployConfig(project.config && project.config.artifactDeploy);
+      if (!config || config.components.length === 0) {
+        throw new ValidationError('No artifactDeploy.components are configured for this project.');
+      }
+      const resolved = resolveTargetComponents(config.components, target.components, null);
+      if (resolved.errors.length > 0) throw new ValidationError(resolved.errors.join(' '));
+      const configured = resolved.components
+        .map((component) => ({ component, runtimeConfig: runtimeConfigForComponent(target.runtimeConfig, component) }))
+        .filter((entry) => entry.runtimeConfig !== null);
+      if (configured.length === 0) throw new ValidationError('This target has no runtime config to apply.');
+
+      reservePreparation(target);
+      try {
+        await ensureAgentOnline(target.agentId);
+        assertTargetUnchanged(target);
+        preparingTargets.delete(target.id);
+
+        const healthSec = configured.reduce(
+          (sum, entry) => sum + (entry.component.health ? entry.component.health.timeoutSec : 0), 0
+        );
+        const timeoutSec = Math.min(3600, CONFIG_APPLY_TIMEOUT_BASE_SEC + healthSec);
+        return await startRun({
+        kind: 'artifact_config_apply',
+        target,
+        project,
+        release: null,
+        triggeredBy,
+        components: configured.map((entry) => entry.component.name),
+        timeoutSec,
+        sensitiveValues: collectSensitiveValues(target.runtimeConfig, configured.map((entry) => entry.component)),
+        description: `Runtime config apply on target '${target.name}' (project: ${project.name})`,
+        buildPayload: (run) => {
+          for (const entry of configured) {
+            log(run, `${entry.component.name}: ${entry.runtimeConfig.format}; keys: ${Object.keys(entry.runtimeConfig.values).join(', ') || '(none)'}`);
+          }
+          log(run, `Applying stored runtime config on '${target.name}' (agent ${target.agentId}).`);
+          return {
+            deployId: run.deployId,
+            timeoutSec,
+            components: configured.map((entry) => ({
+              name: entry.component.name,
+              runtimeConfig: {
+                format: entry.runtimeConfig.format,
+                values: { ...entry.runtimeConfig.values },
+              },
+            })),
+          };
+        },
+        });
+      } finally {
+        preparingTargets.delete(target.id);
+      }
+    },
+
+    /** Cancels a running artifact deploy/rollback/config apply through DeploymentManager.abort(). */
     async cancel(deploymentId) {
       const run = runs.get(deploymentId);
       if (!run) throw new NotFoundError('No running artifact deployment with this id.');

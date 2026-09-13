@@ -1,0 +1,41 @@
+# Copy scripts/make-manifest.js and scripts/upload-artifacts.js into the application repository.
+# Secured repository variable: IDP_ARTIFACT_UPLOAD_TOKEN
+# Non-secret repository variables: IDP_URL, IDP_PROJECT_ID
+pipelines:
+  custom:
+    idp-release:
+      - variables:
+          - name: VERSION
+      - step:
+          name: Build Windows backend once
+          runs-on: [self.hosted, windows]
+          script:
+            - npm ci
+            - npm run build:backend:win-x64
+            - New-Item -ItemType Directory -Force artifacts | Out-Null
+            - tar -czf "artifacts/jetsrm-backend-$env:VERSION-win-x64.tar.gz" -C "dist/backend/win-x64" .
+          artifacts:
+            - artifacts/jetsrm-backend-*.tar.gz
+      - step:
+          name: Build Linux backend and shared frontend once
+          image: node:24
+          script:
+            - npm ci
+            - npm run build:backend:linux-x64
+            - npm run build:frontend
+            - mkdir -p artifacts
+            - tar -czf "artifacts/jetsrm-backend-$VERSION-linux-x64.tar.gz" -C dist/backend/linux-x64 .
+            - tar -czf "artifacts/jetsrm-frontend-$VERSION.tar.gz" -C dist/frontend .
+          artifacts:
+            - artifacts/jetsrm-backend-*.tar.gz
+            - artifacts/jetsrm-frontend-*.tar.gz
+      - step:
+          name: Verify and publish to IDP
+          image: node:24
+          script:
+            - test -n "$IDP_URL" && test -n "$IDP_PROJECT_ID" && test -n "$IDP_ARTIFACT_UPLOAD_TOKEN" && test -n "$VERSION"
+            - node scripts/make-manifest.js jetsrm "$VERSION" "$BITBUCKET_COMMIT" "backend:win-x64:artifacts/jetsrm-backend-$VERSION-win-x64.tar.gz" "backend:linux-x64:artifacts/jetsrm-backend-$VERSION-linux-x64.tar.gz" "frontend:any:artifacts/jetsrm-frontend-$VERSION.tar.gz"
+            - mv "jetsrm-$VERSION-manifest.json" artifacts/
+            - node scripts/upload-artifacts.js --project-id "$IDP_PROJECT_ID" --version "$VERSION" --manifest "artifacts/jetsrm-$VERSION-manifest.json"
+          artifacts:
+            - artifacts/jetsrm-*-manifest.json

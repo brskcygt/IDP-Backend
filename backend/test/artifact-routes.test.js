@@ -24,6 +24,7 @@ const { createArtifactDeployRepository } = require('../src/store/artifactDeployR
 const { createDownloadTokenService } = require('../src/core/artifacts/downloadTokens');
 const { createArtifactDownloadService } = require('../src/core/artifacts/artifactDownloadService');
 const { createArtifactSourceClient } = require('../src/core/artifacts/artifactSourceClient');
+const { deriveArtifactUploadToken } = require('../src/auth/artifactUploadToken');
 const { ConflictError, UpstreamError, NotFoundError } = require('../src/core/errors');
 
 const cleanups = [];
@@ -86,32 +87,49 @@ function fakeServices() {
     artifactDeployService: {
       deploy: record('deploy', async () => ({ deploymentId: 'deploy_d', deployId: 'dep_1' })),
       rollback: record('rollback', async () => ({ deploymentId: 'deploy_r', deployId: 'dep_2' })),
+      applyConfig: record('applyConfig', async () => ({ deploymentId: 'deploy_c', deployId: 'dep_3' })),
       listEvents: record('listEvents', []),
+    },
+    uploadService: {
+      uploadArtifact: record('uploadArtifact', async ({ fileName, sha256, contentLength, stream }) => {
+        for await (const _chunk of stream) { /* drain the raw upload */ }
+        return { fileName, sha256, size: contentLength, staged: true, idempotent: false };
+      }),
+      finalizeRelease: record('finalizeRelease', async ({ version, manifest }) => ({
+        id: 'rel_upload', version, manifest, status: 'ready', artifacts: manifest.artifacts, idempotent: false, pruned: [],
+      })),
     },
     downloadService: { authorize: () => null, open: async () => { throw new Error('unused'); } },
   };
 }
 
-async function startApi({ services = fakeServices(), publicUrl = 'https://idp.example', audit = fakeAudit() } = {}) {
+async function startApi({
+  services = fakeServices(),
+  publicUrl = 'https://idp.example',
+  audit = fakeAudit(),
+  upload = { token: 'U'.repeat(32), maxArtifactBytes: 1024 },
+} = {}) {
   const routes = createArtifactRoutes({
     services,
     getProject: () => ({ id: 'p1', name: 'JetSRM', environment: 'Dev' }),
     auditLogger: audit,
     publicUrl,
     publicUrlError: publicUrl ? null : 'IDP_PUBLIC_URL tanımlı değil.',
+    upload,
   });
   const app = express();
   app.use(express.json());
   app.use(fakeSession);
   app.use(routes.downloadRouter);
+  app.use(routes.uploadRouter);
   app.use(routes.apiRouter);
   return { base: await listen(app), services, audit };
 }
 
-function call(base, method, pathname, { role, body } = {}) {
+function call(base, method, pathname, { role, body, headers = {} } = {}) {
   return fetch(`${base}${pathname}`, {
     method,
-    headers: { ...(role ? { 'x-test-role': role } : {}), ...(body ? { 'content-type': 'application/json' } : {}) },
+    headers: { ...(role ? { 'x-test-role': role } : {}), ...(body ? { 'content-type': 'application/json' } : {}), ...headers },
     body: body ? JSON.stringify(body) : undefined,
   });
 }
@@ -130,6 +148,7 @@ const MATRIX = [
   ['POST', '/api/targets/tgt_dev/refresh-status', null, 'deployer', 200],
   ['POST', '/api/targets/tgt_dev/deploy', { releaseId: 'rel_1' }, 'deployer', 202],
   ['POST', '/api/targets/tgt_dev/rollback', {}, 'deployer', 202],
+  ['POST', '/api/targets/tgt_dev/apply-config', {}, 'deployer', 202],
   ['GET', '/api/deployments/deploy_d/events', null, 'viewer', 200],
 ];
 
@@ -146,6 +165,26 @@ test('RBAC: every artifact route enforces its minimum role', async () => {
   }
 });
 
+test('target runtime config is cache-disabled and only resolved for admins', async () => {
+  const services = fakeServices();
+  const { base } = await startApi({ services });
+
+  for (const [role, includeRuntimeConfig] of [['viewer', false], ['deployer', false], ['admin', true]]) {
+    const response = await call(base, 'GET', '/api/projects/p1/targets', { role });
+    assert.equal(response.status, 200);
+    assert.equal(response.headers.get('cache-control'), 'no-store');
+    const invocation = services.calls.filter((entry) => entry.name === 'listTargets').at(-1);
+    assert.deepEqual(invocation.args, ['p1', { includeRuntimeConfig }]);
+  }
+
+  const created = await call(base, 'POST', '/api/projects/p1/targets', {
+    role: 'admin', body: { name: 'x', agentId: 'WIN-01', os: 'windows' },
+  });
+  assert.equal(created.headers.get('cache-control'), 'no-store');
+  const updated = await call(base, 'PUT', '/api/targets/tgt_dev', { role: 'admin', body: { name: 'y' } });
+  assert.equal(updated.headers.get('cache-control'), 'no-store');
+});
+
 test('deploy/rollback: Prod targets require the target name; triggeredBy and publicUrl come from the server', async () => {
   const { base, services } = await startApi();
   const denied = await call(base, 'POST', '/api/targets/tgt_prod/deploy', { role: 'deployer', body: { releaseId: 'rel_1' } });
@@ -154,7 +193,8 @@ test('deploy/rollback: Prod targets require the target name; triggeredBy and pub
     error: 'Production targets require typing the target name to confirm.', code: 'CONFIRMATION_REQUIRED', expected: 'temsa',
   });
   assert.equal((await call(base, 'POST', '/api/targets/tgt_prod/rollback', { role: 'deployer', body: {} })).status, 400);
-  assert.ok(!services.calls.some((c) => c.name === 'deploy' || c.name === 'rollback'));
+  assert.equal((await call(base, 'POST', '/api/targets/tgt_prod/apply-config', { role: 'deployer', body: {} })).status, 400);
+  assert.ok(!services.calls.some((c) => ['deploy', 'rollback', 'applyConfig'].includes(c.name)));
 
   const ok = await call(base, 'POST', '/api/targets/tgt_prod/deploy', {
     role: 'deployer', body: { releaseId: 'rel_1', components: ['backend'], confirmation: 'temsa' },
@@ -166,6 +206,16 @@ test('deploy/rollback: Prod targets require the target name; triggeredBy and pub
   const deployCall = services.calls.find((c) => c.name === 'deploy');
   assert.deepEqual(deployCall.args[0], {
     targetId: 'tgt_prod', releaseId: 'rel_1', components: ['backend'], triggeredBy: 'user-deployer', publicUrl: 'https://idp.example',
+  });
+  const config = await call(base, 'POST', '/api/targets/tgt_prod/apply-config', {
+    role: 'deployer', body: { confirmation: 'temsa' },
+  });
+  assert.equal(config.status, 202);
+  assert.deepEqual(await config.json(), {
+    deploymentId: 'deploy_c', deployId: 'dep_3', sseUrl: '/api/deploy/logs/deploy_c', eventsUrl: '/api/deployments/deploy_c/events',
+  });
+  assert.deepEqual(services.calls.find((c) => c.name === 'applyConfig').args[0], {
+    targetId: 'tgt_prod', triggeredBy: 'user-deployer',
   });
 });
 
@@ -182,6 +232,7 @@ test('deploy: 503 without IDP_PUBLIC_URL; body validation; error mapping', async
     ['POST', '/api/targets/tgt_dev/deploy', { releaseId: 'rel_1', components: ['../x'] }],
     ['POST', '/api/targets/tgt_dev/deploy', {}],
     ['POST', '/api/targets/tgt_dev/rollback', { components: 'backend' }],
+    ['POST', '/api/targets/tgt_dev/apply-config', { components: ['backend'] }],
     ['POST', '/api/projects/p1/releases', { version: '../2.5.0' }],
     ['POST', '/api/projects/p1/releases', { version: '2.5.0', variables: { VERSION: 'x' } }],
     ['POST', '/api/projects/p1/releases/import', { version: '' }],
@@ -195,6 +246,67 @@ test('deploy: 503 without IDP_PUBLIC_URL; body validation; error mapping', async
   assert.equal((await call(base, 'POST', '/api/targets/tgt_dev/deploy', { role: 'deployer', body: { releaseId: 'rel_1' } })).status, 409);
   services.targetService.refreshStatus = async () => { throw new UpstreamError('gateway down'); };
   assert.equal((await call(base, 'POST', '/api/targets/tgt_dev/refresh-status', { role: 'deployer' })).status, 502);
+});
+
+// ----------------------------------------------------------- CI upload route
+
+test('CI upload is bearer-only, streams raw artifacts and finalizes a manifest', async () => {
+  const services = fakeServices();
+  const masterToken = 'U'.repeat(32);
+  const token = deriveArtifactUploadToken(masterToken, 'p1');
+  const { base } = await startApi({ services, upload: { token: masterToken, maxArtifactBytes: 1024 } });
+  const body = Buffer.from('artifact');
+  const sha256 = require('node:crypto').createHash('sha256').update(body).digest('hex');
+  const url = `${base}/api/artifact-uploads/p1/2.5.0/jetsrm-frontend-2.5.0.tar.gz`;
+
+  assert.equal((await fetch(url, { method: 'PUT', headers: { 'content-type': 'application/gzip', 'x-artifact-sha256': sha256 }, body })).status, 401);
+  assert.equal((await fetch(url, {
+    method: 'PUT',
+    headers: { authorization: 'Bearer wrong', 'content-type': 'application/gzip', 'x-artifact-sha256': sha256 },
+    body,
+  })).status, 401);
+  assert.equal((await fetch(url, {
+    method: 'PUT',
+    headers: { authorization: `Bearer ${deriveArtifactUploadToken(masterToken, 'p2')}`, 'content-type': 'application/gzip', 'x-artifact-sha256': sha256 },
+    body,
+  })).status, 401);
+  const uploaded = await fetch(url, {
+    method: 'PUT',
+    headers: { authorization: `Bearer ${token}`, 'content-type': 'application/gzip', 'x-artifact-sha256': sha256 },
+    body,
+  });
+  assert.equal(uploaded.status, 201);
+  assert.equal((await uploaded.json()).fileName, 'jetsrm-frontend-2.5.0.tar.gz');
+
+  const manifest = {
+    schema: 1, project: 'jetsrm', version: '2.5.0',
+    artifacts: [{ component: 'frontend', os: 'any', file: 'jetsrm-frontend-2.5.0.tar.gz', sha256, size: body.length }],
+  };
+  const finalized = await fetch(`${base}/api/artifact-uploads/p1/2.5.0/finalize`, {
+    method: 'POST',
+    headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json' },
+    body: JSON.stringify(manifest),
+  });
+  assert.equal(finalized.status, 201);
+  assert.equal((await finalized.json()).status, 'ready');
+  assert.ok(services.calls.some((call) => call.name === 'uploadArtifact'));
+  assert.ok(services.calls.some((call) => call.name === 'finalizeRelease'));
+});
+
+test('CI upload fails closed when disabled and rejects media type / declared oversize', async () => {
+  const disabled = await startApi({ upload: { token: null, maxArtifactBytes: 4 } });
+  const url = `${disabled.base}/api/artifact-uploads/p1/1.0.0/a.tar.gz`;
+  assert.equal((await fetch(url, { method: 'PUT', headers: { 'content-type': 'application/gzip' }, body: 'x' })).status, 503);
+
+  const masterToken = 'U'.repeat(32);
+  const enabled = await startApi({ upload: { token: masterToken, maxArtifactBytes: 4 } });
+  const headers = { authorization: `Bearer ${deriveArtifactUploadToken(masterToken, 'p1')}`, 'x-artifact-sha256': 'a'.repeat(64) };
+  assert.equal((await fetch(`${enabled.base}/api/artifact-uploads/p1/1.0.0/a.tar.gz`, {
+    method: 'PUT', headers: { ...headers, 'content-type': 'text/plain' }, body: 'x',
+  })).status, 415);
+  assert.equal((await fetch(`${enabled.base}/api/artifact-uploads/p1/1.0.0/a.tar.gz`, {
+    method: 'PUT', headers: { ...headers, 'content-type': 'application/gzip' }, body: '12345',
+  })).status, 413);
 });
 
 // ---------------------------------------------------------- download route

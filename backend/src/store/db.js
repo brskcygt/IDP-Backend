@@ -108,6 +108,7 @@ const SCHEMA = `
     build_deployment_id TEXT,
     error TEXT,
     created_by TEXT,
+    ready_order INTEGER,
     created_at TEXT,
     updated_at TEXT,
     UNIQUE (project_id, version)
@@ -190,7 +191,8 @@ function ensureDeploymentColumns(db) {
     ['environment', 'TEXT'],
     ['log_text', 'TEXT'],
     // Artifact deploy: 'deploy' (legacy provider flow, NULL on older rows),
-    // 'build', 'artifact_deploy' or 'artifact_rollback', plus the release and
+    // 'build', 'artifact_deploy', 'artifact_rollback' or
+    // 'artifact_config_apply', plus the release and
     // deploy target a row belongs to. Nullable — existing rows are unaffected.
     ['kind', 'TEXT'],
     ['release_id', 'TEXT'],
@@ -210,6 +212,9 @@ function ensureReleaseColumns(db) {
   const existing = new Set(db.prepare('PRAGMA table_info(releases)').all().map((row) => row.name));
   if (!existing.has('source_identity_json')) {
     db.exec('ALTER TABLE releases ADD COLUMN source_identity_json TEXT');
+  }
+  if (!existing.has('ready_order')) {
+    db.exec('ALTER TABLE releases ADD COLUMN ready_order INTEGER');
   }
 }
 

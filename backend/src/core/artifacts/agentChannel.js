@@ -10,7 +10,9 @@
  * AgentGatewayClient in production, a fake in tests.
  */
 
-const { ConflictError, UpstreamError } = require('../errors');
+const { ConflictError, UpstreamError, ValidationError } = require('../errors');
+
+const MAX_ARTIFACT_COMMAND_BYTES = 256 * 1024;
 
 /**
  * Subscribes to one agent's forwarded messages. Resolves after the gateway's
@@ -77,6 +79,10 @@ function openAgentChannel(gateway, agentId, { onMessage, onClose, timeoutMs = 10
  * ConflictError; anything else an UpstreamError. The payload is never logged.
  */
 async function sendAgentCommand(gateway, agentId, process, payload) {
+  const bytes = Buffer.byteLength(JSON.stringify({ process, payload }));
+  if (bytes > MAX_ARTIFACT_COMMAND_BYTES) {
+    throw new ValidationError(`Artifact command is too large for the agent gateway (${bytes} > ${MAX_ARTIFACT_COMMAND_BYTES} bytes).`);
+  }
   try {
     await gateway.sendArtifactCommand(agentId, process, payload);
   } catch (error) {
@@ -94,4 +100,4 @@ async function listGatewayAgents(gateway) {
   }
 }
 
-module.exports = { openAgentChannel, sendAgentCommand, listGatewayAgents };
+module.exports = { openAgentChannel, sendAgentCommand, listGatewayAgents, MAX_ARTIFACT_COMMAND_BYTES };

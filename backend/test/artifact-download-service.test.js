@@ -44,3 +44,27 @@ test('download opens only from the release source identity', async () => {
   );
   assert.equal(opened, 1, 'a changed source is rejected before credentials are sent');
 });
+
+test('download opens local releases without resolving external source credentials', async () => {
+  let opened = 0;
+  const expected = { stream: 'local-stream', contentLength: 42 };
+  const service = createArtifactDownloadService({
+    repository: {},
+    tokens: {},
+    getProject: () => { throw new Error('external project lookup must not run'); },
+    resolveSecrets: async () => { throw new Error('external secrets must not be resolved'); },
+    localStore: {
+      open: async ({ artifact, release }) => {
+        opened += 1;
+        assert.equal(artifact.fileName, 'frontend.tar.gz');
+        assert.equal(release.sourcePlatform, 'local');
+        return expected;
+      },
+    },
+  });
+  assert.equal(await service.open({
+    artifact: { fileName: 'frontend.tar.gz' },
+    release: { projectId: 'p1', version: '1.0.0', sourcePlatform: 'local' },
+  }), expected);
+  assert.equal(opened, 1);
+});

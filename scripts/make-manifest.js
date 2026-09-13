@@ -9,7 +9,7 @@ const path = require('node:path');
 
 const NAME = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
 const VERSION = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
-const COMPONENT = /^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$/;
+const COMPONENT = /^[a-z][a-z0-9-]{0,31}$/;
 const OS_VALUES = new Set(['win-x64', 'linux-x64', 'any']);
 
 function parseEntry(entry) {
@@ -46,9 +46,10 @@ async function makeManifest(args, cwd = process.cwd()) {
   if (typeof commit !== 'string' || commit.length < 7 || commit.length > 128 || /\s/.test(commit)) {
     throw new Error('commit must be a non-whitespace revision of 7-128 characters.');
   }
-  if (rawEntries.length === 0 || rawEntries.length > 50) throw new Error('Provide between 1 and 50 artifact entries.');
+  if (rawEntries.length === 0 || rawEntries.length > 40) throw new Error('Provide between 1 and 40 artifact entries.');
 
   const seen = new Set();
+  const seenFiles = new Set();
   const artifacts = [];
   for (const raw of rawEntries) {
     const entry = parseEntry(raw);
@@ -60,6 +61,8 @@ async function makeManifest(args, cwd = process.cwd()) {
     if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,255}$/.test(fileName)) {
       throw new Error(`Invalid artifact file name '${fileName}'.`);
     }
+    if (seenFiles.has(fileName)) throw new Error(`Duplicate artifact file: ${fileName}.`);
+    seenFiles.add(fileName);
     const digest = await hashFile(absolute);
     artifacts.push({ component: entry.component, os: entry.os, file: fileName, ...digest });
   }
