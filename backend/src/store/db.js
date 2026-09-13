@@ -91,6 +91,86 @@ const SCHEMA = `
     last_seen TEXT,
     PRIMARY KEY (host, port)
   );
+
+  -- Artifact deploy (docs/ARTIFACT-DEPLOY.md): versioned releases built by
+  -- CI/Jenkins, their artifacts (stored at Bitbucket Downloads / GitHub
+  -- Release assets, never here), deploy targets (one agent = one target),
+  -- per-deployment stage events and short-lived artifact download tokens.
+  CREATE TABLE IF NOT EXISTS releases (
+    id TEXT PRIMARY KEY,
+    project_id TEXT NOT NULL,
+    version TEXT NOT NULL,
+    commit_sha TEXT,
+    source_platform TEXT,
+    source_identity_json TEXT,
+    status TEXT NOT NULL,
+    manifest_json TEXT,
+    build_deployment_id TEXT,
+    error TEXT,
+    created_by TEXT,
+    created_at TEXT,
+    updated_at TEXT,
+    UNIQUE (project_id, version)
+  );
+
+  CREATE TABLE IF NOT EXISTS release_artifacts (
+    id TEXT PRIMARY KEY,
+    release_id TEXT NOT NULL,
+    component TEXT NOT NULL,
+    os TEXT NOT NULL,
+    file_name TEXT NOT NULL,
+    source_ref TEXT,
+    sha256 TEXT NOT NULL,
+    size INTEGER NOT NULL
+  );
+
+  CREATE INDEX IF NOT EXISTS idx_release_artifacts_release_id ON release_artifacts (release_id);
+
+  CREATE TABLE IF NOT EXISTS deploy_targets (
+    id TEXT PRIMARY KEY,
+    project_id TEXT NOT NULL,
+    name TEXT NOT NULL,
+    agent_id TEXT NOT NULL UNIQUE,
+    os TEXT NOT NULL,
+    environment TEXT,
+    base_path TEXT,
+    components_json TEXT,
+    runtime_config_json TEXT,
+    current_release_id TEXT,
+    current_versions_json TEXT,
+    created_at TEXT,
+    updated_at TEXT
+  );
+
+  CREATE INDEX IF NOT EXISTS idx_deploy_targets_project_id ON deploy_targets (project_id);
+
+  CREATE TABLE IF NOT EXISTS deployment_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    deployment_id TEXT NOT NULL,
+    ts TEXT NOT NULL,
+    component TEXT,
+    stage TEXT,
+    status TEXT,
+    progress REAL,
+    message TEXT
+  );
+
+  CREATE INDEX IF NOT EXISTS idx_deployment_events_deployment_id ON deployment_events (deployment_id);
+
+  -- Only the sha256 of a token is stored; the token itself exists solely in
+  -- the artifact_deploy payload sent to the agent. expires_at is epoch ms.
+  CREATE TABLE IF NOT EXISTS artifact_download_tokens (
+    token_hash TEXT PRIMARY KEY,
+    artifact_id TEXT NOT NULL,
+    agent_id TEXT,
+    deployment_id TEXT,
+    expires_at INTEGER NOT NULL,
+    max_uses INTEGER NOT NULL,
+    uses INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT
+  );
+
+  CREATE INDEX IF NOT EXISTS idx_artifact_download_tokens_deployment_id ON artifact_download_tokens (deployment_id);
 `;
 
 /**
@@ -109,12 +189,27 @@ function ensureDeploymentColumns(db) {
   const wanted = [
     ['environment', 'TEXT'],
     ['log_text', 'TEXT'],
+    // Artifact deploy: 'deploy' (legacy provider flow, NULL on older rows),
+    // 'build', 'artifact_deploy' or 'artifact_rollback', plus the release and
+    // deploy target a row belongs to. Nullable — existing rows are unaffected.
+    ['kind', 'TEXT'],
+    ['release_id', 'TEXT'],
+    ['target_id', 'TEXT'],
   ];
 
   for (const [name, type] of wanted) {
     if (!existing.has(name)) {
       db.exec(`ALTER TABLE deployments ADD COLUMN ${name} ${type}`);
     }
+  }
+  db.exec('CREATE INDEX IF NOT EXISTS idx_deployments_target_id ON deployments (target_id)');
+}
+
+/** Adds artifact-release columns introduced after the first F1 schema. */
+function ensureReleaseColumns(db) {
+  const existing = new Set(db.prepare('PRAGMA table_info(releases)').all().map((row) => row.name));
+  if (!existing.has('source_identity_json')) {
+    db.exec('ALTER TABLE releases ADD COLUMN source_identity_json TEXT');
   }
 }
 
@@ -179,6 +274,7 @@ function openDatabase(filePath = resolveDbFile()) {
   db.exec(SCHEMA);
   ensureDeploymentColumns(db);
   ensureAuditLogColumns(db);
+  ensureReleaseColumns(db);
 
   // The database holds project configuration and the full audit trail, so it
   // should not be world-readable. SQLite creates the file with the process

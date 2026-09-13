@@ -15,6 +15,7 @@ const {
   TIMEOUT_MINUTES,
   validateCiVariables,
 } = require('../adapters/ci/config');
+const { validateArtifactDeployConfig } = require('../core/artifacts/contracts');
 
 const ENVIRONMENTS = ['Dev', 'Stage', 'Prod'];
 const PROVIDERS = ['Jenkins', 'PMP', 'Server', 'Pipeline'];
@@ -129,6 +130,12 @@ const projectConfigSchema = object({
     // back with an `environments.<Name>.<field>` path instead of a single
     // opaque "environments is invalid".
     environments: optional(object({ allowUnknown: true })),
+    // Artifact deploy (releases → targets). Project-level only (not per
+    // environment); `null` clears it. Detailed rules — components, runtime,
+    // preserve patterns, health, preStart hooks — are checked by
+    // validateArtifactDeployConfig() in validateProjectConfig() below.
+    // Hooks run commands on customer servers, which is why they can only
+    // come from here (project:write) and never from deploy-time parameters.
   },
   allowUnknown: true,
 });
@@ -143,7 +150,11 @@ const projectConfigSchema = object({
  */
 function validateProjectConfig(body) {
   const base = validate(body, projectConfigSchema);
-  const errors = [...base.errors, ...ciVariableErrors(body, '')];
+  const errors = [
+    ...base.errors,
+    ...ciVariableErrors(body, ''),
+    ...(isPlainObject(body) ? validateArtifactDeployConfig(body.artifactDeploy, 'artifactDeploy') : []),
+  ];
 
   const environments = base.value && isPlainObject(base.value.environments) ? base.value.environments : null;
   if (environments) {

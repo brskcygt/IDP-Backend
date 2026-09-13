@@ -22,6 +22,8 @@ const { test } = require('node:test');
 
 const projectService = require('../src/core/projects/projectService');
 const { NotFoundError } = require('../src/core/errors');
+const artifactRepository = require('../src/store/artifactDeployRepository');
+const { getDb } = require('../src/store/db');
 
 const ACTOR = 'test-actor';
 
@@ -175,6 +177,46 @@ test('deleteProject removes the project from listProjects() and getProject()', a
     'deleted project must not appear in listProjects()'
   );
   assert.throws(() => projectService.getProject(created.id), NotFoundError);
+});
+
+test('deleteProject removes artifact releases, targets, artifacts and download tokens', async () => {
+  const created = createTestProject();
+  const release = artifactRepository.createRelease({
+    projectId: created.id,
+    version: '1.0.0',
+    status: 'ready',
+  });
+  const [artifact] = artifactRepository.replaceArtifacts(release.id, [{
+    component: 'backend',
+    os: 'win-x64',
+    file: 'backend.tar.gz',
+    sha256: 'a'.repeat(64),
+    size: 10,
+    sourceRef: 'backend.tar.gz',
+  }]);
+  const agentId = `AGENT-${created.id}`;
+  artifactRepository.createTarget({
+    projectId: created.id,
+    name: 'test-target',
+    agentId,
+    os: 'windows',
+  });
+  artifactRepository.insertToken({
+    tokenHash: 'b'.repeat(64),
+    artifactId: artifact.id,
+    agentId,
+    deploymentId: 'dep-delete-project',
+    expiresAt: Date.now() + 60_000,
+    maxUses: 5,
+  });
+
+  await projectService.deleteProject(created.id, ACTOR);
+
+  assert.equal(artifactRepository.findRelease(release.id), null);
+  assert.equal(artifactRepository.findArtifact(artifact.id), null);
+  assert.equal(artifactRepository.findTargetByAgent(agentId), null);
+  const db = getDb();
+  assert.equal(db.prepare('SELECT COUNT(*) AS count FROM artifact_download_tokens WHERE artifact_id = ?').get(artifact.id).count, 0);
 });
 
 test('deleteProject throws NotFoundError for an unknown project id', async () => {

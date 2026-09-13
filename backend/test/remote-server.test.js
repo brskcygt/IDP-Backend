@@ -61,18 +61,32 @@ test('validateHttpServerEnv: with no new vars the old behavior holds (all interf
   assert.equal(dev.valid, true);
   assert.equal(dev.host, null);
   assert.equal(dev.cookieSecure, false);
+  assert.equal(dev.trustProxy, false);
   assert.deepEqual(dev.warnings, []);
 
   const prod = validateHttpServerEnv({ NODE_ENV: 'production', SESSION_SECRET: SAMPLE_SECRET });
   assert.equal(prod.valid, true);
   assert.equal(prod.host, null);
   assert.equal(prod.cookieSecure, true);
+  assert.equal(prod.trustProxy, false);
   assert.deepEqual(prod.warnings, []);
 });
 
 test('validateHttpServerEnv: IDP_HOST is trimmed, blank means unset', () => {
   assert.equal(validateHttpServerEnv({ IDP_HOST: ' 127.0.0.1 ' }).host, '127.0.0.1');
   assert.equal(validateHttpServerEnv({ IDP_HOST: '   ' }).host, null);
+});
+
+test('validateHttpServerEnv: IDP_TRUST_PROXY accepts an exact hop count only', () => {
+  assert.equal(validateHttpServerEnv({ IDP_TRUST_PROXY: '1' }).trustProxy, 1);
+  assert.equal(validateHttpServerEnv({ IDP_TRUST_PROXY: ' 2 ' }).trustProxy, 2);
+  assert.equal(validateHttpServerEnv({ IDP_TRUST_PROXY: '0' }).trustProxy, false);
+  assert.equal(validateHttpServerEnv({ IDP_TRUST_PROXY: '' }).trustProxy, false);
+  for (const value of ['true', '-1', '1.5', '11']) {
+    const result = validateHttpServerEnv({ IDP_TRUST_PROXY: value });
+    assert.equal(result.valid, false, value);
+    assert.match(result.errors.join('\n'), /IDP_TRUST_PROXY/);
+  }
 });
 
 test('validateHttpServerEnv: IDP_COOKIE_SECURE overrides NODE_ENV in both directions', () => {

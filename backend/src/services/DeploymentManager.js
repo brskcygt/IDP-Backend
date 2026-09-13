@@ -49,7 +49,12 @@ class DeploymentManager {
    * @returns {string} deploymentId
    */
   createSession(projectId, adapter, meta = {}) {
-    const deploymentId = `deploy_${projectId}_${Date.now()}`;
+    let deploymentId = `deploy_${projectId}_${Date.now()}`;
+    // A release build and an artifact deploy of the same project can start in
+    // the same millisecond; never let the second one overwrite the first.
+    for (let n = 2; this.sessions.has(deploymentId); n++) {
+      deploymentId = `deploy_${projectId}_${Date.now()}_${n}`;
+    }
     // Backs cooperative cancellation (T-33): the background deploy IIFE in
     // server.js checks `session.signal.aborted` between phases and bails
     // out with an error instead of continuing to run after abort() has been
@@ -66,6 +71,11 @@ class DeploymentManager {
       startedAt,
       triggeredBy: meta.triggeredBy ?? null,
       environment: meta.environment ?? null,
+      // Artifact deploy: 'build' | 'artifact_deploy' | 'artifact_rollback';
+      // null for the legacy provider deploy flow (unchanged callers).
+      kind: meta.kind ?? null,
+      releaseId: meta.releaseId ?? null,
+      targetId: meta.targetId ?? null,
       lastError: null,
       controller,
       signal: controller.signal,
@@ -87,6 +97,9 @@ class DeploymentManager {
         startedAt,
         triggeredBy: session.triggeredBy,
         environment: session.environment,
+        kind: session.kind,
+        releaseId: session.releaseId,
+        targetId: session.targetId,
       });
     } catch (err) {
       console.error(`[DeploymentManager] Failed to persist deployment ${deploymentId}:`, err.message);
@@ -138,6 +151,9 @@ class DeploymentManager {
       durationMs: record.durationMs,
       triggeredBy: record.triggeredBy,
       environment: record.environment,
+      kind: record.kind ?? null,
+      releaseId: record.releaseId ?? null,
+      targetId: record.targetId ?? null,
       lastError: record.error,
       controller: null,
       signal: { aborted: record.status === 'aborted' },
@@ -379,6 +395,7 @@ class DeploymentManager {
       status: s.status,
       startedAt: s.startedAt,
       logCount: s.logs.length,
+      kind: s.kind ?? null,
     }));
   }
 }

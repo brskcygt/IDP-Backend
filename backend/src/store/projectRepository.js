@@ -107,8 +107,33 @@ function createProjectRepository(db) {
 
     /** @returns {boolean} true if a row was deleted */
     remove(id) {
-      const result = db.prepare('DELETE FROM projects WHERE id = ?').run(id);
-      return result.changes > 0;
+      db.exec('BEGIN');
+      try {
+        // Artifact tables pre-date foreign-key constraints because they must
+        // also work against upgraded databases. Remove project-owned rows
+        // explicitly so an old target cannot keep its globally-unique agent
+        // id and a release id cannot expose data after its project is gone.
+        db.prepare(`
+          DELETE FROM artifact_download_tokens
+          WHERE artifact_id IN (
+            SELECT a.id FROM release_artifacts a
+            JOIN releases r ON r.id = a.release_id
+            WHERE r.project_id = ?
+          )
+        `).run(id);
+        db.prepare(`
+          DELETE FROM release_artifacts
+          WHERE release_id IN (SELECT id FROM releases WHERE project_id = ?)
+        `).run(id);
+        db.prepare('DELETE FROM deploy_targets WHERE project_id = ?').run(id);
+        db.prepare('DELETE FROM releases WHERE project_id = ?').run(id);
+        const result = db.prepare('DELETE FROM projects WHERE id = ?').run(id);
+        db.exec('COMMIT');
+        return result.changes > 0;
+      } catch (err) {
+        db.exec('ROLLBACK');
+        throw err;
+      }
     },
 
     /**

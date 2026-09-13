@@ -31,8 +31,15 @@ const AgentGatewayClient = require('./services/agent/AgentGatewayClient');
 const { projectService, deploymentService, vpnService, testProjectConnection, NotFoundError, ConflictError } = require('./core');
 const { bootstrapCore } = require('./core/bootstrap');
 const { sendError } = require('./http/errorMapper');
+// Artifact deploy (releases → deploy targets). HTTP-only: the desktop IPC
+// shell does not load it — see docs/ARTIFACT-DEPLOY.md.
+const artifactServices = require('./core/artifacts');
+const { createArtifactRoutes } = require('./routes/artifacts');
 
 const app = express();
+if (serverConfig.trustProxy !== false) {
+  app.set('trust proxy', serverConfig.trustProxy);
+}
 app.use(cors({ origin: 'http://localhost:5173', credentials: true })); // MUST enable credentials for sessions
 // T-20 / SEC-15: cap request body size — previously unbounded, so a large
 // or malformed body (e.g. a multi-MB scriptContent) was read and merged
@@ -96,6 +103,26 @@ app.use(session({
 // mounted before every route below — including the auth routes, so a
 // failed/succeeded login is itself captured with an ip and requestId.
 app.use(requestContextMiddleware);
+
+// Artifact deploy routes. The download route authenticates agents with a
+// per-deploy token instead of a session, so it's mounted here — after the
+// request context (audit ip/requestId) but before anything that requires a
+// session. Every other artifact route carries its own requirePermission().
+const artifactRoutes = createArtifactRoutes({
+  services: artifactServices,
+  getProject: (id) => projectService.getProject(id),
+  auditLogger,
+  publicUrl: serverConfig.artifactDeploy.publicUrl,
+  publicUrlError: serverConfig.artifactDeploy.publicUrlError,
+  rateLimits: {
+    // Release build/import, deploy, rollback, status refresh: each one
+    // starts real work (CI run, agent command).
+    trigger: createRateLimit({ windowMs: 60 * 1000, max: 20 }),
+    // Agents download each component once (+ retries); failures are 401s.
+    download: createRateLimit({ windowMs: 60 * 1000, max: 60 }),
+  },
+});
+app.use(artifactRoutes.downloadRouter);
 
 // Auth Middleware
 const requireAuth = (req, res, next) => {
@@ -221,6 +248,8 @@ app.use('/api/agents', require('./routes/agents').createAgentsRouter({
   auditLogger,
   rateLimit: agentCredentialRateLimit,
 }));
+
+app.use(artifactRoutes.apiRouter);
 
 app.post('/api/projects', requirePermission('project:write'), (req, res) => {
   const result = validate(req.body, createProjectSchema);

@@ -147,6 +147,13 @@ test('token boşken gateway açılmayı reddeder', () => {
   assert.match(result.stderr, /IDP_AGENT_API_TOKEN/);
 });
 
+test('kontrol listener loopback dışına açılamaz', () => {
+  assert.throws(
+    () => createGatewayApp({ token: TOKEN, agentPort: 0, controlHost: '0.0.0.0', controlPort: 0 }),
+    /loopback/
+  );
+});
+
 test('sunucu tarafı canlılık: iki aralık pong gelmezse agent sonlandırılır', () => {
   const gateway = new AgentGateway({ logger: silent });
   gateway.issueCredential('WIN-01');
@@ -401,6 +408,93 @@ test('rate limit: başarısız denemeler 429 alır, geçerli kimlik engellenmez'
   assert.equal(limited.status, 429);
   assert.ok(Number(limited.headers['retry-after']) > 0);
   await openAgent(env, 'WIN-01', secret);
+});
+
+// ------------------------------------------------------------ artifact deploy
+
+test('artifact-command: izinli komutlar agent\'a gider, yanıt 200 {sent:true}', async (t) => {
+  const env = await startApp(t);
+  const secret = await issue(env, 'WIN-01');
+  const agent = await openAgent(env, 'WIN-01', secret);
+
+  const payloads = {
+    artifact_deploy: { deployId: 'dep_1', project: 'jetsrm', version: '2.5.0', timeoutSec: 1800, components: [] },
+    artifact_rollback: { deployId: 'dep_2', components: null },
+    artifact_cancel: { deployId: 'dep_1' },
+    artifact_status: { requestId: 'req_1' },
+  };
+  for (const [process, payload] of Object.entries(payloads)) {
+    const response = await env.api('/agent/artifact-command/WIN-01', { method: 'POST', body: { process, payload } });
+    assert.equal(response.status, 200, process);
+    assert.deepEqual(await response.json(), { type: true, sent: true });
+    const command = await agent.waitFor((m) => m.process === process);
+    assert.equal(command.type, 'server');
+    assert.equal(command.agentId, 'WIN-01');
+    assert.deepEqual(command.payload, payload);
+  }
+});
+
+test('artifact-command: izin listesi, payload tipi, ID, 256 KB sınırı ve metot doğrulanır', async (t) => {
+  const env = await startApp(t);
+  const secret = await issue(env, 'WIN-01');
+  const agent = await openAgent(env, 'WIN-01', secret);
+  const post = (body, id = 'WIN-01') => env.api(`/agent/artifact-command/${id}`, { method: 'POST', body });
+
+  for (const process of ['run_deploy', 'update', 'handshake', '', undefined]) {
+    assert.equal((await post({ process, payload: { deployId: 'dep_1' } })).status, 400, String(process));
+  }
+  for (const payload of ['text', [1, 2], null, undefined, 42]) {
+    assert.equal((await post({ process: 'artifact_deploy', payload })).status, 400, JSON.stringify(payload));
+  }
+  assert.equal((await post({ process: 'artifact_cancel', payload: { deployId: 'dep_1' } }, '-bad')).status, 400);
+  assert.equal((await post({ process: 'artifact_deploy', payload: { blob: 'x'.repeat(300 * 1024) } })).status, 413);
+  assert.equal((await env.api('/agent/artifact-command/WIN-01')).status, 405);
+
+  const invalidJson = await fetch(`${env.controlUrl}/agent/artifact-command/WIN-01`, {
+    method: 'POST',
+    headers: { authorization: `Bearer ${TOKEN}`, 'content-type': 'application/json' },
+    body: '{not json',
+  });
+  assert.equal(invalidJson.status, 400);
+
+  await new Promise((resolve) => setTimeout(resolve, 50));
+  assert.ok(!agent.messages.some((m) => String(m.process).startsWith('artifact_') || m.process === 'run_deploy'));
+});
+
+test('artifact-command: çevrimdışı agent 404, kontrol token zorunlu, agent portunda yok', async (t) => {
+  const env = await startApp(t);
+  await issue(env, 'WIN-01');
+  const body = { process: 'artifact_status', payload: { requestId: 'req_1' } };
+  assert.equal((await env.api('/agent/artifact-command/WIN-01', { method: 'POST', body })).status, 404);
+  assert.equal((await env.api('/agent/artifact-command/WIN-99', { method: 'POST', body })).status, 404);
+  for (const token of ['', 'wrong-token']) {
+    assert.equal((await env.api('/agent/artifact-command/WIN-01', { method: 'POST', body, token })).status, 401);
+  }
+  assert.equal((await env.api('/agent/artifact-command/WIN-01', { method: 'POST', body, base: env.agentUrl })).status, 404);
+});
+
+test('deploy_event, deploy_result ve artifact_status_result aboneye akar', async (t) => {
+  const env = await startApp(t);
+  const secret = await issue(env, 'WIN-01');
+  const agent = await openAgent(env, 'WIN-01', secret);
+  const web = await openWeb(env);
+  web.send(agentMessage('idp-listener-1', 'subscribe', { targetAgentId: 'WIN-01' }, 'web'));
+  await waitUntil(() => [...env.app.gateway.webConnections].some((c) => c.subscriptions.has('WIN-01')));
+
+  const messages = {
+    deploy_event: { deployId: 'dep_1', component: 'backend', stage: 'downloading', status: 'progress', progress: 40, message: '' },
+    deploy_result: { deployId: 'dep_1', success: true, version: '2.5.0', rolledBack: false, durationMs: 10, components: [], error: null },
+    artifact_status_result: { requestId: 'req_1', basePath: 'C:/inetpub/wwwroot/jetsrm', components: {} },
+  };
+  agent.send(agentMessage('WIN-01', 'not_forwarded', { secret: 'x' }));
+  for (const [process, payload] of Object.entries(messages)) {
+    agent.send(agentMessage('WIN-01', process, payload));
+    const forwarded = await web.waitFor((m) => m.process === process);
+    assert.equal(forwarded.type, 'agent');
+    assert.equal(forwarded.agentId, 'WIN-01');
+    assert.deepEqual(forwarded.payload, payload);
+  }
+  assert.ok(!web.messages.some((m) => m.process === 'not_forwarded'));
 });
 
 test('hash\'i olmayan eski kayıt yüklenir ama kimlik verilene kadar bağlanamaz', async (t) => {

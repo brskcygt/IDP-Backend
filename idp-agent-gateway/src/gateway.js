@@ -9,7 +9,11 @@ const CREDENTIAL_HASH_PATTERN = /^[0-9a-f]{64}$/;
 const FORWARDED_PROCESSES = new Set([
   'ping', 'current_version', 'download_file_progress', 'app_logs',
   'update_version', 'command_execution_result', 'get_app_config',
+  // Artifact deploy (docs/ARTIFACT-DEPLOY.md): stage events, the single terminal result, status answers.
+  'deploy_event', 'deploy_result', 'artifact_status_result',
 ]);
+/** Typed commands the backend may send via POST /agent/artifact-command/:agentId. */
+const ARTIFACT_COMMAND_PROCESSES = new Set(['artifact_deploy', 'artifact_rollback', 'artifact_cancel', 'artifact_status']);
 const MAX_SUBSCRIPTIONS_PER_WEB = 256;
 const DETAIL_FIELDS = ['version', 'agent_version', 'os_info'];
 
@@ -491,6 +495,8 @@ class AgentGateway {
 
 module.exports = {
   AgentGateway,
+  ARTIFACT_COMMAND_PROCESSES,
+  FORWARDED_PROCESSES,
   FailureRateLimiter,
   bearerToken,
   isAuthorized,

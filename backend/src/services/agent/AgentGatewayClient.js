@@ -10,6 +10,9 @@ const crypto = require('crypto');
  */
 const AGENT_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]{2,127}$/;
 
+/** Mirrors the gateway's allowlist for POST /agent/artifact-command/:agentId. */
+const ARTIFACT_COMMAND_PROCESSES = new Set(['artifact_deploy', 'artifact_rollback', 'artifact_cancel', 'artifact_status']);
+
 function isValidAgentId(value) {
   return typeof value === 'string' && AGENT_ID_PATTERN.test(value);
 }
@@ -73,6 +76,24 @@ class AgentGatewayClient {
     return this.request(`/agent/run-deploy-command/${encodeURIComponent(agentId)}`, {
       method: 'POST',
       body: JSON.stringify({ command }),
+    });
+  }
+
+  /**
+   * Sends a typed artifact-deploy command (artifact_deploy, artifact_rollback,
+   * artifact_cancel, artifact_status) through the gateway control API.
+   * The payload may carry per-deploy download tokens: never log it.
+   * @param {string} agentId
+   * @param {string} process
+   * @param {object} payload
+   * @returns {Promise<object>} gateway answer; rejects with `status: 404` when the agent is offline.
+   */
+  async sendArtifactCommand(agentId, process, payload) {
+    assertValidAgentId(agentId);
+    if (!ARTIFACT_COMMAND_PROCESSES.has(process)) throw new Error(`Unsupported artifact command: ${process}`);
+    return this.request(`/agent/artifact-command/${encodeURIComponent(agentId)}`, {
+      method: 'POST',
+      body: JSON.stringify({ process, payload }),
     });
   }
 

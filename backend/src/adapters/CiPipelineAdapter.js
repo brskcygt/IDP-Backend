@@ -9,6 +9,7 @@ const {
   normalizeCiConfig,
   findMissingCiFields,
   validateCiVariables,
+  toStringVariables,
   isPlainObject,
 } = require('./ci');
 const { isTransientError } = require('./ci/http');
@@ -33,6 +34,12 @@ const { isTransientError } = require('./ci/http');
  * Only variable KEYS are ever logged, never values. Variables come only from
  * the project config; deploy parameters (`variables`, `environment`,
  * `confirmation`, …) are ignored — never sent or logged.
+ *
+ * The one exception is `extraVariables`, a constructor option set only by
+ * server-side code (the artifact-deploy release build injects
+ * `{ [versionVariable]: version }` — core/artifacts/releaseService.js).
+ * deploymentService.createAdapter() never passes it, so nothing a deployer
+ * sends at trigger time can reach it.
  */
 
 const MAX_CONSECUTIVE_POLL_FAILURES = 5;
@@ -89,6 +96,9 @@ class CiPipelineAdapter extends DeploymentAdapter {
    * @param {object} config.ciConfig - `project.config.ciConfig` (environment overrides already merged).
    * @param {string} config.apiToken - resolved token (never a secret:// ref).
    * @param {string} [config.username] - Atlassian email (Bitbucket basic auth only).
+   * @param {Record<string, string>} [config.extraVariables] - SERVER-SIDE ONLY
+   *   variables merged over ciConfig.variables at trigger time (e.g. the
+   *   release version). Never populate this from request/deploy parameters.
    * @param {Function} [config.fetchImpl] - test seam; defaults to undici's fetch.
    * @param {object} [config.timing] - test seam: `{ pollIntervalMs, timeoutMs,
    *   correlationIntervalMs, correlationTimeoutMs, logRetryIntervalMs }` overriding
@@ -115,6 +125,7 @@ class CiPipelineAdapter extends DeploymentAdapter {
     const { apiToken, username } = this.config;
     this._scrub = createCiScrubber({ token: apiToken, username });
     this.ciConfig = normalizeCiConfig(this.config.ciConfig);
+    this._extraVariables = toStringVariables(this.config.extraVariables);
 
     const missing = findMissingCiFields(this.ciConfig, { token: apiToken, username });
     if (missing.length > 0) {
@@ -186,7 +197,8 @@ class CiPipelineAdapter extends DeploymentAdapter {
   async trigger(_params) {
     if (this.aborted) throw this._error('Deployment was aborted before the pipeline was triggered.');
 
-    const variables = { ...this.ciConfig.variables };
+    // Server-side extras (release version) win over a same-named project variable.
+    const variables = { ...this.ciConfig.variables, ...this._extraVariables };
     const problems = validateCiVariables(variables);
     if (problems.length > 0) {
       throw this._error(`Invalid CI variables: ${problems.map((problem) => problem.message).join(' ')}`);

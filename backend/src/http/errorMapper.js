@@ -9,9 +9,10 @@
  *   ValidationError  → 400 (includes `details` when the error carries them)
  *   ConflictError    → 409
  *   PermissionError  → 403
+ *   UpstreamError    → 502
  *   anything else    → 500
  */
-const { NotFoundError, ValidationError, ConflictError, PermissionError } = require('../core/errors');
+const { NotFoundError, ValidationError, ConflictError, PermissionError, UpstreamError } = require('../core/errors');
 
 /**
  * @param {Error} err
@@ -32,6 +33,9 @@ function mapErrorToResponse(err) {
   }
   if (err instanceof PermissionError) {
     return { status: 403, body: { error: err.message } };
+  }
+  if (err instanceof UpstreamError) {
+    return { status: 502, body: { error: err.message } };
   }
   return { status: 500, body: { error: err.message } };
 }

@@ -21,6 +21,47 @@ function getAtPath(obj, dottedPath) {
   return dottedPath.split('.').reduce((acc, part) => (acc == null ? acc : acc[part]), obj);
 }
 
+const ARTIFACT_SOURCE_DEFAULTS = {
+  bitbucket: 'https://api.bitbucket.org/2.0',
+  github: 'https://api.github.com',
+};
+
+function artifactSourceIdentity(config) {
+  const source = isPlainObject(config && config.artifactDeploy && config.artifactDeploy.source)
+    ? config.artifactDeploy.source
+    : {};
+  const platform = typeof source.platform === 'string' ? source.platform.trim() : '';
+  const baseUrl = typeof source.baseUrl === 'string' && source.baseUrl.trim()
+    ? source.baseUrl.trim().replace(/\/+$/, '')
+    : (ARTIFACT_SOURCE_DEFAULTS[platform] || '');
+  return JSON.stringify({
+    platform,
+    owner: typeof source.owner === 'string' ? source.owner.trim() : '',
+    repo: typeof source.repo === 'string' ? source.repo.trim() : '',
+    baseUrl,
+    authType: source.authType === 'basic' ? 'basic' : 'bearer',
+    username: typeof source.username === 'string' ? source.username.trim() : '',
+  });
+}
+
+/** Token references must never follow a source identity change silently. */
+function artifactTokensRequiringReplacement(existing, incoming) {
+  const paths = new Set();
+  const inspect = (existingScope, incomingScope, prefix) => {
+    if (!isPlainObject(incomingScope) || !isPlainObject(incomingScope.artifactDeploy)) return;
+    if (artifactSourceIdentity(existingScope) !== artifactSourceIdentity(incomingScope)) {
+      paths.add(`${prefix}artifactDeploy.source.token`);
+    }
+  };
+  inspect(existing, incoming, '');
+  if (isPlainObject(incoming.environments)) {
+    for (const [name, incomingScope] of Object.entries(incoming.environments)) {
+      inspect(isPlainObject(existing.environments) ? existing.environments[name] : null, incomingScope, `environments.${name}.`);
+    }
+  }
+  return paths;
+}
+
 /** Deletes `dottedPath` from `obj` in place and reports whether it held a value. */
 function deleteAtPath(obj, dottedPath) {
   const parts = dottedPath.split('.');
@@ -92,6 +133,7 @@ function mergeProjectConfig(existingConfig, incoming) {
   const cleanBody = stripPresenceFlags(body);
   const merged = deepMerge(stripPresenceFlags(existing), cleanBody);
   replaceWholesaleKeys(merged, cleanBody);
+  const requireNewArtifactToken = artifactTokensRequiringReplacement(existing, body);
 
   // Union of secret paths on both sides: a path may exist only in the stored
   // config (client omitted it) or only in the incoming one (new environment).
@@ -101,6 +143,11 @@ function mergeProjectConfig(existingConfig, incoming) {
     const incomingValue = getAtPath(body, fieldPath);
     const isReplacement = typeof incomingValue === 'string' && incomingValue.trim() !== '';
     if (isReplacement) continue;
+
+    if (requireNewArtifactToken.has(fieldPath)) {
+      deleteAtPath(merged, fieldPath);
+      continue;
+    }
 
     const existingValue = getAtPath(existing, fieldPath);
     if (existingValue === undefined) {
@@ -119,8 +166,15 @@ function mergeProjectConfig(existingConfig, incoming) {
  * user-edited data and no secrets (the CI token is the top-level `apiToken`):
  * deep-merging it would resurrect a deleted `variables` key or a cleared
  * optional field on every save.
+ *
+ * `artifactDeploy` is replaced the same way (a removed component, preserve
+ * pattern or hook must really disappear), but unlike ciConfig it DOES hold a
+ * secret — `artifactDeploy.source.token`. The secret-preserving loop in
+ * mergeProjectConfig() runs after this replacement, so an omitted/blank
+ * token still keeps the stored one. Its `source.hasToken` presence flag is
+ * stripped like every other (artifactDeploy is deliberately NOT exempt).
  */
-const REPLACE_ON_SAVE_KEYS = ['ciConfig'];
+const REPLACE_ON_SAVE_KEYS = ['ciConfig', 'artifactDeploy'];
 
 /**
  * Subtrees exempt from presence-flag stripping — they hold no secrets, so

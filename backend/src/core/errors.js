@@ -42,4 +42,12 @@ class PermissionError extends Error {
   }
 }
 
-module.exports = { NotFoundError, ValidationError, ConflictError, PermissionError };
+/** An upstream dependency (agent gateway, artifact source) failed or is unreachable. */
+class UpstreamError extends Error {
+  constructor(message) {
+    super(message);
+    this.name = 'UpstreamError';
+  }
+}
+
+module.exports = { NotFoundError, ValidationError, ConflictError, PermissionError, UpstreamError };

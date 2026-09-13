@@ -23,7 +23,7 @@
 /** @typedef {'admin'|'deployer'|'viewer'} Role */
 /**
  * @typedef {'project:read'|'project:write'|'project:delete'|'deploy:trigger'|
- *   'deploy:abort'|'vpn:manage'|'audit:read'|'user:manage'} Action
+ *   'deploy:abort'|'release:create'|'release:delete'|'vpn:manage'|'audit:read'|'user:manage'} Action
  */
 
 const ROLES = Object.freeze({
@@ -50,6 +50,10 @@ const ACTION_MIN_ROLE = Object.freeze({
   'audit:read': ROLES.VIEWER,
   'deploy:trigger': ROLES.DEPLOYER,
   'deploy:abort': ROLES.DEPLOYER,
+  // Artifact deploy: cutting/importing a release (build + manifest ingest) is
+  // a deployer action; deleting release records is admin-only.
+  'release:create': ROLES.DEPLOYER,
+  'release:delete': ROLES.ADMIN,
   'project:write': ROLES.ADMIN,
   'project:delete': ROLES.ADMIN,
   'vpn:manage': ROLES.ADMIN,

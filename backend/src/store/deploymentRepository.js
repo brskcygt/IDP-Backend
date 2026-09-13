@@ -39,6 +39,9 @@ function rowToDeployment(row) {
     triggeredBy: row.triggered_by,
     environment: row.environment,
     error: row.error,
+    kind: row.kind ?? null,
+    releaseId: row.release_id ?? null,
+    targetId: row.target_id ?? null,
     logText: row.log_text ?? null,
   };
 }
@@ -60,8 +63,14 @@ function rowToSummary(row) {
     triggeredBy: row.triggered_by,
     environment: row.environment,
     error: row.error,
+    kind: row.kind ?? null,
+    releaseId: row.release_id ?? null,
+    targetId: row.target_id ?? null,
   };
 }
+
+const SUMMARY_COLUMNS =
+  'id, project_id, status, started_at, finished_at, duration_ms, triggered_by, environment, error, kind, release_id, target_id';
 
 /**
  * Trim a log body down to the last MAX_LOG_LINES lines or MAX_LOG_BYTES
@@ -168,15 +177,18 @@ function createDeploymentRepository(db) {
      */
     create(deployment) {
       db.prepare(`
-        INSERT INTO deployments (id, project_id, status, started_at, triggered_by, environment)
-        VALUES (?, ?, ?, ?, ?, ?)
+        INSERT INTO deployments (id, project_id, status, started_at, triggered_by, environment, kind, release_id, target_id)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
       `).run(
         deployment.id,
         deployment.projectId ?? null,
         deployment.status ?? null,
         deployment.startedAt ?? null,
         deployment.triggeredBy ?? null,
-        deployment.environment ?? null
+        deployment.environment ?? null,
+        deployment.kind ?? null,
+        deployment.releaseId ?? null,
+        deployment.targetId ?? null
       );
       return this.findById(deployment.id);
     },
@@ -220,7 +232,7 @@ function createDeploymentRepository(db) {
      */
     listRecent(limit = 50) {
       const rows = db.prepare(`
-        SELECT id, project_id, status, started_at, finished_at, duration_ms, triggered_by, environment, error
+        SELECT ${SUMMARY_COLUMNS}
         FROM deployments
         ORDER BY started_at DESC, rowid DESC
         LIMIT ?
@@ -234,7 +246,7 @@ function createDeploymentRepository(db) {
      */
     listByProject(projectId, limit = 50) {
       const rows = db.prepare(`
-        SELECT id, project_id, status, started_at, finished_at, duration_ms, triggered_by, environment, error
+        SELECT ${SUMMARY_COLUMNS}
         FROM deployments
         WHERE project_id = ?
         ORDER BY started_at DESC, rowid DESC

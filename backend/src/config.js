@@ -137,7 +137,7 @@ function loadConfig() {
  * Pure (reads only the `env` it's given) so it can be unit-tested.
  *
  * @param {NodeJS.ProcessEnv} [env]
- * @returns {{ valid: boolean, errors: string[], warnings: string[], host: string|null, cookieSecure: boolean }}
+ * @returns {{ valid: boolean, errors: string[], warnings: string[], host: string|null, cookieSecure: boolean, trustProxy: number|false }}
  */
 function validateHttpServerEnv(env = process.env) {
   const errors = [];
@@ -148,6 +148,20 @@ function validateHttpServerEnv(env = process.env) {
   // pre-existing behavior).
   const rawHost = env.IDP_HOST;
   const host = rawHost && rawHost.trim() !== '' ? rawHost.trim() : null;
+
+  // Exact proxy-hop count keeps X-Forwarded-* headers untrusted for direct
+  // clients while allowing TLS termination and real client IPs behind one or
+  // more known reverse proxies. Blank/0 preserves Express's default `false`.
+  let trustProxy = false;
+  const rawTrustProxy = env.IDP_TRUST_PROXY;
+  if (rawTrustProxy !== undefined && rawTrustProxy.trim() !== '') {
+    const value = Number(rawTrustProxy.trim());
+    if (!Number.isInteger(value) || value < 0 || value > 10) {
+      errors.push('[SERVER] IDP_TRUST_PROXY gecersiz: 0 ile 10 arasinda bir tam sayi olmali.');
+    } else if (value > 0) {
+      trustProxy = value;
+    }
+  }
 
   // IDP_COOKIE_SECURE unset/blank -> the pre-existing rule (Secure only in
   // production). An unrecognised value is fatal rather than guessed at: a
@@ -184,18 +198,71 @@ function validateHttpServerEnv(env = process.env) {
   errors.push(...agentCredentials.errors);
   warnings.push(...agentCredentials.warnings);
 
+  const artifactDeploy = validateArtifactPublicUrlEnv(env);
+  warnings.push(...artifactDeploy.warnings);
+
   return {
     valid: errors.length === 0,
     errors,
     warnings,
     host,
     cookieSecure,
+    trustProxy,
     agentCredentials: {
       publicUrl: agentCredentials.publicUrl,
       publicUrlError: agentCredentials.publicUrlError,
       cfAccess: agentCredentials.cfAccess,
     },
+    artifactDeploy: {
+      publicUrl: artifactDeploy.publicUrl,
+      publicUrlError: artifactDeploy.publicUrlError,
+    },
   };
+}
+
+/**
+ * IDP_PUBLIC_URL: the backend's own public base URL (e.g. https://idp.example),
+ * used to build artifact download URLs handed to agents
+ * (`<IDP_PUBLIC_URL>/api/artifacts/<id>/download`, docs/ARTIFACT-DEPLOY.md).
+ *
+ * Optional: unset/invalid only disables artifact deploy (503), it never
+ * blocks startup — same rule as IDP_AGENT_PUBLIC_URL. Must be http(s) with no
+ * credentials, query or fragment; a path prefix (reverse proxy) is allowed.
+ * With NODE_ENV=production only https:// is accepted, because agents send
+ * their download token to this address.
+ *
+ * Pure (reads only `env`).
+ * @param {NodeJS.ProcessEnv} [env]
+ * @returns {{ warnings: string[], publicUrl: string|null, publicUrlError: string|null }}
+ */
+function validateArtifactPublicUrlEnv(env = process.env) {
+  const warnings = [];
+  const raw = (env.IDP_PUBLIC_URL || '').trim();
+  if (!raw) {
+    return { warnings, publicUrl: null, publicUrlError: 'IDP_PUBLIC_URL tanımlı değil.' };
+  }
+  const isProduction = (env.NODE_ENV || 'development') === 'production';
+  let parsed = null;
+  try {
+    parsed = new URL(raw);
+  } catch {
+    parsed = null;
+  }
+  let publicUrlError = null;
+  if (!parsed || !['http:', 'https:'].includes(parsed.protocol) || !parsed.hostname) {
+    publicUrlError = 'IDP_PUBLIC_URL geçersiz: http:// veya https:// ile başlayan bir adres olmalı.';
+  } else if (parsed.username || parsed.password) {
+    publicUrlError = 'IDP_PUBLIC_URL geçersiz: adres kullanıcı adı/parola içeremez.';
+  } else if (parsed.search || parsed.hash) {
+    publicUrlError = 'IDP_PUBLIC_URL geçersiz: sorgu (?) veya # parçası içeremez.';
+  } else if (isProduction && parsed.protocol !== 'https:') {
+    publicUrlError = "IDP_PUBLIC_URL geçersiz: NODE_ENV=production iken https:// olmalı (agent'lar indirme token'ını bu adrese gönderir).";
+  }
+  if (publicUrlError) {
+    warnings.push(`${publicUrlError} Artifact deploy (POST /api/targets/:id/deploy) 503 döner.`);
+    return { warnings, publicUrl: null, publicUrlError };
+  }
+  return { warnings, publicUrl: raw.replace(/\/+$/, ''), publicUrlError: null };
 }
 
 /**
@@ -261,11 +328,11 @@ function validateAgentCredentialEnv(env = process.env) {
 /**
  * Validates and returns the HTTP-shell settings, mirroring loadConfig():
  * warnings are logged, errors are logged and abort startup.
- * @returns {Readonly<{ host: string|null, cookieSecure: boolean,
+ * @returns {Readonly<{ host: string|null, cookieSecure: boolean, trustProxy: number|false,
  *   agentCredentials: { publicUrl: string|null, publicUrlError: string|null, cfAccess: object|null } }>}
  */
 function loadHttpServerConfig() {
-  const { valid, errors, warnings, host, cookieSecure, agentCredentials } = validateHttpServerEnv();
+  const { valid, errors, warnings, host, cookieSecure, trustProxy, agentCredentials, artifactDeploy } = validateHttpServerEnv();
 
   for (const w of warnings) {
     console.warn(`⚠️  ${w}`);
@@ -283,12 +350,24 @@ function loadHttpServerConfig() {
   return Object.freeze({
     host,
     cookieSecure,
+    trustProxy,
     agentCredentials: Object.freeze({
       publicUrl: agentCredentials.publicUrl,
       publicUrlError: agentCredentials.publicUrlError,
       cfAccess: agentCredentials.cfAccess ? Object.freeze({ ...agentCredentials.cfAccess }) : null,
     }),
+    artifactDeploy: Object.freeze({
+      publicUrl: artifactDeploy.publicUrl,
+      publicUrlError: artifactDeploy.publicUrlError,
+    }),
   });
 }
 
-module.exports = { loadConfig, validateEnv, validateHttpServerEnv, validateAgentCredentialEnv, loadHttpServerConfig };
+module.exports = {
+  loadConfig,
+  validateEnv,
+  validateHttpServerEnv,
+  validateAgentCredentialEnv,
+  validateArtifactPublicUrlEnv,
+  loadHttpServerConfig,
+};

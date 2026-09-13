@@ -16,6 +16,9 @@ const SECRET_FIELD_PATHS = [
   'pmpConfig.authToken',
   'vpnConfig.password',
   'vpnConfig.mfaConfig.secret',
+  // Artifact deploy: Bitbucket/GitHub token used to read release artifacts
+  // (backend-only; never sent to agents). Presence flag: artifactDeploy.source.hasToken.
+  'artifactDeploy.source.token',
 ];
 
 /**

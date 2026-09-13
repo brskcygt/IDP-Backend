@@ -3,10 +3,12 @@
 const http = require('http');
 const path = require('path');
 const { WebSocketServer } = require('ws');
-const { AgentGateway, FailureRateLimiter, bearerToken, isAuthorized, isValidAgentId } = require('./gateway');
+const { AgentGateway, ARTIFACT_COMMAND_PROCESSES, FailureRateLimiter, bearerToken, isAuthorized, isValidAgentId } = require('./gateway');
 
 const SERVICE = 'idp-agent-gateway';
 const MAX_WS_PAYLOAD = 1024 * 1024;
+const MAX_ARTIFACT_COMMAND_BYTES = 256 * 1024;
+const BODY_TOO_LARGE = 'Request body is too large.';
 const NOT_FOUND = { type: false, message: 'Not found.' };
 
 function parsePort(value, fallback, name) {
@@ -41,7 +43,7 @@ async function readJson(request, maxBytes = 70 * 1024) {
   const chunks = []; let size = 0;
   for await (const chunk of request) {
     size += chunk.length;
-    if (size > maxBytes) throw new Error('Request body is too large.');
+    if (size > maxBytes) throw Object.assign(new Error(BODY_TOO_LARGE), { tooLarge: true });
     chunks.push(chunk);
   }
   return JSON.parse(Buffer.concat(chunks).toString('utf8') || '{}');
@@ -94,6 +96,9 @@ function createGatewayApp({
   const controlToken = String(token || '').trim();
   if (!controlToken) {
     throw new Error('IDP_AGENT_API_TOKEN ayarlı değil. Kontrol API token\'ı zorunludur (backend ile aynı, uzun ve rastgele bir değer); gateway başlatılmadı.');
+  }
+  if (!isLoopback(controlHost)) {
+    throw new Error(`Kontrol listener yalnizca loopback adrese baglanabilir; '${controlHost}' reddedildi.`);
   }
   if (agentPort !== 0 && agentPort === controlPort) {
     throw new Error(`Agent ve kontrol listener aynı porta (${agentPort}) bağlanamaz.`);
@@ -151,6 +156,46 @@ function createGatewayApp({
     return response.end();
   }
 
+  /**
+   * POST /agent/artifact-command/:agentId {process, payload}: typed artifact
+   * deploy commands (docs/ARTIFACT-DEPLOY.md). Only allowlisted processes,
+   * object payloads, bodies up to 256 KB. The payload carries per-deploy
+   * download tokens, so it is never logged — only agent id, process and
+   * deployId/requestId.
+   */
+  async function handleArtifactCommand(request, response, rawId) {
+    if (request.method !== 'POST') {
+      response.setHeader('allow', 'POST');
+      return json(response, 405, { type: false, message: 'Method not allowed.' });
+    }
+    let agentId = '';
+    try { agentId = decodeURIComponent(rawId); } catch { /* geçersiz yüzde kodlaması → 400 */ }
+    if (!isValidAgentId(agentId)) return json(response, 400, { type: false, message: 'Invalid agent id. Expected ^[A-Za-z0-9][A-Za-z0-9._-]{2,127}$.' });
+
+    let body;
+    try {
+      body = await readJson(request, MAX_ARTIFACT_COMMAND_BYTES);
+    } catch (error) {
+      if (error.tooLarge) return json(response, 413, { type: false, message: 'Artifact command body exceeds 256 KB.' });
+      return json(response, 400, { type: false, message: 'Invalid JSON body.' });
+    }
+    const process = body && typeof body.process === 'string' ? body.process : '';
+    if (!ARTIFACT_COMMAND_PROCESSES.has(process)) {
+      return json(response, 400, { type: false, message: `process must be one of: ${[...ARTIFACT_COMMAND_PROCESSES].join(', ')}.` });
+    }
+    const payload = body.payload;
+    if (!payload || typeof payload !== 'object' || Array.isArray(payload)) {
+      return json(response, 400, { type: false, message: 'payload must be a JSON object.' });
+    }
+    if (!gateway.sendCommand(agentId, process, payload)) {
+      return json(response, 404, { type: false, message: `Agent ${agentId} is not connected.` });
+    }
+    const correlation = typeof payload.deployId === 'string' ? { deployId: payload.deployId.slice(0, 64) }
+      : typeof payload.requestId === 'string' ? { requestId: payload.requestId.slice(0, 64) } : {};
+    logger.info('[gateway] Artifact command sent', { id: agentId, process, ...correlation });
+    return json(response, 200, { type: true, sent: true });
+  }
+
   async function handleControlRequest(request, response) {
     const pathname = requestPath(request);
     if (request.method === 'GET' && pathname === '/health') return json(response, 200, { ok: true, service: SERVICE, ...gateway.stats() });
@@ -159,6 +204,9 @@ function createGatewayApp({
 
     const credentialMatch = pathname.match(/^\/agent\/credentials\/([^/]+)$/);
     if (credentialMatch) return handleCredential(request, response, credentialMatch[1]);
+
+    const artifactMatch = pathname.match(/^\/agent\/artifact-command\/([^/]+)$/);
+    if (artifactMatch) return handleArtifactCommand(request, response, artifactMatch[1]);
 
     const updateMatch = request.method === 'GET' && pathname.match(/^\/agent\/send-app-update-command\/([A-Za-z0-9._-]{3,128})$/);
     if (updateMatch) {
@@ -250,9 +298,6 @@ function main() {
       agentListener: `${config.agentHost}:${agent.port}`,
       controlListener: `${config.controlHost}:${control.port}`,
     }));
-    if (!isLoopback(config.controlHost)) {
-      console.warn(`[gateway] UYARI: kontrol listener loopback dışı bir adrese (${config.controlHost}) bağlı; bu portu tünele veya dış ağa açmayın.`);
-    }
   }).catch((error) => {
     console.error(`[gateway] Başlatılamadı: ${error.message}`);
     process.exit(1);
