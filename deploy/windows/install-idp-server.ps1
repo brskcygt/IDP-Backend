@@ -759,13 +759,15 @@ $DbPath         = Join-Path $DataDir 'idp.db'
 $SessionsPath   = Join-Path $DataDir 'sessions.json'
 $SecretsPath    = Join-Path $DataDir 'secrets.enc.json'
 $RegistryPath   = Join-Path $DataDir 'agents.json'
+$AllowlistPath  = Join-Path $DataDir 'agent-allowlist.json'
 $LegacySecretsPath = Join-Path $BackendDir 'src\secrets.enc.json'   # FileSecretStore.js varsayilani
 # Env yol degiskenleri yokken kullanilan varsayilan yollar (db.js, userStore.js, FileSecretStore.js, gateway server.js).
 $LegacyData = @(
     @{ Legacy = (Join-Path $BackendDir 'src\idp.db');         Target = $DbPath },
     @{ Legacy = (Join-Path $BackendDir 'src\users.json');     Target = $UsersPath },
     @{ Legacy = $LegacySecretsPath;                           Target = $SecretsPath },
-    @{ Legacy = (Join-Path $GatewayDir 'data\agents.json');   Target = $RegistryPath }
+    @{ Legacy = (Join-Path $GatewayDir 'data\agents.json');   Target = $RegistryPath },
+    @{ Legacy = (Join-Path $GatewayDir 'data\agent-allowlist.json'); Target = $AllowlistPath }
 )
 
 # ------------------------------------------------------------------ kaldirma
@@ -1113,6 +1115,10 @@ try {
     Set-EnvValue $gatewayLines 'IDP_AGENT_GATEWAY_CONTROL_PORT' ([string]$GatewayControlPort)
     if ([string]::IsNullOrWhiteSpace($tokenGateway)) { Set-EnvValue $gatewayLines 'IDP_AGENT_API_TOKEN' $agentToken }
     Set-EnvValue $gatewayLines 'IDP_AGENT_REGISTRY_PATH' $RegistryPath
+    # Kaynak IP erisim listesi: IDP arayuzunden yonetilir, bos oldugunda kisit
+    # uygulanmaz. IDP_AGENT_TRUSTED_PROXIES bilerek yazilmaz; yalnizca onunde
+    # gercek bir tunel/ters proxy varsa elle eklenmelidir (bkz. .env.example).
+    Set-EnvValue $gatewayLines 'IDP_AGENT_ALLOWLIST_PATH' $AllowlistPath
     Write-ProtectedFile -Path $GatewayEnvPath -Content (Join-EnvLines $gatewayLines) -ServiceSid $ServiceSid
     Write-Info ('Gateway env : ' + $GatewayEnvPath)
     $agentToken = $null

@@ -210,7 +210,7 @@ silin.
   tüm sırlar (`secrets.enc.json`) çözülemez hale gelir.
 - `C:\ProgramData\IDP\Server\gateway.env`.
 - `C:\ProgramData\IDP\Server\`: `idp.db` ile birlikte `-wal` ve `-shm` dosyaları, `users.json`,
-  `secrets.enc.json`, `agents.json`.
+  `secrets.enc.json`, `agents.json`, `agent-allowlist.json`.
 
 Tutarlı bir DB kopyası için önce görevleri durdurun
 (`Disable-ScheduledTask` + `Stop-ScheduledTask`). Kopyaladıktan sonra betiği tekrar çalıştırın ya

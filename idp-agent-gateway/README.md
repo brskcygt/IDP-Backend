@@ -26,10 +26,37 @@ Bu token agent'lara verilmez, agent listener'da kabul edilmez.
 | `DELETE /agent/credentials/:id` | 204; kayıt silinir, canlı oturum 4003 `Credential revoked` ile kapanır. Bilinmeyen ID 404. |
 | `POST /agent/run-deploy-command/:id` | Gövde `{"command":"..."}` (en fazla 64 KB) |
 | `GET /agent/send-app-update-command/:id` | Agent'a `update` komutu |
+| `GET /agent/allowlist` | `{type,message,data:{enforcing,entries:[{entry,note,addedAt,addedBy}]}}` |
+| `POST /agent/allowlist` | Gövde `{"entry":"203.0.113.0/24","note":"..."}`. 201 + güncel liste. Geçersiz/tekrar girdi 400, liste dolu 409. |
+| `DELETE /agent/allowlist` | Gövde `{"entry":"..."}`. 200 + güncel liste; listede yoksa 404. |
 
 Agent ID formatı: `^[A-Za-z0-9][A-Za-z0-9._-]{2,127}$`. Secret yalnızca `POST` yanıtında bir kez
 döner; gateway yalnızca `sha256(secret)` hex değerini saklar. Kimlik verilen agent `/agent/all`'da
 hemen `online:false` olarak görünür.
+
+## Kaynak IP erişim listesi
+
+Agent listener'a hangi kaynak adreslerin bağlanabileceğini sınırlar. Agent'ın kendi secret'ı
+kimliği doğrular; bu liste onun önündeki ikinci kapıdır ve IDP arayüzünden yönetilir.
+
+**Liste boşken kısıt uygulanmaz** — her kaynak kabul edilir. Boş listeyi "hiçbiri" saymak,
+özelliği açmayı ya da listeyi yanlışlıkla boşaltmayı anında tüm agent'lar için kesintiye
+çevirirdi. Ağ katmanı (bulut güvenlik listesi, host firewall) dıştaki kapı olarak kalır.
+
+Kontrol kimlik doğrulamasından **önce** yapılır: izinsiz bir kaynak 403 alır ve hiçbir zaman
+agent ID/secret denemesi yapamaz.
+
+Depolama `IDP_AGENT_ALLOWLIST_PATH` (varsayılan `./data/agent-allowlist.json`), `agents.json`'dan
+ayrı bir dosyadır: o dosya JSON dizi formatındadır ve tepesine anahtar eklemek eski bir gateway
+sürümünde tüm agent kayıtlarının sessizce silinmesine yol açar.
+
+### Ters proxy / tünel uyarısı
+
+Varsayılan olarak yalnızca TCP karşı taraf adresine bakılır; `X-Forwarded-For` ve
+`CF-Connecting-IP` **yok sayılır**. Önüne tünel koyarsanız o adres tünelin adresi olur ve liste
+beklediğiniz gibi çalışmaz. Bu durumda `IDP_AGENT_TRUSTED_PROXIES` ile YALNIZCA tünelin
+adreslerini tanımlayın; ancak o zaman başlıklara bakılır. Bu değişken boşken başlıklara güvenmek
+tam bypass demektir — 7003'e ulaşan herkes kendini izinli bir IP gibi gösterebilirdi.
 
 ## Agent bağlantısı
 

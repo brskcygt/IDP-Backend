@@ -5,6 +5,9 @@
  *
  *   POST   /api/agents/:id/credentials  -> 201 { agentId, secret, gatewayUrl, cfAccess }
  *   DELETE /api/agents/:id/credentials  -> 204 (404 when the gateway had none)
+ *   GET    /api/agents/allowlist        -> 200 { enforcing, entries }
+ *   POST   /api/agents/allowlist        -> 201 { enforcing, entries }
+ *   DELETE /api/agents/allowlist        -> 200 { enforcing, entries } (404 when absent)
  *
  * Every agent used to carry the one shared IDP_AGENT_API_TOKEN, so whoever
  * pulled it out of one customer's JAR could send SYSTEM commands to every
@@ -44,6 +47,88 @@ function createAgentsRouter({ agentConfig, auditLogger, createClient = () => new
   // Permission first (401/403 never consume a rate-limit slot), then the limiter.
   const guards = [requirePermission('project:write')];
   if (rateLimit) guards.push(rateLimit);
+
+  // Source-IP allowlist for the agent listener. Registered before the
+  // '/:id/...' routes below; '/allowlist' is a single segment and those need
+  // two, so the two never collide.
+  //
+  // The gateway is the one that validates an entry and owns the file; these
+  // routes only shape-check, forward, and write the audit record.
+  router.get('/allowlist', ...guards, async (req, res) => {
+    try {
+      return res.json(await createClient().listAllowlist());
+    } catch (err) {
+      return res.status(502).json({ error: `Agent gateway erişim listesi okunamadı: ${err.message}` });
+    }
+  });
+
+  router.post('/allowlist', ...guards, async (req, res) => {
+    const username = req.session?.user?.username;
+    const entry = typeof req.body?.entry === 'string' ? req.body.entry.trim() : '';
+    const note = typeof req.body?.note === 'string' ? req.body.note : '';
+
+    if (!entry) {
+      return res.status(400).json({ error: 'entry alanı zorunlu: bir IPv4/IPv6 adresi ya da CIDR (örn. 203.0.113.4 veya 203.0.113.0/24).' });
+    }
+
+    let result;
+    try {
+      result = await createClient().addAllowlistEntry(entry, { note, addedBy: username || null });
+    } catch (err) {
+      // A malformed or duplicate entry is the operator's mistake, not a
+      // gateway failure — pass 400 through instead of masking it as 502.
+      if (err.status === 400 || err.status === 409) {
+        return res.status(err.status).json({ error: err.message });
+      }
+      auditLogger.log(
+        username,
+        'AGENT_ALLOWLIST_ADD_FAILED',
+        `Agent erişim listesine eklenemedi: ${entry}`,
+        { entry, error: err.message },
+        { outcome: 'failure' }
+      );
+      return res.status(502).json({ error: `Agent gateway erişim listesine ekleyemedi: ${err.message}` });
+    }
+
+    auditLogger.log(username, 'AGENT_ALLOWLIST_ADDED', `Agent erişim listesine eklendi: ${entry}`, { entry, note });
+    return res.status(201).json(result);
+  });
+
+  router.delete('/allowlist', ...guards, async (req, res) => {
+    const username = req.session?.user?.username;
+    const entry = typeof req.body?.entry === 'string' ? req.body.entry.trim() : '';
+
+    if (!entry) {
+      return res.status(400).json({ error: 'entry alanı zorunlu.' });
+    }
+
+    let result;
+    try {
+      result = await createClient().removeAllowlistEntry(entry);
+    } catch (err) {
+      auditLogger.log(
+        username,
+        'AGENT_ALLOWLIST_REMOVE_FAILED',
+        `Agent erişim listesinden çıkarılamadı: ${entry}`,
+        { entry, error: err.message },
+        { outcome: 'failure' }
+      );
+      return res.status(502).json({ error: `Agent gateway erişim listesinden çıkaramadı: ${err.message}` });
+    }
+    if (!result) {
+      return res.status(404).json({ error: `${entry} listede yok.` });
+    }
+
+    // Worth its own action name: dropping the last entry turns the whole
+    // restriction off, and the audit trail has to show who did that.
+    auditLogger.log(
+      username,
+      'AGENT_ALLOWLIST_REMOVED',
+      `Agent erişim listesinden çıkarıldı: ${entry}${result.enforcing ? '' : ' (liste boşaldı, kısıt artık uygulanmıyor)'}`,
+      { entry, enforcing: result.enforcing }
+    );
+    return res.json(result);
+  });
 
   router.post('/:id/credentials', ...guards, async (req, res) => {
     res.set('Cache-Control', 'no-store');

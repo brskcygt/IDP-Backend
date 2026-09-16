@@ -4,6 +4,8 @@ const http = require('http');
 const path = require('path');
 const { WebSocketServer } = require('ws');
 const { AgentGateway, ARTIFACT_COMMAND_PROCESSES, FailureRateLimiter, bearerToken, isAuthorized, isValidAgentId } = require('./gateway');
+const { Allowlist } = require('./allowlist');
+const { normalizeAddress, matchesAny } = require('./ipMatch');
 
 const SERVICE = 'idp-agent-gateway';
 const MAX_WS_PAYLOAD = 1024 * 1024;
@@ -26,7 +28,25 @@ function loadConfig(env = process.env) {
     controlPort: parsePort(env.IDP_AGENT_GATEWAY_CONTROL_PORT, 7004, 'IDP_AGENT_GATEWAY_CONTROL_PORT'),
     token: String(env.IDP_AGENT_API_TOKEN || '').trim(),
     registryPath: env.IDP_AGENT_REGISTRY_PATH || path.join(process.cwd(), 'data', 'agents.json'),
+    allowlistPath: env.IDP_AGENT_ALLOWLIST_PATH || path.join(process.cwd(), 'data', 'agent-allowlist.json'),
+    trustedProxies: parseTrustedProxies(env.IDP_AGENT_TRUSTED_PROXIES),
   };
+}
+
+/**
+ * Networks whose `X-Forwarded-For` / `CF-Connecting-IP` headers may be believed.
+ *
+ * Empty by default, and that default is the safe one: with nothing trusted the
+ * gateway only ever looks at the TCP peer address, so a client that reaches
+ * port 7003 directly cannot hand itself an approved source IP in a header.
+ * Only set this once a tunnel or reverse proxy really does sit in front, and
+ * set it to that proxy's addresses only.
+ */
+function parseTrustedProxies(value) {
+  return String(value || '')
+    .split(',')
+    .map((part) => part.trim())
+    .filter(Boolean);
 }
 
 function isLoopback(host) {
@@ -84,6 +104,8 @@ function listenOn(server, port, host) {
 function createGatewayApp({
   token,
   registryPath = '',
+  allowlistPath = '',
+  trustedProxies = [],
   agentHost = '0.0.0.0',
   agentPort = 7003,
   controlHost = '127.0.0.1',
@@ -106,6 +128,34 @@ function createGatewayApp({
 
   const rateLimiter = new FailureRateLimiter(rateLimit);
   const gateway = new AgentGateway({ logger, registryPath, heartbeatIntervalMs, handshakeTimeoutMs, rateLimiter });
+  const allowlist = new Allowlist({ filePath: allowlistPath, logger });
+  if (!allowlist.enforcing) {
+    logger.info('[gateway] Agent source-IP allowlist is empty — every source address is accepted.');
+  }
+
+  /**
+   * The address an allowlist decision is made against.
+   *
+   * Forwarded headers are only read when the TCP peer is a trusted proxy;
+   * otherwise they are ignored entirely, since anyone who can open a socket to
+   * this port could otherwise set them freely.
+   */
+  function effectiveClientIp(request) {
+    const peer = normalizeAddress(request.socket.remoteAddress) || 'unknown';
+    if (trustedProxies.length === 0 || !matchesAny(trustedProxies, peer)) return peer;
+
+    const cfConnecting = normalizeAddress(request.headers['cf-connecting-ip']);
+    if (cfConnecting) return cfConnecting;
+
+    // Right-most entry: the ones further left were supplied by hops we do not
+    // control and can be forged.
+    const forwarded = String(request.headers['x-forwarded-for'] || '').split(',');
+    for (let i = forwarded.length - 1; i >= 0; i -= 1) {
+      const candidate = normalizeAddress(forwarded[i]);
+      if (candidate) return candidate;
+    }
+    return peer;
+  }
 
   // ------------------------------------------------------------ agent listener
 
@@ -118,9 +168,22 @@ function createGatewayApp({
   agentServer.on('upgrade', (request, socket, head) => {
     socket.on('error', () => {});
     const remoteAddress = request.socket.remoteAddress || 'unknown';
-    // CF-Connecting-IP doğrulanamaz; yalnızca log bağlamı içindir, hiçbir karar buna dayanmaz.
+    // CF-Connecting-IP doğrulanamaz; yalnızca log bağlamı içindir. Allowlist
+    // kararı effectiveClientIp() üzerinden verilir ve bu header'a yalnızca
+    // güvenilir bir proxy arkasındayken bakılır.
     const cfConnectingIp = String(request.headers['cf-connecting-ip'] || '').slice(0, 64) || undefined;
     if (requestPath(request) !== '/') return rejectUpgrade(socket, 404, NOT_FOUND.message);
+
+    // Ahead of credential verification on purpose: a source that is not
+    // allowed never gets to probe agent ids or secrets. Rejections here are
+    // deliberately NOT fed to the failure rate limiter — behind a tunnel every
+    // agent shares one peer address, and one blocked source would then lock
+    // out the legitimate ones.
+    const clientIp = effectiveClientIp(request);
+    if (!allowlist.allows(clientIp)) {
+      logger.warn('[gateway] Agent upgrade rejected by source allowlist', { remoteAddress, clientIp, cfConnectingIp });
+      return rejectUpgrade(socket, 403, 'Forbidden');
+    }
 
     const agentId = String(request.headers['x-idp-agent-id'] || '').trim();
     const result = gateway.verifyAgentCredential(agentId, bearerToken(request));
@@ -196,11 +259,68 @@ function createGatewayApp({
     return json(response, 200, { type: true, sent: true });
   }
 
+  /** GET lists the allowlist, POST adds an entry, DELETE removes one. */
+  async function handleAllowlist(request, response) {
+    if (request.method === 'GET') {
+      return json(response, 200, {
+        type: true,
+        message: 'Allowlist fetched.',
+        data: { enforcing: allowlist.enforcing, entries: allowlist.list() },
+      });
+    }
+
+    if (request.method === 'POST' || request.method === 'DELETE') {
+      let body;
+      try {
+        body = await readJson(request);
+      } catch (error) {
+        if (error.tooLarge) return json(response, 413, { type: false, message: BODY_TOO_LARGE });
+        return json(response, 400, { type: false, message: 'Invalid JSON body.' });
+      }
+      const entry = body && typeof body.entry === 'string' ? body.entry : '';
+
+      if (request.method === 'DELETE') {
+        let removed;
+        try {
+          removed = allowlist.remove(entry);
+        } catch (error) {
+          return json(response, 500, { type: false, message: `Allowlist could not be written: ${error.message}` });
+        }
+        if (!removed) return json(response, 404, { type: false, message: 'Entry not found.' });
+        logger.info('[gateway] Allowlist entry removed', { entry, enforcing: allowlist.enforcing });
+        return json(response, 200, { type: true, message: 'Entry removed.', data: { enforcing: allowlist.enforcing, entries: allowlist.list() } });
+      }
+
+      let result;
+      try {
+        result = allowlist.add(entry, {
+          note: typeof body.note === 'string' ? body.note : '',
+          addedBy: typeof body.addedBy === 'string' ? body.addedBy : null,
+        });
+      } catch (error) {
+        return json(response, 500, { type: false, message: `Allowlist could not be written: ${error.message}` });
+      }
+      if (!result.ok) {
+        const message = result.reason === 'duplicate' ? 'Entry is already on the list.'
+          : result.reason === 'limit_reached' ? 'Allowlist is full.'
+            : 'Entry must be an IPv4/IPv6 address or CIDR (e.g. 203.0.113.4 or 203.0.113.0/24).';
+        return json(response, result.reason === 'limit_reached' ? 409 : 400, { type: false, message });
+      }
+      logger.info('[gateway] Allowlist entry added', { entry: result.entry.entry, enforcing: allowlist.enforcing });
+      return json(response, 201, { type: true, message: 'Entry added.', data: { enforcing: allowlist.enforcing, entries: allowlist.list() } });
+    }
+
+    response.setHeader('allow', 'GET, POST, DELETE');
+    return json(response, 405, { type: false, message: 'Method not allowed.' });
+  }
+
   async function handleControlRequest(request, response) {
     const pathname = requestPath(request);
     if (request.method === 'GET' && pathname === '/health') return json(response, 200, { ok: true, service: SERVICE, ...gateway.stats() });
     if (!isAuthorized(request, controlToken)) return json(response, 401, { type: false, message: 'Unauthorized' });
     if (request.method === 'GET' && pathname === '/agent/all') return json(response, 200, { type: true, message: 'Agents fetched.', data: gateway.listAgents() });
+
+    if (pathname === '/agent/allowlist') return handleAllowlist(request, response);
 
     const credentialMatch = pathname.match(/^\/agent\/credentials\/([^/]+)$/);
     if (credentialMatch) return handleCredential(request, response, credentialMatch[1]);

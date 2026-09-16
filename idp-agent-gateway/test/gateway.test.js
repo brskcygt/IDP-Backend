@@ -220,6 +220,7 @@ test('agent portunda kontrol uçları 404 döner (kontrol token ile bile)', asyn
     ['GET', '/agent/send-app-update-command/WIN-01'],
     ['POST', '/agent/credentials/WIN-01'],
     ['DELETE', '/agent/credentials/WIN-01'],
+    ['GET', '/agent/allowlist'],
     ['GET', '/'],
     ['POST', '/health'],
   ];
@@ -236,6 +237,8 @@ test('kontrol uçları ve abonelik WS kontrol token ister', async (t) => {
     assert.equal((await env.api('/agent/credentials/WIN-01', { method: 'POST', token })).status, 401);
     assert.equal((await env.api('/agent/credentials/WIN-01', { method: 'DELETE', token })).status, 401);
     assert.equal((await env.api('/agent/run-deploy-command/WIN-01', { method: 'POST', token, body: { command: 'dir' } })).status, 401);
+    assert.equal((await env.api('/agent/allowlist', { token })).status, 401);
+    assert.equal((await env.api('/agent/allowlist', { method: 'POST', token, body: { entry: '203.0.113.4' } })).status, 401);
     const { status } = await connect(`ws://127.0.0.1:${env.controlPort}/`, token ? { authorization: `Bearer ${token}` } : {});
     assert.equal(status, 401);
   }
@@ -517,4 +520,110 @@ test('hash\'i olmayan eski kayıt yüklenir ama kimlik verilene kadar bağlanama
   const secret = await issue(env, 'LEGACY-01');
   await openAgent(env, 'LEGACY-01', secret);
   assert.equal((await listAgents(env))[0].online, true);
+});
+
+// ------------------------------------------------------- source IP allowlist
+
+function tmpAllowlist() {
+  return path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'idp-gw-al-')), 'data', 'agent-allowlist.json');
+}
+
+test('allowlist boşken her kaynak kabul edilir ve enforcing false döner', async (t) => {
+  const env = await startApp(t, { allowlistPath: tmpAllowlist() });
+  const body = await (await env.api('/agent/allowlist')).json();
+  assert.deepEqual(body.data, { enforcing: false, entries: [] });
+
+  const secret = await issue(env, 'WIN-01');
+  const ws = await openAgent(env, 'WIN-01', secret);
+  assert.equal(ws.readyState, WebSocket.OPEN);
+});
+
+test('allowlist doluyken izinli kaynak bağlanır, izinsiz kaynak 403 alır', async (t) => {
+  const env = await startApp(t, { allowlistPath: tmpAllowlist() });
+  const secret = await issue(env, 'WIN-01');
+
+  // Testler 127.0.0.1 üzerinden bağlanıyor; listeye başka bir adres koymak
+  // yerel bağlantıyı dışarıda bırakır.
+  const added = await env.api('/agent/allowlist', { method: 'POST', body: { entry: '203.0.113.0/24', note: 'ofis' } });
+  assert.equal(added.status, 201);
+  assert.equal((await added.json()).data.enforcing, true);
+
+  const blocked = await connect(`ws://127.0.0.1:${env.agentPort}/`, agentHeaders('WIN-01', secret));
+  assert.equal(blocked.status, 403);
+
+  // Loopback eklenince aynı agent geçer.
+  assert.equal((await env.api('/agent/allowlist', { method: 'POST', body: { entry: '127.0.0.1' } })).status, 201);
+  const ws = await openAgent(env, 'WIN-01', secret);
+  assert.equal(ws.readyState, WebSocket.OPEN);
+});
+
+test('allowlist reddi kimlik doğrulamasından ÖNCE olur: geçersiz secret de 403 alır', async (t) => {
+  const env = await startApp(t, { allowlistPath: tmpAllowlist() });
+  await issue(env, 'WIN-01');
+  assert.equal((await env.api('/agent/allowlist', { method: 'POST', body: { entry: '203.0.113.0/24' } })).status, 201);
+
+  // 401 dönseydi, izinsiz bir kaynak agent id/secret denemesi yapabildiğini
+  // anlardı; 403 hiçbir kimlik bilgisi sızdırmaz.
+  const { status } = await connect(`ws://127.0.0.1:${env.agentPort}/`, agentHeaders('WIN-01', 'yanlis-secret'));
+  assert.equal(status, 403);
+});
+
+test('güvenilir proxy tanımlı değilken CF-Connecting-IP yok sayılır (spoof edilemez)', async (t) => {
+  const env = await startApp(t, { allowlistPath: tmpAllowlist() });
+  const secret = await issue(env, 'WIN-01');
+  assert.equal((await env.api('/agent/allowlist', { method: 'POST', body: { entry: '203.0.113.4' } })).status, 201);
+
+  const { status } = await connect(`ws://127.0.0.1:${env.agentPort}/`, {
+    ...agentHeaders('WIN-01', secret),
+    'cf-connecting-ip': '203.0.113.4',
+    'x-forwarded-for': '203.0.113.4',
+  });
+  assert.equal(status, 403);
+});
+
+test('güvenilir proxy arkasında CF-Connecting-IP allowlist kararına girer', async (t) => {
+  const env = await startApp(t, { allowlistPath: tmpAllowlist(), trustedProxies: ['127.0.0.1'] });
+  const secret = await issue(env, 'WIN-01');
+  assert.equal((await env.api('/agent/allowlist', { method: 'POST', body: { entry: '203.0.113.4' } })).status, 201);
+
+  const blocked = await connect(`ws://127.0.0.1:${env.agentPort}/`, agentHeaders('WIN-01', secret));
+  assert.equal(blocked.status, 403, 'header yokken peer adresi bakılır ve listede değil');
+
+  const ws = await connect(`ws://127.0.0.1:${env.agentPort}/`, { ...agentHeaders('WIN-01', secret), 'cf-connecting-ip': '203.0.113.4' });
+  assert.equal(ws.status, 101);
+  ws.ws.close();
+});
+
+test('allowlist girdileri doğrulanır, tekrar eklenemez ve silinebilir', async (t) => {
+  const env = await startApp(t, { allowlistPath: tmpAllowlist() });
+
+  for (const entry of ['', 'not-an-ip', '203.0.113.0/33', '203.0.113.4/abc']) {
+    const response = await env.api('/agent/allowlist', { method: 'POST', body: { entry } });
+    assert.equal(response.status, 400, entry);
+  }
+
+  assert.equal((await env.api('/agent/allowlist', { method: 'POST', body: { entry: '203.0.113.4' } })).status, 201);
+  assert.equal((await env.api('/agent/allowlist', { method: 'POST', body: { entry: '203.0.113.4' } })).status, 400, 'tekrar');
+
+  // IPv4-mapped IPv6 aynı girdi sayılır.
+  assert.equal((await env.api('/agent/allowlist', { method: 'POST', body: { entry: '::ffff:203.0.113.4' } })).status, 400);
+
+  assert.equal((await env.api('/agent/allowlist', { method: 'DELETE', body: { entry: '198.51.100.1' } })).status, 404);
+  const removed = await env.api('/agent/allowlist', { method: 'DELETE', body: { entry: '203.0.113.4' } });
+  assert.equal(removed.status, 200);
+  assert.deepEqual((await removed.json()).data, { enforcing: false, entries: [] });
+});
+
+test('allowlist yeniden başlatmaya dayanır', async (t) => {
+  const allowlistPath = tmpAllowlist();
+  const env = await startApp(t, { allowlistPath });
+  assert.equal((await env.api('/agent/allowlist', { method: 'POST', body: { entry: '203.0.113.0/24', note: 'ofis' } })).status, 201);
+  await env.app.close();
+
+  const again = await startApp(t, { allowlistPath });
+  const body = await (await again.api('/agent/allowlist')).json();
+  assert.equal(body.data.enforcing, true);
+  assert.equal(body.data.entries.length, 1);
+  assert.equal(body.data.entries[0].entry, '203.0.113.0/24');
+  assert.equal(body.data.entries[0].note, 'ofis');
 });

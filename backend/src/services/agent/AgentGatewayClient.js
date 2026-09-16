@@ -131,6 +131,54 @@ class AgentGatewayClient {
     }
   }
 
+  /**
+   * Source-IP allowlist for the agent listener. An empty list means the
+   * gateway is not restricting anything — `enforcing` says which it is, so
+   * callers never have to infer it from the array being empty.
+   * @returns {Promise<{ enforcing: boolean, entries: Array<{ entry: string, note: string, addedAt: string, addedBy: string | null }> }>}
+   */
+  async listAllowlist() {
+    const body = await this.request('/agent/allowlist');
+    const data = body && body.data ? body.data : {};
+    return {
+      enforcing: data.enforcing === true,
+      entries: Array.isArray(data.entries) ? data.entries : [],
+    };
+  }
+
+  /**
+   * @param {string} entry - an IPv4/IPv6 address or CIDR.
+   * @param {{ note?: string, addedBy?: string | null }} [meta]
+   * @returns {Promise<{ enforcing: boolean, entries: object[] }>} the list after the change.
+   * @throws {Error} with `status: 400` when the entry is malformed or already present.
+   */
+  async addAllowlistEntry(entry, { note = '', addedBy = null } = {}) {
+    const body = await this.request('/agent/allowlist', {
+      method: 'POST',
+      body: JSON.stringify({ entry, note, addedBy }),
+    });
+    const data = body && body.data ? body.data : {};
+    return { enforcing: data.enforcing === true, entries: Array.isArray(data.entries) ? data.entries : [] };
+  }
+
+  /**
+   * @param {string} entry
+   * @returns {Promise<{ enforcing: boolean, entries: object[] } | null>} null when the entry was not on the list (404).
+   */
+  async removeAllowlistEntry(entry) {
+    try {
+      const body = await this.request('/agent/allowlist', {
+        method: 'DELETE',
+        body: JSON.stringify({ entry }),
+      });
+      const data = body && body.data ? body.data : {};
+      return { enforcing: data.enforcing === true, entries: Array.isArray(data.entries) ? data.entries : [] };
+    } catch (error) {
+      if (error.status === 404) return null;
+      throw error;
+    }
+  }
+
   subscribe(agentId, handlers = {}) {
     const listenerId = `idp-${crypto.randomUUID()}`;
     const socket = new WebSocket(websocketUrl(this.baseUrl), {

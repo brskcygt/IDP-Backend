@@ -47,6 +47,11 @@ run "backend: npm ci"        backend npm ci
 run "backend: lint (syntax)" backend npm run lint
 run "backend: test"          backend npm test
 
+# ---- Agent gateway ----
+run "gateway: npm ci"          idp-agent-gateway npm ci
+run "gateway: check (syntax)"  idp-agent-gateway npm run check:syntax
+run "gateway: test"            idp-agent-gateway npm test
+
 # ---- Optional: security checks (mirrors .github/workflows/security.yml) ----
 if [[ "${WITH_SECURITY}" -eq 1 ]]; then
   run "backend: npm audit (high)"  backend  npm audit --audit-level=high
