@@ -10,7 +10,7 @@
  * touches Express, cookies, or sessions — a requirement for the eventual
  * Electron migration, where deploys will be triggered over IPC instead of
  * HTTP. Every other line of logic — secret resolution, environment merging,
- * the PMP vault call, VPN setup/teardown, the `throwIfAborted` checkpoints,
+ * the PMP vault call, the `throwIfAborted` checkpoints,
  * status updates, audit entries, and the `activeDeployments` concurrency
  * lock — is unchanged.
  */
@@ -23,7 +23,6 @@ const WindowsAdapter = require('../../adapters/WindowsAdapter');
 // const CloudflareRunnerAdapter = require('../../adapters/CloudflareRunnerAdapter');
 const IdpAgentAdapter = require('../../adapters/IdpAgentAdapter');
 const CiPipelineAdapter = require('../../adapters/CiPipelineAdapter');
-const VpnManager = require('../../services/vpn/VpnManager');
 const deploymentManager = require('../../services/DeploymentManager');
 const auditLogger = require('../../services/AuditLogger');
 const PmpService = require('../../services/vault/PmpService');
@@ -133,8 +132,8 @@ function describeDeployTarget(provider, config) {
  * abort() call actually stops the work in progress instead of letting it
  * run to completion while status merely reads 'aborted'. The thrown error
  * is caught by the IIFE's existing catch/finally chain, which already
- * tears down the VPN session and clears credentials — that behavior is
- * unchanged, this just makes sure it triggers promptly instead of only
+ * clears credentials — that behavior is unchanged, this just makes sure it
+ * triggers promptly instead of only
  * after the current phase happens to finish on its own.
  */
 function throwIfAborted(deploymentId) {
@@ -168,7 +167,7 @@ async function executeDeploy({ project, parameters, triggeredBy, appConfig }) {
   // keep its references, or the very next write would persist plaintext
   // credentials back to SQLite and undo the whole point of the secret store.
   //
-  // Everything that needs real credentials (the adapter, the VPN tunnel) reads
+  // Everything that needs real credentials (the adapter) reads
   // from `runtimeProject`; everything that mutates persisted state (status,
   // lastDeploy) keeps using `project`.
   let runtimeProject = await resolveProjectSecrets(project, secretStore);
@@ -237,7 +236,6 @@ async function executeDeploy({ project, parameters, triggeredBy, appConfig }) {
 
   // Run deployment in background (don't await — return deploymentId immediately)
   (async () => {
-    let vpnSession = null;
     try {
       // 0. Resolve Dynamic Credentials via PMP Vault API
       if (runtimeProject.config.authType === 'pmp' && runtimeProject.config.pmpConfig) {
@@ -263,17 +261,12 @@ async function executeDeploy({ project, parameters, triggeredBy, appConfig }) {
 
       throwIfAborted(deploymentId); // checkpoint: after PMP credential resolution
 
-      // 1. Establish VPN/PAM Tunnel if enabled
-      if (runtimeProject.config.vpnEnabled && runtimeProject.config.vpnConfig) {
-        vpnSession = await VpnManager.connect(
-          runtimeProject.config.vpnConfig,
-          (line) => deploymentManager.pushLog(deploymentId, line),
-          project.id,
-          deploymentId
-        );
-      }
-
-      throwIfAborted(deploymentId); // checkpoint: after VPN connection
+      // 1. VPN/PAM tunnel step removed: deployments now reach their targets
+      // either directly or through the IDP agent, which dials out to the
+      // gateway itself. `services/vpn/` is kept in the repository for a
+      // possible rollback but is no longer called by the active flow.
+      // Existing projects may still carry `vpnEnabled`/`vpnConfig` in their
+      // stored config; both are ignored.
 
       // 2. Connect & Execute Target Deploy
       await adapter.connect();
@@ -332,16 +325,7 @@ async function executeDeploy({ project, parameters, triggeredBy, appConfig }) {
     } finally {
       activeDeployments.delete(project.id);
 
-      // 3. Always teardown VPN regardless of success/failure
-      if (vpnSession) {
-        try {
-          await VpnManager.disconnect(vpnSession, (line) => {
-            deploymentManager.pushLog(deploymentId, line);
-          });
-        } catch (teardownErr) {
-          deploymentManager.pushLog(deploymentId, `[System] ⚠ VPN Teardown warning: ${teardownErr.message}`);
-        }
-      }
+      // 3. VPN teardown removed along with the tunnel step above.
 
       // 4. Clean up sensitive credential variable from runtime memory
       adapter.password = null;

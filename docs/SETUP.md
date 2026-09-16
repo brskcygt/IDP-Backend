@@ -1,5 +1,11 @@
-# IDP — Kurulum: VPN Sudo Yapılandırması
+# IDP — Kurulum: VPN Sudo Yapılandırması (GEÇERSİZ)
 
+> **Bu belge artık uygulanmıyor.** VPN tünel kurulumu üründen kaldırıldı:
+> deploy'lar hedeflere ya doğrudan ya da gateway'e kendisi bağlanan IDP
+> agent'ı üzerinden ulaşıyor. Aşağıdaki sudoers adımlarına, `openfortivpn`
+> / `openconnect` kurulumuna ve MFA webhook'una ihtiyaç yok. Belge olası bir
+> geri dönüş için tarihsel kayıt olarak duruyor.
+>
 > Son güncelleme: 2026-08-20 · Kapsam: `backend/src/server.js` (VPN adaptörleri)
 > İlgili: `docs/02-GUVENLIK-ANALIZI.md` → SEC-02, SEC-08
 

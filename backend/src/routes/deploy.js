@@ -240,22 +240,8 @@ router.post('/:deploymentId/abort', requirePermission('deploy:abort'), async (re
   res.json({ message: 'Abort signal sent.', deploymentId });
 });
 
-/**
- * POST /api/deploy/:deploymentId/submit-mfa
- * Submits an MFA code or approval back to the waiting deployment process.
- */
-router.post('/:deploymentId/submit-mfa', requirePermission('deploy:trigger'), (req, res) => {
-  const { deploymentId } = req.params;
-  const { code } = req.body;
-
-  const resolved = deploymentManager.resolveMfa(deploymentId, code);
-
-  if (!resolved) {
-    return res.status(400).json({ error: 'No active MFA request found for this deployment.' });
-  }
-
-  auditLogger.log(req.session?.user?.username, 'MFA_SUBMITTED', `MFA response submitted`, { deploymentId });
-  res.json({ message: 'MFA response submitted successfully.' });
-});
+// POST /:deploymentId/submit-mfa was removed together with the VPN tunnel
+// step: nothing sets an MFA resolver anymore, so the route could only ever
+// answer 400.
 
 module.exports = router;

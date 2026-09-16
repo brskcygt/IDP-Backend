@@ -10,7 +10,6 @@
 const errors = require('./errors');
 const projectService = require('./projects/projectService');
 const deploymentService = require('./deployment/deploymentService');
-const vpnService = require('./vpn/vpnService');
 const { testProjectConnection } = require('./diagnostics/connectionTest');
 
 module.exports = {
@@ -18,6 +17,5 @@ module.exports = {
   errors,
   projectService,
   deploymentService,
-  vpnService,
   testProjectConnection,
 };

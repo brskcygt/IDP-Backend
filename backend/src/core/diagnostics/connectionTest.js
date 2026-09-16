@@ -19,10 +19,6 @@
  *  - Every network probe here is READ-ONLY. Nothing in this file ever
  *    triggers a Jenkins build, runs a deploy script, or writes to a target
  *    server — that is the whole point of a "test connection" feature.
- *  - VPN tunnels are deliberately never established here: bringing one up
- *    is exactly as expensive and side-effecting as a real deploy. When a
- *    project has `vpnEnabled`, the result includes an informational
- *    `{ ok: null }` line instead of dialing anything.
  *  - `ok: null` (as opposed to `true`/`false`) means "not tested" — either
  *    because an earlier check in the same chain failed first (e.g. no point
  *    testing SSH auth when TCP couldn't even connect) or because testing it
@@ -179,14 +175,6 @@ async function testProjectConnection({ project, appConfig, environment, deps = {
     });
   } else {
     checks = [makeCheck('Provider', false, `Unknown provider '${project.provider}'.`)];
-  }
-
-  // VPN is deliberately never dialed for a test click — see module header.
-  if (config.vpnEnabled && config.vpnConfig) {
-    checks = [
-      ...checks,
-      makeCheck('VPN', null, 'Not tested — the tunnel is only established during a deployment'),
-    ];
   }
 
   const ok = checks.every((check) => check.ok !== false);

@@ -5,9 +5,13 @@
 ## 1. Proje ne yapıyor?
 
 **Internal Developer Platform (IDP)** — tek bir arayüzden farklı hedeflere deployment tetikleyen
-merkezi orkestratör. Ayırt edici özelliği: **VPN bağlantısı ve MFA akışını deployment
-pipeline'ının içine gömmesi**. Operatör portala girer, "Deploy" der; portal arka planda
-kurumsal VPN'i açar, MFA'yı çözer, hedefe bağlanır, script'i çalıştırır, tüneli kapatır.
+merkezi orkestratör. Operatör portala girer, "Deploy" der; portal hedefe bağlanır,
+script'i çalıştırır, logu canlı akıtır. Hedefe erişim ya doğrudan ya da hedef sunucuda
+çalışıp gateway'e kendisi bağlanan IDP agent'ı üzerindendir.
+
+> VPN tünel kurulumu ve ona bağlı MFA akışı üründen kaldırıldı (agent mimarisine
+> geçildi). `services/vpn/*` modülleri olası bir geri dönüş için repoda duruyor ama
+> hiçbir akış tarafından çağrılmıyor.
 
 ## 2. Ana akış
 
@@ -16,20 +20,14 @@ Login (admin/admin — sabit)
   ↓
 Dashboard — proje kartları (Jenkins / PMP / Server / WinRM)
   │  ├─ Telemetry rozeti (Server/WinRM için CPU+RAM, 60 sn polling)
-  │  └─ Settings → hedef bilgileri, kimlik, script, VPN + MFA
+  │  └─ Settings → hedef bilgileri, kimlik, script
   ↓
 Deploy → TriggerModal (environment seçimi)
   ↓
 POST /api/deploy/trigger
   ├─ 0. PMP Vault'tan şifre çek        (config.authType === 'pmp')
-  ├─ 1. VPN tüneli aç                  (VpnManager)
-  │      └─ MFA gerekirse → SSE event → UI overlay
-  │         • push        → "telefonundan onayla"
-  │         • totp        → 6 haneli kutu
-  │         • number-match→ Microsoft Authenticator numarası
-  │         • webhook     → SMS'ten OTP otomatik yakalama (/api/mfa/webhook-otp)
-  ├─ 2. adapter.connect() → trigger() → streamLogs()
-  └─ 3. finally: VPN teardown + şifreyi bellekten sil
+  ├─ 1. adapter.connect() → trigger() → streamLogs()
+  └─ 2. finally: şifreyi bellekten sil
   ↓
 LiveTerminalStream — SSE (/api/deploy/logs/:id) ile canlı log
   ↓
@@ -41,9 +39,8 @@ AuditLogger → audit_logs.json
 | Katman | Dosya | Sorumluluk |
 |---|---|---|
 | Transport | `server.js`, `routes/deploy.js` | REST + SSE (+ ölü WebSocket yolu) |
-| Orkestrasyon | `services/DeploymentManager.js` | Session, log buffer, subscriber, MFA resolver |
+| Orkestrasyon | `services/DeploymentManager.js` | Session, log buffer, subscriber |
 | Adapter | `adapters/*.js` | Jenkins / SSH / WinRM / PMP-web |
-| Ağ | `services/vpn/*` | VpnManager, MfaVpnHandler, AzureAdMfaHandler, SamlBrowserAuth (ölü) |
 | Vault | `services/vault/PmpService.js` | ManageEngine PMP'den dinamik şifre |
 | İzleme | `services/TelemetryService.js` | SSH/WinRM ile CPU+RAM |
 | Kayıt | `services/AuditLogger.js` | JSON dosyasına denetim kaydı |
@@ -61,7 +58,6 @@ AuditLogger → audit_logs.json
 ## 5. Olgunluk değerlendirmesi
 
 **Güçlü yanlar**
-- VPN + MFA orkestrasyonu gerçekten çözülmüş, nadir ve değerli bir problem
 - Adapter soyutlaması doğru kurgulanmış — yeni sağlayıcı eklemek kolay
 - SSE + log buffer + late-join replay tasarımı sağlam
 - PMP Vault entegrasyonu (dinamik şifre) doğru fikir

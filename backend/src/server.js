@@ -28,7 +28,7 @@ const AgentGatewayClient = require('./services/agent/AgentGatewayClient');
 // Transport-agnostic business logic (T-58). Nothing under src/core/** knows
 // about Express, req/res, cookies, or sessions — see src/core/index.js and
 // backend/scripts/check-core-boundaries.js.
-const { projectService, deploymentService, vpnService, testProjectConnection, NotFoundError, ConflictError } = require('./core');
+const { projectService, deploymentService, testProjectConnection, NotFoundError, ConflictError } = require('./core');
 const { bootstrapCore } = require('./core/bootstrap');
 const { sendError } = require('./http/errorMapper');
 // Artifact deploy (releases → deploy targets). HTTP-only: the desktop IPC
@@ -192,8 +192,9 @@ app.get('/api/auth/me', (req, res) => {
 // User Management routes (T-52 / SEC-09, admin-only) — see routes/users.js.
 app.use('/api/users', require('./routes/users'));
 
-// MFA Webhook Routes
-app.use('/api/mfa', require('./routes/mfa'));
+// MFA webhook routes are no longer mounted: the OTP/SAML flow only ever
+// served VPN tunnel establishment, which was removed. `routes/mfa.js` and
+// `services/mfa/` are kept in the repository for a possible rollback.
 
 // Mount SSE deploy routes
 app.use('/api/deploy', requireAuth, deployRoutes);
@@ -212,25 +213,6 @@ bootstrapCore();
 
 app.get('/api/projects', requirePermission('project:read'), (req, res) => {
   res.json(projectService.listProjects());
-});
-
-app.post('/api/projects/:id/vpn/clear-session', requirePermission('vpn:manage'), async (req, res) => {
-  try {
-    const result = await vpnService.clearProjectVpnSession(req.params.id, req.session?.user?.username);
-    res.json(result);
-  } catch (err) {
-    sendError(res, err);
-  }
-});
-
-app.post('/api/vpn/force-disconnect', requirePermission('vpn:manage'), async (req, res) => {
-  const result = await vpnService.forceDisconnectAll(req.session?.user?.username);
-  res.json(result);
-});
-
-app.get('/api/vpn/sessions', requirePermission('vpn:manage'), async (req, res) => {
-  const activeSessions = await vpnService.listActiveVpnSessions();
-  res.json(activeSessions);
 });
 
 app.get('/api/audit-logs', requirePermission('audit:read'), (req, res) => {

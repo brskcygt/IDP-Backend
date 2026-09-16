@@ -41,7 +41,7 @@ masaüstü uygulaması** eklendi. 72 maddelik iyileştirme listesinin 69'u kapan
                                               ├── adapters/  Jenkins·SSH·WinRM·PMP
                                               ├── secrets/   şifreli kimlik deposu
                                               ├── store/     SQLite
-                                              └── services/  VPN·MFA·telemetry
+                                              └── services/  telemetry·agent·vault
 ```
 
 `core/` içine Express sızması CI'da engelleniyor

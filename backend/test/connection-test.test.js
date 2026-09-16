@@ -575,37 +575,6 @@ test('Server/WinRM: PMP-vault-authenticated project with no fetched password -> 
   assert.ok(byName['PMP Vault']);
 });
 
-// ── VPN (never dialed) ───────────────────────────────────────────────────
-
-test('VPN configured -> reported as ok:null with the "not tested" note, never dialed', async () => {
-  const project = baseProject({
-    provider: 'Jenkins',
-    config: {
-      url: 'http://jenkins.local',
-      vpnEnabled: true,
-      vpnConfig: { type: 'openvpn', host: 'vpn.local' },
-    },
-  });
-
-  let vpnDialed = false;
-  const result = await testProjectConnection({
-    project,
-    deps: {
-      JenkinsAdapter: fakeJenkinsAdapterClass({ connectBehavior: 'ok' }),
-      resolveSecrets: passThroughResolveSecrets,
-      // No VPN dependency is even accepted by testProjectConnection — this
-      // flag just documents intent; the real guarantee is that no VPN
-      // module is ever required/called by connectionTest.js at all.
-    },
-  });
-  assert.equal(vpnDialed, false);
-
-  const vpn = result.checks.find((c) => c.name === 'VPN');
-  assert.ok(vpn);
-  assert.equal(vpn.ok, null);
-  assert.equal(vpn.detail, 'Not tested — the tunnel is only established during a deployment');
-});
-
 // ── Credential resolution failure ───────────────────────────────────────
 
 test('a secret-store resolution failure is reported as a single Credentials check, not thrown', async () => {
