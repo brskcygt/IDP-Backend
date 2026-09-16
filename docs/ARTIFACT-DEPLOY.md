@@ -103,6 +103,11 @@ Zarf değişmedi: `{date, type, agentId, process, payload}`.
   - `runtimeConfig`: `{format, values}` ya da `null`. `frontend-config-js` bileşen köküne
     `config.js` = `window.__ENV__ = <JSON>;`; `env-file` ise `.env` yazar. Dosya adı payload'dan
     alınmaz. Eski düz string map yalnız `writeRuntimeConfig: true` frontend bileşenleri için korunur.
+  - **Önerilen anahtarlar:** CI upload finalize edilirken her bileşen tarball'ının kökünde (ya da tek üst
+    klasör altında) `.env.example` aranır; `KEY=value` satırları varsayılan değer, hemen üstündeki `#`
+    satırları açıklama, `# KEY=value` isteğe bağlı anahtar olarak `releases.config_schema_json`'a yazılır
+    ve target runtime config editöründe öneri olarak gösterilir. Dosya yoksa ya da okunamazsa release
+    etkilenmez. Harici (Bitbucket/GitHub import) release'lerde okunmaz.
   - `hooks.preStart` (ya da `null`): swap'tan **sonra**, servis başlamadan **önce**, bileşen kökünde sırayla
     çalışır (bkz. §3.2).
   - `timeoutSec`: agent tarafı genel süre; `900 + Σ health.timeoutSec + Σ hook.timeoutSec`, en az 1800, en çok 14400.

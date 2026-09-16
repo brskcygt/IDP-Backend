@@ -3,6 +3,7 @@
 /** CI upload/finalize orchestration and local-release retention. */
 const { validateManifest, normalizeArtifactDeployConfig, VERSION_PATTERN } = require('./contracts');
 const { ValidationError, ConflictError, NotFoundError } = require('../errors');
+const { buildConfigSchema } = require('./envExample');
 
 function createArtifactUploadService({
   repository,
@@ -130,9 +131,13 @@ function createArtifactUploadService({
         const artifacts = check.manifest.artifacts.map((artifact) => ({ ...artifact, sourceRef: artifact.file }));
         repository.replaceArtifacts(release.id, artifacts);
         repository.markReleaseFinalized(release.id, projectId);
+        const configSchema = await buildConfigSchema(check.manifest.artifacts, async (artifact) => (
+          (await store.open({ artifact: { fileName: artifact.file }, release: { projectId, version } })).stream
+        ));
         release = repository.updateRelease(release.id, {
           status: 'ready',
           manifest: check.manifest,
+          configSchema,
           commitSha: check.manifest.commit,
           sourcePlatform: 'local',
           sourceIdentity: { storage: 'local', projectId, version },

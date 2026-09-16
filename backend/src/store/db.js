@@ -216,6 +216,10 @@ function ensureReleaseColumns(db) {
   if (!existing.has('ready_order')) {
     db.exec('ALTER TABLE releases ADD COLUMN ready_order INTEGER');
   }
+  // Keys parsed from each component's .env.example (see core/artifacts/envExample.js).
+  if (!existing.has('config_schema_json')) {
+    db.exec('ALTER TABLE releases ADD COLUMN config_schema_json TEXT');
+  }
 }
 
 /**
