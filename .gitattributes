@@ -6,10 +6,9 @@
 # Lockfiles are machine-generated — exclude them from diffs/stats and from
 # GitHub's language detection so they don't dominate PR reviews.
 backend/package-lock.json -diff linguist-generated=true linguist-vendored=true
-frontend/package-lock.json -diff linguist-generated=true linguist-vendored=true
 
 # Preserve CRLF-agnostic binary handling for common binary types that may
-# show up under backend/public or frontend assets.
+# show up under backend/public.
 *.png binary
 *.jpg binary
 *.jpeg binary
