@@ -135,6 +135,7 @@ const SCHEMA = `
     os TEXT NOT NULL,
     environment TEXT,
     base_path TEXT,
+    ref TEXT,
     components_json TEXT,
     runtime_config_json TEXT,
     current_release_id TEXT,
@@ -219,6 +220,18 @@ function ensureDeploymentColumns(db) {
 }
 
 /** Adds artifact-release columns introduced after the first F1 schema. */
+/**
+ * `deploy_targets` gained `ref` (the branch a test target rebuilds from) after
+ * the table first shipped; CREATE TABLE IF NOT EXISTS is a no-op on an existing
+ * database, so add it in place. Safe on every boot.
+ *
+ * @param {import('node:sqlite').DatabaseSync} db
+ */
+function ensureDeployTargetColumns(db) {
+  const existing = new Set(db.prepare('PRAGMA table_info(deploy_targets)').all().map((row) => row.name));
+  if (!existing.has('ref')) db.exec('ALTER TABLE deploy_targets ADD COLUMN ref TEXT');
+}
+
 function ensureReleaseColumns(db) {
   const existing = new Set(db.prepare('PRAGMA table_info(releases)').all().map((row) => row.name));
   if (!existing.has('source_identity_json')) {
@@ -295,6 +308,7 @@ function openDatabase(filePath = resolveDbFile()) {
   ensureDeploymentColumns(db);
   ensureAuditLogColumns(db);
   ensureReleaseColumns(db);
+  ensureDeployTargetColumns(db);
 
   // The database holds project configuration and the full audit trail, so it
   // should not be world-readable. SQLite creates the file with the process

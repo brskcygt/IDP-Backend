@@ -237,7 +237,7 @@ override'ı yok).
 | `source.authType` | Bitbucket: `bearer` (Access Token) \| `basic` (Atlassian e-posta `username` + API token) |
 | `source.token` | **Secret** (`artifactDeploy.source.token`): şifreli saklanır, yanıtlarda `source.hasToken` olarak döner, boş/eksik gönderilirse saklı değer korunur. Boşsa projenin `apiToken`'ı (+`username`) kullanılır |
 | `build.provider` | `pipeline` (projenin `ciConfig` + `apiToken`), `jenkins` (projenin `url` / `jobName` / `username` / `apiToken`), `none` (yalnız import) |
-| `build.parameters` | Build'e sürümle birlikte gönderilen serbest anahtar/değer (en çok 25; ad: `^[A-Za-z_][A-Za-z0-9_]*$`, değer ≤ 2000 karakter). **Sır konulmaz** (bkz. 3.4) |
+| `build.parameters` | Build'e sürümle birlikte gönderilen serbest anahtar/değer (en çok 25; ad: `^[A-Za-z_][A-Za-z0-9_]*$`, değer ≤ 2000 karakter). **Sır konulmaz** (bkz. 3.5) |
 | `versionVariable` | Build'e sürümün geçtiği değişken/parametre adı (varsayılan `VERSION`) |
 | `artifactName` | Manifest `project` ve dosya adı öneki. Varsayılan: `source.repo` (küçük harf) |
 | `components[]` | En çok 10; `name` benzersiz, `subdir` tek klasör adı (`.`/`..` değil, büyük/küçük harf duyarsız benzersiz) |
@@ -310,7 +310,22 @@ karşı doğrulanır ve build'e `COMPONENTS` parametresiyle (virgülle ayrılmı
 hiç gönderilmez, böylece bu parametreyi tanımayan bir job eskisi gibi davranır. Tek bileşenli release
 geçerlidir: deploy yalnız kurduğu bileşenin artifact'ını arar.
 
-### 3.4 Sırlar build parametresi olmaz
+### 3.4 Test sunucusu: sürümsüz dağıtım
+
+Prod'da sürüm bilerek elle verilir: kurulan şey daha önce derlenmiş, görülmüş ve adlandırılmış bir
+release'dir. Test sunucusunda bu tören anlamsız — orada istenen "branch'in şu anki hâlini kur".
+
+Hedefe (`deploy_targets.ref`) bir **branch** yazılırsa o hedef için `POST /api/targets/:id/build-and-deploy`
+açılır: IDP sürümü kendi üretir (`0.0.0-<branch>-<UTC zaman damgası>`), branch'i derletir ve derleme biter
+bitmez aynı hedefe kurar. Release kaydı yine oluşur — rollback ve "burada ne kurulu" bilgisi buna bağlı.
+
+`environment: 'Prod'` olan hedefte bu uç **reddedilir**; branch alanı da arayüzde gösterilmez.
+
+Branch build'e nasıl ulaşır: CI Pipeline sağlayıcısında `ciConfig.ref` olarak, Jenkins'te `BRANCH` build
+parametresi olarak (Jenkins'in `buildWithParameters` ucunda ref kavramı yok). Job bu parametre doluysa o
+branch'i checkout etmelidir; boşsa kendi yapılandırdığı branch'te kalır.
+
+### 3.5 Sırlar build parametresi olmaz
 
 Parametreler Jenkins'e **query string** olarak gider (`buildWithParameters?VERSION=...`) ve build log'una
 yazılır. Bir kimlik bilgisi buraya konursa hem Jenkins'in istek log'una hem konsol çıktısına düşer. Doğrusu

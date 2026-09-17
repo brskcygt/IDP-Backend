@@ -28,7 +28,7 @@ const { createArtifactDeployService } = require('./artifactDeployService');
 const { createArtifactDownloadService } = require('./artifactDownloadService');
 const { createArtifactUploadService } = require('./artifactUploadService');
 const { createLocalArtifactStore } = require('./localArtifactStore');
-const { validateArtifactStorageEnv } = require('../../config');
+const { validateArtifactStorageEnv, validateArtifactPublicUrlEnv } = require('../../config');
 const {
   persistTargetRuntimeConfig,
   resolveTargetSecrets,
@@ -77,6 +77,11 @@ const releaseService = createReleaseService({
   getProject,
   resolveSecrets,
   getGlobalBuildParameters: () => settingsService.readBuildParametersForBuild(),
+  // Lazy on purpose: the deploy service is created below and needs the release
+  // service, so this closure is what breaks the cycle.
+  // Read at call time, not at boot: the same value the HTTP layer validates, and
+  // a build that finishes hours later must see the current configuration.
+  deployRelease: (args) => artifactDeployService.deploy({ ...args, publicUrl: validateArtifactPublicUrlEnv().publicUrl }),
   isReleaseBusy: (releaseId) => artifactDeployService ? artifactDeployService.isReleaseBusy(releaseId) : false,
   deleteLocalRelease: (projectId, version) => localStore.removeReleaseSync(projectId, version),
 });
@@ -113,7 +118,6 @@ const uploadService = createArtifactUploadService({
   store: localStore,
   auditLogger,
   getProject,
-  getGlobalBuildParameters: () => settingsService.readBuildParametersForBuild(),
   isReleaseBusy: (releaseId) => artifactDeployService ? artifactDeployService.isReleaseBusy(releaseId) : false,
 });
 const downloadService = createArtifactDownloadService({ repository, tokens, getProject, resolveSecrets, localStore });

@@ -671,7 +671,7 @@ function resolveSourceCredentials(runtimeConfig, normalized) {
 // Deploy targets (one agent = one target = one project per server)
 // ---------------------------------------------------------------------------
 
-const TARGET_KEYS = ['name', 'agentId', 'os', 'environment', 'basePath', 'components', 'runtimeConfig'];
+const TARGET_KEYS = ['name', 'agentId', 'os', 'environment', 'basePath', 'ref', 'components', 'runtimeConfig'];
 const TARGET_COMPONENT_KEYS = ['name', 'runtime', 'health'];
 const AGENT_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]{2,127}$/;
 
@@ -833,6 +833,14 @@ function validateTargetInput(input, { partial = false } = {}) {
     if (input.basePath !== null && (typeof input.basePath !== 'string' || input.basePath.length > 500 || hasControlChars(input.basePath))) {
       errors.push({ path: 'basePath', message: 'Must be a string of at most 500 characters (or null).' });
     } else value.basePath = input.basePath || null;
+  }
+  if (present('ref')) {
+    // The branch a test target rebuilds from. Prod targets deliberately have no
+    // branch: there you pick a version that was already built and verified.
+    if (input.ref !== null && input.ref !== ''
+      && (typeof input.ref !== 'string' || !GIT_REF_PATTERN.test(input.ref) || input.ref.includes('..'))) {
+      errors.push({ path: 'ref', message: 'Must be a branch or tag name.' });
+    } else value.ref = input.ref || null;
   }
   if (present('components')) {
     validateTargetComponents(input.components, 'components', errors);

@@ -49,6 +49,7 @@ const createReleaseSchema = object({
   allowUnknown: false,
 });
 const importReleaseSchema = object({ fields: { version: versionRule() }, allowUnknown: false });
+const buildAndDeploySchema = object({ fields: { components: componentsRule() }, allowUnknown: false });
 const deploySchema = object({
   fields: {
     releaseId: string({ min: 1, max: 64 }),
@@ -114,6 +115,23 @@ function createArtifactRoutes({ services, getProject, auditLogger, publicUrl = n
         projectId: req.params.id,
         version: body.value.version,
         ref: body.value.ref,
+        components: body.value.components,
+        triggeredBy: actor(req),
+      });
+      res.status(202).json({ release, deploymentId, sseUrl: `/api/deploy/logs/${deploymentId}` });
+    } catch (err) {
+      sendError(res, err);
+    }
+  });
+
+  // Test-server flow: rebuild the target's branch and install it there, with no
+  // version to invent. Refused for production targets — see releaseService.buildAndDeploy.
+  api.post('/api/targets/:id/build-and-deploy', requirePermission('release:create'), ...trigger, async (req, res) => {
+    const body = validate(req.body ?? {}, buildAndDeploySchema);
+    if (!body.valid) return invalid(res, 'Invalid build request.', body);
+    try {
+      const { release, deploymentId } = await releaseService.buildAndDeploy({
+        targetId: req.params.id,
         components: body.value.components,
         triggeredBy: actor(req),
       });

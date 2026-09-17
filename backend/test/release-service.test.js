@@ -105,6 +105,7 @@ function setup({
   manifestFor = (v) => makeManifest(v),
   isReleaseBusy = () => false,
   deleteLocalRelease = null,
+  deployRelease = null,
 } = {}) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'idp-release-'));
   const db = openDatabase(path.join(dir, 'test.db'));
@@ -133,6 +134,7 @@ function setup({
     },
     isReleaseBusy,
     deleteLocalRelease,
+    deployRelease,
     timing: { manifestRetryMs: 1 },
   });
   return {
@@ -480,7 +482,11 @@ test('defaultCreateBuildAdapter: pipeline gets extraVariables + ref, jenkins get
   assert.ok(jenkins.adapter instanceof JenkinsAdapter);
   assert.deepEqual(jenkins.triggerParams, { VERSION: '2.5.0' });
 
-  assert.throws(() => defaultCreateBuildAdapter({ provider: 'jenkins', config, version: '2.5.0', versionVariable: 'VERSION', ref: 'x' }), ValidationError);
+  // Jenkins has no ref in buildWithParameters, so a branch travels as a parameter
+  // the job checks out. It used to be refused outright, which left test targets
+  // (whose whole point is "build this branch") unable to use the provider.
+  const jenkinsOnBranch = defaultCreateBuildAdapter({ provider: 'jenkins', config, version: '2.5.0', versionVariable: 'VERSION', ref: 'test' });
+  assert.deepEqual(jenkinsOnBranch.triggerParams, { BRANCH: 'test', VERSION: '2.5.0' });
   assert.throws(() => defaultCreateBuildAdapter({ provider: 'none', config, version: '2.5.0', versionVariable: 'VERSION' }), ValidationError);
   assert.throws(
     () => defaultCreateBuildAdapter({ provider: 'pipeline', config: { ciConfig: {} }, version: '2.5.0', versionVariable: 'VERSION' }),
@@ -505,6 +511,41 @@ test('createRelease: a component subset travels to the build, the whole project 
     await assert.rejects(
       () => env.service.createRelease({ projectId: 'p1', version: '2.5.2', components: ['nope'], triggeredBy: 'baris' }),
       (err) => err instanceof ValidationError && /Unknown component/.test(err.message),
+    );
+  } finally {
+    env.cleanup();
+  }
+});
+
+test('buildAndDeploy: rebuilds a test target branch and installs it; production is refused', async () => {
+  const installed = [];
+  const env = setup({ deployRelease: async (args) => { installed.push(args); } });
+  try {
+    const target = env.repository.createTarget({
+      projectId: 'p1', name: 'TEMSA-TEST', agentId: 'TEMSA-TEST-01', os: 'windows', environment: 'Dev', ref: 'test',
+    });
+    const { release } = await env.service.buildAndDeploy({ targetId: target.id, triggeredBy: 'baris' });
+    // Generated, and shaped so nobody mistakes it for a version someone picked.
+    assert.match(release.version, /^0\.0\.0-test\.\d{14}$/);
+    assert.equal(env.buildArgs[0].ref, 'test');
+    await env.service.waitForBuild(release.id);
+
+    assert.deepEqual(installed, [{ targetId: target.id, releaseId: release.id, components: undefined, triggeredBy: 'baris' }]);
+
+    const prod = env.repository.createTarget({
+      projectId: 'p1', name: 'TEMSA-PROD', agentId: 'TEMSA-PROD-01', os: 'windows', environment: 'Prod', ref: 'main',
+    });
+    await assert.rejects(
+      () => env.service.buildAndDeploy({ targetId: prod.id, triggeredBy: 'baris' }),
+      (err) => err instanceof ValidationError && /named release/.test(err.message),
+    );
+
+    const noBranch = env.repository.createTarget({
+      projectId: 'p1', name: 'NO-BRANCH', agentId: 'NO-BRANCH-01', os: 'windows', environment: 'Dev',
+    });
+    await assert.rejects(
+      () => env.service.buildAndDeploy({ targetId: noBranch.id, triggeredBy: 'baris' }),
+      (err) => err instanceof ValidationError && /no branch/i.test(err.message),
     );
   } finally {
     env.cleanup();

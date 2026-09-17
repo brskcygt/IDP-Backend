@@ -32,6 +32,22 @@ const { mergeBuildParameters } = require('../deployment/buildParameters');
 const MANIFEST_ATTEMPTS = 3;
 /** Build parameter naming the subset being built (see createRelease). */
 const COMPONENTS_VARIABLE = 'COMPONENTS';
+/** Build parameter carrying the branch for providers without a ref concept. */
+const BRANCH_VARIABLE = 'BRANCH';
+
+/**
+ * A version for a build nobody named: `0.0.0-<branch>.<utc timestamp>`.
+ *
+ * 0.0.0 keeps it visibly below any real version, the branch says where it came
+ * from and the timestamp makes it unique — two test deploys a minute apart must
+ * not collide on an immutable release row. Branch characters outside the
+ * version pattern (slashes in `feature/x`) become dashes.
+ */
+function generateVersion(ref, now = new Date()) {
+  const branch = String(ref).replace(/[^0-9A-Za-z._-]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 24) || 'branch';
+  const stamp = now.toISOString().replace(/[-:T]/g, '').replace(/\..+$/, '');
+  return `0.0.0-${branch}.${stamp}`;
+}
 
 /**
  * @param {string[]|undefined|null} requested
@@ -78,7 +94,9 @@ function defaultCreateBuildAdapter({ provider, config, version, versionVariable,
     }
   }
   if (provider === 'jenkins') {
-    if (ref) throw new ValidationError('A ref override is only supported by the pipeline build provider.');
+    // Jenkins has no ref concept in buildWithParameters, so the branch travels as
+    // a parameter the job checks out (see the BRANCH parameter in jetsrm's
+    // Jenkinsfile). Empty means the job's own configured branch, as before.
     if (!config.url || !config.jobName) {
       throw new ValidationError("The Jenkins build provider needs the project's url and jobName.");
     }
@@ -89,7 +107,7 @@ function defaultCreateBuildAdapter({ provider, config, version, versionVariable,
       apiToken: config.apiToken,
       jobName: config.jobName,
     });
-    return { adapter, triggerParams: { ...parameters, [versionVariable]: version } };
+    return { adapter, triggerParams: { ...parameters, ...(ref ? { [BRANCH_VARIABLE]: ref } : {}), [versionVariable]: version } };
   }
   throw new ValidationError(`Build provider '${provider}' does not build — import the release instead.`);
 }
@@ -129,6 +147,9 @@ function createReleaseService({
   // Defaults every project's build inherits (settings service). A function, not
   // a value: the settings can change between two builds of the same server.
   getGlobalBuildParameters = () => null,
+  // Installs a finished release on a target. Injected rather than imported: the
+  // deploy service is built in the same module and would otherwise be a cycle.
+  deployRelease = null,
   createSourceClient = defaultCreateSourceClient,
   isReleaseBusy = () => false,
   deleteLocalRelease = null,
@@ -232,7 +253,28 @@ function createReleaseService({
     return repository.updateRelease(release.id, { status: 'failed', error: String(err && err.message ? err.message : err).slice(0, 2000) });
   }
 
-  async function runBuild({ project, runtimeProject, release, adapter, triggerParams, deploymentId, triggeredBy, provider }) {
+  /**
+   * Hands a freshly built release to the deploy service. Failures are logged
+   * into the build's own stream and never re-thrown: the release IS ready at
+   * this point, and marking the build failed because the install did not start
+   * would misreport what happened.
+   */
+  async function deployAfterBuild({ release, deployTo, triggeredBy, log }) {
+    if (!deployTo || typeof deployRelease !== 'function') return;
+    try {
+      log(`[Release] → Installing ${release.version} on target ${deployTo.targetId}...`);
+      await deployRelease({
+        targetId: deployTo.targetId,
+        releaseId: release.id,
+        components: deployTo.components,
+        triggeredBy,
+      });
+    } catch (err) {
+      log(`[Release] ✗ Release ${release.version} is ready but the deployment could not start: ${err.message}`);
+    }
+  }
+
+  async function runBuild({ project, runtimeProject, release, adapter, triggerParams, deploymentId, triggeredBy, provider, deployTo }) {
     const startedAt = Date.now();
     const log = (line) => deploymentManager.pushLog(deploymentId, line);
     const throwIfAborted = () => {
@@ -262,6 +304,7 @@ function createReleaseService({
       }
       log(`[Release] ✓ Release ${ready.version} is ready (${artifacts.length} artifact(s)).`);
       deploymentManager.setStatus(deploymentId, 'succeeded');
+      await deployAfterBuild({ release: ready, deployTo, triggeredBy, log });
       auditLogger.log(triggeredBy, 'RELEASE_BUILD_SUCCEEDED', `Release ${release.version} built for project: ${project.name}`, {
         projectId: project.id,
         releaseId: release.id,
@@ -329,7 +372,7 @@ function createReleaseService({
      * @param {{ projectId: string, version: string, ref?: string, triggeredBy?: string }} args
      * @returns {Promise<{ release: object, deploymentId: string }>}
      */
-    async createRelease({ projectId, version, ref, components, triggeredBy }) {
+    async createRelease({ projectId, version, ref, components, deployTo, triggeredBy }) {
       const project = getProject(projectId);
       requireVersion(version);
       if (ref !== undefined && ref !== null && ref !== '') {
@@ -407,10 +450,43 @@ function createReleaseService({
           `(the build receives ${config.versionVariable}=${version}).`
       );
 
-      const promise = runBuild({ project, runtimeProject, release, adapter, triggerParams, deploymentId, triggeredBy, provider })
+      const promise = runBuild({ project, runtimeProject, release, adapter, triggerParams, deploymentId, triggeredBy, provider, deployTo })
         .finally(() => pending.delete(release.id));
       pending.set(release.id, promise);
       return { release, deploymentId };
+    },
+
+    /**
+     * Test-server flow: rebuild the target's branch and install the result on
+     * that target, without asking anyone to invent a version.
+     *
+     * A version is still cut — the deploy path, rollback and "what is installed
+     * here" all key off a release row — but it is generated, and its shape says
+     * plainly that it is not a hand-picked one: `0.0.0-<branch>.<timestamp>`.
+     *
+     * Production is excluded on purpose: there a version is the whole point.
+     * You deploy something that was built, seen and named earlier, not whatever
+     * the branch happens to hold right now.
+     *
+     * @param {{ targetId: string, components?: string[], triggeredBy?: string }} args
+     */
+    async buildAndDeploy({ targetId, components, triggeredBy }) {
+      const target = repository.findTarget(targetId);
+      if (!target) throw new NotFoundError('Deploy target not found');
+      if (!target.ref) {
+        throw new ValidationError("This target has no branch configured — set one, or pick a release from the Deploy screen.");
+      }
+      if (target.environment === 'Prod') {
+        throw new ValidationError('A production target deploys a named release, not the current state of a branch.');
+      }
+      return this.createRelease({
+        projectId: target.projectId,
+        version: generateVersion(target.ref),
+        ref: target.ref,
+        components,
+        deployTo: { targetId: target.id, components },
+        triggeredBy,
+      });
     },
 
     /**
