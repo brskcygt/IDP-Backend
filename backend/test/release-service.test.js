@@ -162,9 +162,11 @@ test('createRelease: build succeeds → manifest ingested → release ready', as
       'frontend/any/jetsrm-frontend-2.5.0.tar.gz',
     ]);
 
-    // The version reaches the build server-side, under the configured variable name.
+    // The version reaches the build server-side, under the configured variable
+    // name, alongside the merged build parameters (none configured here).
     assert.deepEqual(env.buildArgs, [{
       provider: 'pipeline', config: env.project.config, version: '2.5.0', versionVariable: 'RELEASE_VERSION', ref: null,
+      parameters: { RELEASE_VERSION: '2.5.0' },
     }]);
     assert.deepEqual(env.adapter.calls, ['connect', ['trigger', { RELEASE_VERSION: '2.5.0' }]]);
     assert.deepEqual(env.client.asked, [{ artifactName: 'jetsrm', version: '2.5.0' }]);

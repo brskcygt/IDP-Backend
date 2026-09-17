@@ -22,6 +22,7 @@ const { UpstreamError } = require('../errors');
 const contracts = require('./contracts');
 const { createDownloadTokenService } = require('./downloadTokens');
 const { createReleaseService } = require('./releaseService');
+const { settingsService } = require('../settings');
 const { createTargetService } = require('./targetService');
 const { createArtifactDeployService } = require('./artifactDeployService');
 const { createArtifactDownloadService } = require('./artifactDownloadService');
@@ -75,6 +76,7 @@ const releaseService = createReleaseService({
   auditLogger,
   getProject,
   resolveSecrets,
+  getGlobalBuildParameters: () => settingsService.readBuildParametersForBuild(),
   isReleaseBusy: (releaseId) => artifactDeployService ? artifactDeployService.isReleaseBusy(releaseId) : false,
   deleteLocalRelease: (projectId, version) => localStore.removeReleaseSync(projectId, version),
 });
@@ -111,6 +113,7 @@ const uploadService = createArtifactUploadService({
   store: localStore,
   auditLogger,
   getProject,
+  getGlobalBuildParameters: () => settingsService.readBuildParametersForBuild(),
   isReleaseBusy: (releaseId) => artifactDeployService ? artifactDeployService.isReleaseBusy(releaseId) : false,
 });
 const downloadService = createArtifactDownloadService({ repository, tokens, getProject, resolveSecrets, localStore });

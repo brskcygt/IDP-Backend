@@ -23,7 +23,8 @@
 /** @typedef {'admin'|'deployer'|'viewer'} Role */
 /**
  * @typedef {'project:read'|'project:write'|'project:delete'|'deploy:trigger'|
- *   'deploy:abort'|'release:create'|'release:delete'|'vpn:manage'|'audit:read'|'user:manage'} Action
+ *   'deploy:abort'|'release:create'|'release:delete'|'vpn:manage'|'audit:read'|'user:manage'|
+ *   'settings:read'|'settings:write'} Action
  */
 
 const ROLES = Object.freeze({
@@ -48,6 +49,10 @@ const ROLE_RANK = Object.freeze({
 const ACTION_MIN_ROLE = Object.freeze({
   'project:read': ROLES.VIEWER,
   'audit:read': ROLES.VIEWER,
+  // Server-wide build parameters: everyone may see what a build will receive
+  // (they show up in the build log anyway), only an admin may change them —
+  // they are inputs to commands that run on customer servers.
+  'settings:read': ROLES.VIEWER,
   'deploy:trigger': ROLES.DEPLOYER,
   'deploy:abort': ROLES.DEPLOYER,
   // Artifact deploy: cutting/importing a release (build + manifest ingest) is
@@ -56,6 +61,7 @@ const ACTION_MIN_ROLE = Object.freeze({
   'release:delete': ROLES.ADMIN,
   'project:write': ROLES.ADMIN,
   'project:delete': ROLES.ADMIN,
+  'settings:write': ROLES.ADMIN,
   'vpn:manage': ROLES.ADMIN,
   'user:manage': ROLES.ADMIN,
 });

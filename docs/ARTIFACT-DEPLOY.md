@@ -237,6 +237,7 @@ override'ı yok).
 | `source.authType` | Bitbucket: `bearer` (Access Token) \| `basic` (Atlassian e-posta `username` + API token) |
 | `source.token` | **Secret** (`artifactDeploy.source.token`): şifreli saklanır, yanıtlarda `source.hasToken` olarak döner, boş/eksik gönderilirse saklı değer korunur. Boşsa projenin `apiToken`'ı (+`username`) kullanılır |
 | `build.provider` | `pipeline` (projenin `ciConfig` + `apiToken`), `jenkins` (projenin `url` / `jobName` / `username` / `apiToken`), `none` (yalnız import) |
+| `build.parameters` | Build'e sürümle birlikte gönderilen serbest anahtar/değer (en çok 25; ad: `^[A-Za-z_][A-Za-z0-9_]*$`, değer ≤ 2000 karakter). **Sır konulmaz** (bkz. 3.4) |
 | `versionVariable` | Build'e sürümün geçtiği değişken/parametre adı (varsayılan `VERSION`) |
 | `artifactName` | Manifest `project` ve dosya adı öneki. Varsayılan: `source.repo` (küçük harf) |
 | `components[]` | En çok 10; `name` benzersiz, `subdir` tek klasör adı (`.`/`..` değil, büyük/küçük harf duyarsız benzersiz) |
@@ -286,13 +287,38 @@ JetSRM örneği (Sequelize, 440 migration, uygulama açılışta migrate etmez):
 > almayacak şekilde ayrı yayınlayın (ör. önce yalnız migration içeren bir sürüm, sonra kod). IDP şemayı geri
 > almaz (`db:migrate:undo` çalıştırılmaz).
 
+### 3.3 Build parametreleri
+
+Build'e yalnız sürüm gidiyordu; geri kalan her şey CI aracına elle giriliyordu. Declarative bir Jenkins
+pipeline'ında bu sürdürülebilir değil: `parameters { }` bloğu job'ın parametre tanımlarını **her koşuda**
+üzerine yazar, yani arayüzden verilen varsayılan bir sonraki build'de kaybolur.
+
+İki katman var, sonraki öncekini ezer:
+
+1. **Global varsayılanlar** — `settings` tablosunda `buildParameters` anahtarı, arayüzde sidebar → Settings.
+   Okuma `settings:read` (viewer), yazma `settings:write` (admin).
+2. **Proje parametreleri** — `artifactDeploy.build.parameters`, proje ayarları → Artifact Deploy
+   (`project:write`, yani admin).
+3. `versionVariable` **her zaman** en son yazılır: bir proje onu gölgeleyip kimsenin istemediği bir sürüm
+   yayınlayamaz.
+
+Release'i tetikleyen kullanıcı (deployer) parametre gönderemez — deploy'da olduğu gibi burada da gerekçe
+aynı: bu değerler müşteri sunucusunda komut çalıştıran bir build'in girdisi.
+
+### 3.4 Sırlar build parametresi olmaz
+
+Parametreler Jenkins'e **query string** olarak gider (`buildWithParameters?VERSION=...`) ve build log'una
+yazılır. Bir kimlik bilgisi buraya konursa hem Jenkins'in istek log'una hem konsol çıktısına düşer. Doğrusu
+sırrı CI aracının credential deposunda tutup buradan yalnız **id'sini** geçmektir (ör.
+`POSTHOG_CREDENTIAL_ID=posthog-cli-api-key`).
+
 ## 4. Build job sözleşmesi
 
 Build job'ı (CI Pipeline, GitHub Actions ya da Jenkins):
 
 1. Sürümü `versionVariable` (vars. `VERSION`) değişkeninden/parametresinden okur. IDP bu değeri **sunucu
    tarafında** enjekte eder (CI Pipeline: `extraVariables`; Jenkins: build parametresi). Deploy eden kullanıcı
-   değişken gönderemez.
+   değişken gönderemez. Sürümün yanında global + proje **build parametreleri** de aynı yoldan gider (bkz. 3.3).
 2. Her bileşen için `<artifactName>-<component>-<version>[-<os>].tar.gz` üretir (dosya adı serbest ama
    manifest'teki `file` ile aynı olmalı). Arşiv kökü = bileşen klasörü.
 3. `<artifactName>-<version>-manifest.json` üretir (sha256 + boyut).

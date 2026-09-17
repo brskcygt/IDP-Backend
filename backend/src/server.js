@@ -34,6 +34,7 @@ const { sendError } = require('./http/errorMapper');
 // Artifact deploy (releases → deploy targets). HTTP-only: the desktop IPC
 // shell does not load it — see docs/ARTIFACT-DEPLOY.md.
 const artifactServices = require('./core/artifacts');
+const { settingsService, SettingsValidationError } = require('./core/settings');
 const { createArtifactRoutes } = require('./routes/artifacts');
 
 const app = express();
@@ -268,6 +269,26 @@ app.post('/api/projects/:id/settings', requirePermission('project:write'), async
     const updated = await projectService.updateProjectConfig(id, req.body, req.session?.user?.username);
     res.json(updated);
   } catch (err) {
+    sendError(res, err);
+  }
+});
+
+// Server-wide build parameters: the key/value map every project's release build
+// inherits (a project's own parameters win). Read is open to any signed-in role
+// because these values end up in the build log regardless; writing is admin-only,
+// since they are inputs to a build that runs commands on customer servers — the
+// same reason deploy-time callers cannot supply them.
+app.get('/api/settings/build-parameters', requirePermission('settings:read'), (req, res) => {
+  res.json(settingsService.getBuildParameters());
+});
+
+app.put('/api/settings/build-parameters', requirePermission('settings:write'), (req, res) => {
+  try {
+    res.json(settingsService.updateBuildParameters(req.body?.parameters, req.session?.user?.username));
+  } catch (err) {
+    if (err instanceof SettingsValidationError) {
+      return res.status(400).json({ error: err.message, details: err.details });
+    }
     sendError(res, err);
   }
 });

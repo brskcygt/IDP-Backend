@@ -10,6 +10,8 @@
  * Nothing here performs I/O.
  */
 
+const { normalizeBuildParameters, validateBuildParameters } = require('../deployment/buildParameters');
+
 const VERSION_PATTERN = /^[0-9A-Za-z][0-9A-Za-z._-]{0,63}$/;
 const COMPONENT_NAME_PATTERN = /^[a-z][a-z0-9-]{0,31}$/;
 const ARTIFACT_OS_VALUES = ['any', 'win-x64', 'linux-x64'];
@@ -250,7 +252,7 @@ function manifestFileName(artifactName, version) {
 
 const ARTIFACT_DEPLOY_KEYS = ['source', 'build', 'versionVariable', 'artifactName', 'components'];
 const SOURCE_KEYS = ['platform', 'owner', 'repo', 'baseUrl', 'authType', 'username', 'token', 'hasToken'];
-const BUILD_KEYS = ['provider'];
+const BUILD_KEYS = ['provider', 'parameters'];
 const COMPONENT_KEYS = ['name', 'subdir', 'os', 'runtime', 'preserve', 'health', 'writeRuntimeConfig', 'hooks'];
 const RUNTIME_KEYS = ['type', 'serviceName', 'appPool'];
 const HEALTH_KEYS = ['url', 'expectVersionPath', 'timeoutSec'];
@@ -501,6 +503,7 @@ function validateArtifactDeployConfig(value, path = 'artifactDeploy') {
     } else {
       errors.push(...unknownKeyErrors(value.build, BUILD_KEYS, buildPath));
       optionalEnum(value.build.provider, BUILD_PROVIDERS, childPath(buildPath, 'provider'), errors);
+      errors.push(...validateBuildParameters(value.build.parameters, childPath(buildPath, 'parameters')));
     }
   }
   optionalPatternString(value.versionVariable, VARIABLE_KEY_PATTERN, 100, childPath(path, 'versionVariable'), errors);
@@ -608,7 +611,12 @@ function normalizeArtifactDeployConfig(raw) {
       authType: platform === 'bitbucket' && source.authType === 'basic' ? 'basic' : 'bearer',
       username: trimmed(source.username),
     },
-    build: { provider: BUILD_PROVIDERS.includes(build.provider) ? build.provider : 'none' },
+    build: {
+      provider: BUILD_PROVIDERS.includes(build.provider) ? build.provider : 'none',
+      // null rather than {} so a project without parameters stays indistinguishable
+      // from one whose last entry was removed.
+      parameters: normalizeBuildParameters(build.parameters),
+    },
     versionVariable: trimmed(raw.versionVariable) || 'VERSION',
     artifactName,
     components: Array.isArray(raw.components) ? raw.components.filter(isPlainObject).map(normalizeComponent) : [],

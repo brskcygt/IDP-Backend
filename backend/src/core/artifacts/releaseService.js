@@ -27,10 +27,17 @@ const {
   validateManifest,
   manifestFileName,
 } = require('./contracts');
+const { mergeBuildParameters } = require('../deployment/buildParameters');
 
 const MANIFEST_ATTEMPTS = 3;
 
-function defaultCreateBuildAdapter({ provider, config, version, versionVariable, ref }) {
+/**
+ * `parameters` is the merged build-parameter map (global defaults + the
+ * project's own, version last). It reaches the build as CI variables /
+ * job parameters — see core/deployment/buildParameters.js for why secrets
+ * must not travel this way.
+ */
+function defaultCreateBuildAdapter({ provider, config, version, versionVariable, ref, parameters = {} }) {
   // Required lazily: keeps this module (and its tests) free of adapter
   // dependencies until a real build runs.
   if (provider === 'pipeline') {
@@ -42,7 +49,7 @@ function defaultCreateBuildAdapter({ provider, config, version, versionVariable,
         ciConfig,
         username: config.username,
         apiToken: config.apiToken,
-        extraVariables: { [versionVariable]: version },
+        extraVariables: { ...parameters, [versionVariable]: version },
       });
       return { adapter, triggerParams: {} };
     } catch (err) {
@@ -61,7 +68,7 @@ function defaultCreateBuildAdapter({ provider, config, version, versionVariable,
       apiToken: config.apiToken,
       jobName: config.jobName,
     });
-    return { adapter, triggerParams: { [versionVariable]: version } };
+    return { adapter, triggerParams: { ...parameters, [versionVariable]: version } };
   }
   throw new ValidationError(`Build provider '${provider}' does not build — import the release instead.`);
 }
@@ -98,6 +105,9 @@ function createReleaseService({
   getProject,
   resolveSecrets,
   createBuildAdapter = defaultCreateBuildAdapter,
+  // Defaults every project's build inherits (settings service). A function, not
+  // a value: the settings can change between two builds of the same server.
+  getGlobalBuildParameters = () => null,
   createSourceClient = defaultCreateSourceClient,
   isReleaseBusy = () => false,
   deleteLocalRelease = null,
@@ -320,6 +330,15 @@ function createReleaseService({
         version,
         versionVariable: config.versionVariable,
         ref: ref || null,
+        // Nothing the caller sent reaches the build: the parameters come from
+        // the project's config (project:write) and the global defaults, which
+        // is what keeps a deployer from injecting build inputs.
+        parameters: mergeBuildParameters(
+          getGlobalBuildParameters(),
+          config.build.parameters,
+          config.versionVariable,
+          version,
+        ),
       });
 
       let release;

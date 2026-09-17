@@ -172,6 +172,17 @@ const SCHEMA = `
   );
 
   CREATE INDEX IF NOT EXISTS idx_artifact_download_tokens_deployment_id ON artifact_download_tokens (deployment_id);
+
+  -- Server-wide settings, one JSON document per key (currently only
+  -- 'buildParameters'). Deliberately not a column per setting: these are
+  -- operator-edited documents, not queried fields, and a new setting should
+  -- not need a migration. Secrets never live here — the table is plain text.
+  CREATE TABLE IF NOT EXISTS settings (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL,
+    updated_at TEXT,
+    updated_by TEXT
+  );
 `;
 
 /**
