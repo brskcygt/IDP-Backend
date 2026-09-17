@@ -1,6 +1,9 @@
 const DeploymentAdapter = require('./DeploymentAdapter');
 const { assertTriggerResult } = DeploymentAdapter;
 const { jenkinsJobPath } = require('./jenkinsPaths');
+const { consoleLines } = require('./jenkinsConsole');
+const { buildPercent } = require('./jenkinsProgress');
+const { formatEventLine, BUILD_PROGRESS_EVENT } = require('../core/deployment/progressEvents');
 const axios = require('axios');
 
 /**
@@ -175,6 +178,7 @@ class JenkinsAdapter extends DeploymentAdapter {
 
     const jobPath = jenkinsJobPath(this.config.jobName);
     let textOffset = 0;
+    let reportedPercent = null;
 
     while (!this.aborted) {
       try {
@@ -193,8 +197,8 @@ class JenkinsAdapter extends DeploymentAdapter {
         const moreData = res.headers['x-more-data'] === 'true';
 
         if (text && text.length > 0 && newOffset > textOffset) {
-          const lines = text.toString().split('\n').filter(l => l.length > 0);
-          for (const line of lines) {
+          // consoleLines drops Jenkins' ConsoleNote markers (see jenkinsConsole.js).
+          for (const line of consoleLines(text.toString())) {
             callback(`[Jenkins] ${line}`);
           }
           textOffset = newOffset;
@@ -204,9 +208,26 @@ class JenkinsAdapter extends DeploymentAdapter {
         const statusRes = await this.client.get(`${jobPath}/${this.buildNumber}/api/json`);
         const buildInfo = statusRes.data;
 
+        // 2b. Report an elapsed-vs-estimate percentage so the UI can show a
+        // real bar instead of an indeterminate one. Only on change, otherwise
+        // this would emit an event on every 1.5 s poll.
+        const percent = buildPercent(buildInfo);
+        if (percent !== null && percent !== reportedPercent) {
+          reportedPercent = percent;
+          callback(formatEventLine(BUILD_PROGRESS_EVENT, {
+            stage: 'building',
+            status: 'progress',
+            progress: percent,
+            message: `Build #${this.buildNumber} — estimated ${Math.round(buildInfo.estimatedDuration / 1000)}s`
+          }));
+        }
+
         // If the build is no longer running and no more data is available in the progressive log stream
         if (buildInfo.building === false && !moreData) {
           if (buildInfo.result === 'SUCCESS') {
+            callback(formatEventLine(BUILD_PROGRESS_EVENT, {
+              stage: 'building', status: 'done', progress: 100, message: `Build #${this.buildNumber} finished`
+            }));
             callback(`[Jenkins] Build #${this.buildNumber} finished with status: SUCCESS`);
             return;
           } else {

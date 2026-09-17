@@ -1,4 +1,5 @@
 const deploymentRepository = require('../store/deploymentRepository');
+const { formatEventLine } = require('../core/deployment/progressEvents');
 
 const TERMINAL_STATUSES = ['succeeded', 'failed', 'aborted'];
 
@@ -223,7 +224,7 @@ class DeploymentManager {
    * Push a structured event to a session. Sent via SSE as a special log line.
    */
   pushEvent(deploymentId, eventType, payload) {
-    this.pushLog(deploymentId, `__EVENT__:${JSON.stringify({ type: eventType, payload })}`);
+    this.pushLog(deploymentId, formatEventLine(eventType, payload));
   }
 
   /**
