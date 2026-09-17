@@ -220,3 +220,26 @@ test('keyManager.describeKeyStatus never exposes the key value', () => {
     else process.env.IDP_SECRET_KEY = original;
   }
 });
+
+test('concurrent set() calls all land on disk (temp-name collision regression)', async () => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'idp-secret-store-concurrent-'));
+  try {
+    const filePath = path.join(dir, 'secrets.enc.json');
+    const key = crypto.randomBytes(32);
+    const store = new FileSecretStore({ filePath, key });
+    const keys = Array.from({ length: 24 }, (_, index) => `secret://p1/runtimeConfig.KEY_${index}`);
+
+    // Saving a target's runtime config persists every key at once: before the fix
+    // two writes in the same millisecond shared one temp file, and the loser's
+    // rename failed with ENOENT.
+    await Promise.all(keys.map((name, index) => store.set(name, `value-${index}`)));
+
+    const reopened = new FileSecretStore({ filePath, key });
+    for (const [index, name] of keys.entries()) {
+      assert.equal(await reopened.get(name), `value-${index}`);
+    }
+    assert.deepEqual((await fs.readdir(dir)).filter((entry) => entry.endsWith('.tmp')), []);
+  } finally {
+    await fs.rm(dir, { recursive: true, force: true });
+  }
+});

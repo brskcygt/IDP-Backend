@@ -78,6 +78,8 @@ class FileSecretStore extends SecretStore {
     /** @type {Object<string, EncryptedRecord>|null} */
     this._cache = null;
     this._loadPromise = null;
+    /** Serializes _writeCache() calls; see _persist(). @type {Promise<void>|null} */
+    this._persistQueue = null;
   }
 
   /**
@@ -153,12 +155,29 @@ class FileSecretStore extends SecretStore {
     return true;
   }
 
-  /** Writes `this._cache` to disk atomically (temp file + rename). */
+  /**
+   * Writes `this._cache` to disk atomically (temp file + rename).
+   *
+   * Saving a target's runtime config persists one secret per key, so a dozen
+   * set() calls run concurrently. Two guards make that safe:
+   *   - a random suffix in the temp name — pid+timestamp alone collided when
+   *     two writes landed in the same millisecond, and the loser's rename then
+   *     failed with ENOENT because the winner had already moved the file away;
+   *   - a promise chain, so writes of the same cache never interleave.
+   */
   async _persist() {
+    this._persistQueue = (this._persistQueue || Promise.resolve())
+      .catch(() => {})
+      .then(() => this._writeCache());
+    return this._persistQueue;
+  }
+
+  async _writeCache() {
     const dir = path.dirname(this._filePath);
     await fsp.mkdir(dir, { recursive: true });
 
-    const tmpPath = path.join(dir, `.${path.basename(this._filePath)}.${process.pid}.${Date.now()}.tmp`);
+    const unique = `${process.pid}.${Date.now()}.${crypto.randomBytes(6).toString('hex')}`;
+    const tmpPath = path.join(dir, `.${path.basename(this._filePath)}.${unique}.tmp`);
     const data = JSON.stringify(this._cache, null, 2);
     try {
       await fsp.writeFile(tmpPath, data, { mode: FILE_MODE });
