@@ -263,12 +263,23 @@ function createReleaseService({
     if (!deployTo || typeof deployRelease !== 'function') return;
     try {
       log(`[Release] → Installing ${release.version} on target ${deployTo.targetId}...`);
-      await deployRelease({
+      const run = await deployRelease({
         targetId: deployTo.targetId,
         releaseId: release.id,
         components: deployTo.components,
         triggeredBy,
       });
+      // The install runs as its own deployment with its own log stream, so the
+      // build's stream would otherwise end here and leave "did it actually get
+      // installed?" answerable only by hunting for the other run.
+      const deploymentId = run && run.deploymentId;
+      if (deploymentId) {
+        log(`[Release] → Deployment ${deploymentId} is installing it; its stages stream there.`);
+        deploymentManager.pushLog(
+          deploymentId,
+          `[Release] This deployment installs ${release.version}, built by ${release.buildDeploymentId || 'this release'}.`,
+        );
+      }
     } catch (err) {
       log(`[Release] ✗ Release ${release.version} is ready but the deployment could not start: ${err.message}`);
     }
