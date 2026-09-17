@@ -40,7 +40,12 @@ const versionRule = () => string({ min: 1, max: 64, pattern: VERSION_PATTERN });
 const componentsRule = () => optional(array({ max: 10, of: string({ min: 1, max: 32, pattern: COMPONENT_NAME_PATTERN }) }));
 
 const createReleaseSchema = object({
-  fields: { version: versionRule(), ref: optional(string({ max: 255 })) },
+  // `components` narrows WHAT is built, not HOW: the names are validated against
+  // the project's configured components, so a caller can only ever ask for a
+  // subset of what an admin already declared. That is the same kind of choice as
+  // picking the version, which is why it is allowed at release:create level
+  // while free-form build inputs still are not.
+  fields: { version: versionRule(), ref: optional(string({ max: 255 })), components: componentsRule() },
   allowUnknown: false,
 });
 const importReleaseSchema = object({ fields: { version: versionRule() }, allowUnknown: false });
@@ -109,6 +114,7 @@ function createArtifactRoutes({ services, getProject, auditLogger, publicUrl = n
         projectId: req.params.id,
         version: body.value.version,
         ref: body.value.ref,
+        components: body.value.components,
         triggeredBy: actor(req),
       });
       res.status(202).json({ release, deploymentId, sseUrl: `/api/deploy/logs/${deploymentId}` });

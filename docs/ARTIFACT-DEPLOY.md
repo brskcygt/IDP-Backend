@@ -305,6 +305,11 @@ pipeline'ında bu sürdürülebilir değil: `parameters { }` bloğu job'ın para
 Release'i tetikleyen kullanıcı (deployer) parametre gönderemez — deploy'da olduğu gibi burada da gerekçe
 aynı: bu değerler müşteri sunucusunda komut çalıştıran bir build'in girdisi.
 
+Ayrıca release oluştururken **hangi bileşenlerin derleneceği** seçilebilir. Seçim proje bileşen adlarına
+karşı doğrulanır ve build'e `COMPONENTS` parametresiyle (virgülle ayrılmış) gider; hepsi seçiliyse parametre
+hiç gönderilmez, böylece bu parametreyi tanımayan bir job eskisi gibi davranır. Tek bileşenli release
+geçerlidir: deploy yalnız kurduğu bileşenin artifact'ını arar.
+
 ### 3.4 Sırlar build parametresi olmaz
 
 Parametreler Jenkins'e **query string** olarak gider (`buildWithParameters?VERSION=...`) ve build log'una

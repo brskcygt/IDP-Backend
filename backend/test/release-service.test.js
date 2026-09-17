@@ -487,3 +487,26 @@ test('defaultCreateBuildAdapter: pipeline gets extraVariables + ref, jenkins get
     (err) => err instanceof ValidationError && /incomplete/.test(err.message)
   );
 });
+
+test('createRelease: a component subset travels to the build, the whole project does not', async () => {
+  const env = setup();
+  try {
+    const narrowed = await env.service.createRelease({ projectId: 'p1', version: '2.5.0', components: ['frontend'], triggeredBy: 'baris' });
+    await env.service.waitForBuild(narrowed.release.id);
+    // Comma-separated so a job can split it without parsing JSON.
+    assert.equal(env.buildArgs[0].parameters.COMPONENTS, 'frontend');
+
+    // Asking for every component is not a narrowed build: the parameter stays
+    // absent so a job that ignores it behaves exactly as before.
+    const whole = await env.service.createRelease({ projectId: 'p1', version: '2.5.1', components: ['backend', 'frontend'], triggeredBy: 'baris' });
+    await env.service.waitForBuild(whole.release.id);
+    assert.equal(env.buildArgs[1].parameters.COMPONENTS, undefined);
+
+    await assert.rejects(
+      () => env.service.createRelease({ projectId: 'p1', version: '2.5.2', components: ['nope'], triggeredBy: 'baris' }),
+      (err) => err instanceof ValidationError && /Unknown component/.test(err.message),
+    );
+  } finally {
+    env.cleanup();
+  }
+});

@@ -30,6 +30,27 @@ const {
 const { mergeBuildParameters } = require('../deployment/buildParameters');
 
 const MANIFEST_ATTEMPTS = 3;
+/** Build parameter naming the subset being built (see createRelease). */
+const COMPONENTS_VARIABLE = 'COMPONENTS';
+
+/**
+ * @param {string[]|undefined|null} requested
+ * @param {{ name: string }[]} configured
+ * @returns {string[]|null} null when the whole project is being built
+ */
+function normalizeRequestedComponents(requested, configured) {
+  if (requested === undefined || requested === null) return null;
+  if (!Array.isArray(requested) || requested.length === 0) return null;
+  const known = new Set(configured.map((component) => component.name));
+  const unknown = requested.filter((name) => !known.has(name));
+  if (unknown.length > 0) {
+    throw new ValidationError(`Unknown component(s): ${unknown.join(', ')}.`);
+  }
+  const unique = [...new Set(requested)];
+  // Asking for all of them is the same as asking for nothing in particular —
+  // keep the parameter out so the build log does not imply a narrowed run.
+  return unique.length === known.size ? null : unique;
+}
 
 /**
  * `parameters` is the merged build-parameter map (global defaults + the
@@ -308,7 +329,7 @@ function createReleaseService({
      * @param {{ projectId: string, version: string, ref?: string, triggeredBy?: string }} args
      * @returns {Promise<{ release: object, deploymentId: string }>}
      */
-    async createRelease({ projectId, version, ref, triggeredBy }) {
+    async createRelease({ projectId, version, ref, components, triggeredBy }) {
       const project = getProject(projectId);
       requireVersion(version);
       if (ref !== undefined && ref !== null && ref !== '') {
@@ -322,6 +343,11 @@ function createReleaseService({
         throw new ValidationError("This project's build provider is 'none' — upload the artifacts yourself and import the release.");
       }
 
+      // Only the components this project declares may be asked for; an unknown
+      // name would otherwise reach the build job as a silent no-op and produce a
+      // release missing the very component the operator wanted.
+      const requestedComponents = normalizeRequestedComponents(components, config.components);
+
       const runtimeProject = await resolveSecrets(project);
       const runtimeConfig = runtimeProject.config || {};
       const { adapter, triggerParams } = createBuildAdapter({
@@ -333,12 +359,18 @@ function createReleaseService({
         // Nothing the caller sent reaches the build: the parameters come from
         // the project's config (project:write) and the global defaults, which
         // is what keeps a deployer from injecting build inputs.
-        parameters: mergeBuildParameters(
-          getGlobalBuildParameters(),
-          config.build.parameters,
-          config.versionVariable,
-          version,
-        ),
+        parameters: {
+          ...mergeBuildParameters(
+            getGlobalBuildParameters(),
+            config.build.parameters,
+            config.versionVariable,
+            version,
+          ),
+          // Comma-separated so a job can read it with a plain string split;
+          // absent (not empty) when everything is being built, so an existing
+          // job that ignores it keeps behaving exactly as before.
+          ...(requestedComponents ? { [COMPONENTS_VARIABLE]: requestedComponents.join(',') } : {}),
+        },
       });
 
       let release;
