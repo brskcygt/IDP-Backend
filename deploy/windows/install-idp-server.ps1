@@ -89,6 +89,11 @@ $System32            = Join-Path $env:SystemRoot 'System32'
 $CmdExe              = Join-Path $System32 'cmd.exe'
 $IcaclsExe           = Join-Path $System32 'icacls.exe'
 $SeceditExe          = Join-Path $System32 'secedit.exe'
+# Bu desenler ve [A-Za-z] iceren her sinif YALNIZ -cmatch/-cnotmatch ile kullanilir.
+# -match buyuk/kucuk harf duyarsizdir ve harfi sistemin diline gore katlar: Turkce
+# Windows'ta 'I' noktasiz i'ye (U+0131) katlanir, [A-Za-z] onu tanimaz. Sonuc: IDP_*, SESSION_SECRET gibi
+# I iceren her anahtar "yok" sayilir, betik mevcut IDP_SECRET_KEY'i goremez (2026-09-28).
+# Siniflar iki harf durumunu zaten acikca yazdigi icin duyarli eslestirme ayni isi gorur.
 $EnvLinePattern      = '^\s*(?:export\s+)?([A-Za-z_][A-Za-z0-9_.-]*)\s*=(.*)$'
 
 $script:TasksDisabled = $false
@@ -109,7 +114,7 @@ function Write-Warn([string]$Message) {
 }
 
 function Assert-LocalPath([string]$Path, [string]$Name) {
-    if ($Path -notmatch '^[A-Za-z]:\\') {
+    if ($Path -cnotmatch '^[A-Za-z]:\\') {
         throw ($Name + ' yerel bir surucu yolu olmali (UNC veya goreli yol desteklenmez): ' + $Path)
     }
     # " ve % cmd.exe komut satirini, # ise .env'deki tirnaksiz degerleri bozar.
@@ -237,7 +242,7 @@ function ConvertFrom-EnvRawValue([string]$Raw) {
 function Get-EnvValue($Lines, [string]$Key) {
     $result = $null
     foreach ($line in $Lines) {
-        if ($line -match $EnvLinePattern -and $Matches[1] -ceq $Key) {
+        if ($line -cmatch $EnvLinePattern -and $Matches[1] -ceq $Key) {
             $result = ConvertFrom-EnvRawValue $Matches[2]   # dotenv gibi: son tanim kazanir
         }
     }
@@ -248,7 +253,7 @@ function Set-EnvValue($Lines, [string]$Key, [string]$Value) {
     $newLine = $Key + '=' + $Value
     $found = $false
     for ($i = 0; $i -lt $Lines.Count; $i++) {
-        if ($Lines[$i] -match $EnvLinePattern -and $Matches[1] -ceq $Key) {
+        if ($Lines[$i] -cmatch $EnvLinePattern -and $Matches[1] -ceq $Key) {
             if (-not $found) { $Lines[$i] = $newLine; $found = $true }
             else { $Lines.RemoveAt($i); $i-- }
         }
@@ -259,7 +264,7 @@ function Set-EnvValue($Lines, [string]$Key, [string]$Value) {
 function Remove-EnvKey($Lines, [string]$Key) {
     $removed = 0
     for ($i = $Lines.Count - 1; $i -ge 0; $i--) {
-        if ($Lines[$i] -match $EnvLinePattern -and $Matches[1] -ceq $Key) { $Lines.RemoveAt($i); $removed++ }
+        if ($Lines[$i] -cmatch $EnvLinePattern -and $Matches[1] -ceq $Key) { $Lines.RemoveAt($i); $removed++ }
     }
     return $removed
 }
@@ -539,7 +544,7 @@ function Show-PlaceholderWarning($Lines, [string]$ExamplePath, [string]$Label) {
     $examples = @{}
     if ($ExamplePath -and (Test-Path -LiteralPath $ExamplePath -PathType Leaf)) {
         foreach ($exampleLine in (Read-EnvLines $ExamplePath)) {
-            if ($exampleLine -match $EnvLinePattern) {
+            if ($exampleLine -cmatch $EnvLinePattern) {
                 $exampleKey = $Matches[1]
                 $exampleValue = ConvertFrom-EnvRawValue $Matches[2]
                 if ($exampleValue -and ($benign -notcontains $exampleKey)) { $examples[$exampleKey] = $exampleValue }
@@ -547,7 +552,7 @@ function Show-PlaceholderWarning($Lines, [string]$ExamplePath, [string]$Label) {
         }
     }
     foreach ($line in $Lines) {
-        if ($line -notmatch $EnvLinePattern) { continue }
+        if ($line -cnotmatch $EnvLinePattern) { continue }
         $key = $Matches[1]
         $value = ConvertFrom-EnvRawValue $Matches[2]
         if (-not $value) { continue }
@@ -710,7 +715,7 @@ if ($CfAccessClientSecret -and -not $PSBoundParameters.ContainsKey('CfAccessClie
 }
 if ($PSBoundParameters.ContainsKey('CfAccessClientId')) {
     $CfAccessClientId = ([string]$CfAccessClientId).Trim()
-    if ($CfAccessClientId -notmatch $EnvSafeValuePattern) {
+    if ($CfAccessClientId -cnotmatch $EnvSafeValuePattern) {
         throw '-CfAccessClientId bos olamaz ve sadece harf, rakam ve . _ ~ + / = - icerebilir.'
     }
 }
@@ -907,7 +912,7 @@ try {
         if ($CfAccessClientSecret) { $cfSecretSecure = $CfAccessClientSecret }
         else { $cfSecretSecure = Read-Host 'Cloudflare Access Client Secret (-CfAccessClientId icin)' -AsSecureString }
         $cfSecretCheck = ConvertTo-PlainText $cfSecretSecure
-        $cfSecretValid = ($cfSecretCheck -match $EnvSafeValuePattern)
+        $cfSecretValid = ($cfSecretCheck -cmatch $EnvSafeValuePattern)
         $cfSecretCheck = $null
         if (-not $cfSecretValid) {
             throw 'Cloudflare Access Client Secret bos olamaz ve sadece harf, rakam ve . _ ~ + / = - icerebilir.'
@@ -1026,7 +1031,7 @@ try {
             Write-Warn 'Mevcut agents.json var ama token yoktu: daha once dagitilmis agent ZIP''leri yeni token ile yeniden uretilmeli.'
         }
     }
-    if ($agentToken -notmatch '^[A-Za-z0-9._~+/=-]+$') {
+    if ($agentToken -cnotmatch '^[A-Za-z0-9._~+/=-]+$') {
         throw 'IDP_AGENT_API_TOKEN tirnaksiz yazilamayacak karakterler iceriyor; degeri elle sadelestirin (betik degistirmez).'
     }
     if ([string]::IsNullOrWhiteSpace($tokenBackend)) { Set-EnvValue $backendLines 'IDP_AGENT_API_TOKEN' $agentToken }
@@ -1100,7 +1105,7 @@ try {
     }
 
     foreach ($line in $backendLines) {
-        if ($line -match $EnvLinePattern -and $Matches[1] -like '*_PATH' -and (ConvertFrom-EnvRawValue $Matches[2]).StartsWith('~')) {
+        if ($line -cmatch $EnvLinePattern -and $Matches[1] -like '*_PATH' -and (ConvertFrom-EnvRawValue $Matches[2]).StartsWith('~')) {
             Write-Warn ($Matches[1] + ' "~" ile basliyor. Servis hesabinda HOME tanimsiz: backend "~" yerine "/root" koyar. Mutlak Windows yolu yazin.')
         }
     }
