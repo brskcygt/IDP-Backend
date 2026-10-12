@@ -109,6 +109,9 @@ const SCHEMA = `
     error TEXT,
     created_by TEXT,
     ready_order INTEGER,
+    ref TEXT,
+    ref_type TEXT,
+    composition_json TEXT,
     created_at TEXT,
     updated_at TEXT,
     UNIQUE (project_id, version)
@@ -244,6 +247,11 @@ function ensureReleaseColumns(db) {
   if (!existing.has('config_schema_json')) {
     db.exec('ALTER TABLE releases ADD COLUMN config_schema_json TEXT');
   }
+  // The ref a release was built from, and for a composed preview the base +
+  // feature branches merged into it (core/artifacts/composeService.js).
+  if (!existing.has('ref')) db.exec('ALTER TABLE releases ADD COLUMN ref TEXT');
+  if (!existing.has('ref_type')) db.exec('ALTER TABLE releases ADD COLUMN ref_type TEXT');
+  if (!existing.has('composition_json')) db.exec('ALTER TABLE releases ADD COLUMN composition_json TEXT');
 }
 
 /**

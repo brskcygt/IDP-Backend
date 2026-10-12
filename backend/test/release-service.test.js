@@ -167,7 +167,7 @@ test('createRelease: build succeeds → manifest ingested → release ready', as
     // The version reaches the build server-side, under the configured variable
     // name, alongside the merged build parameters (none configured here).
     assert.deepEqual(env.buildArgs, [{
-      provider: 'pipeline', config: env.project.config, version: '2.5.0', versionVariable: 'RELEASE_VERSION', ref: null,
+      provider: 'pipeline', config: env.project.config, version: '2.5.0', versionVariable: 'RELEASE_VERSION', ref: null, refType: null,
       parameters: { RELEASE_VERSION: '2.5.0' },
     }]);
     assert.deepEqual(env.adapter.calls, ['connect', ['trigger', { RELEASE_VERSION: '2.5.0' }]]);
@@ -550,4 +550,46 @@ test('buildAndDeploy: rebuilds a test target branch and installs it; production 
   } finally {
     env.cleanup();
   }
+});
+
+test('createRelease: ref + refType are stored and reach the pipeline as both halves of the target', async () => {
+  const env = setup();
+  try {
+    const tagged = await env.service.createRelease({ projectId: 'p1', version: '2.6.0', ref: '2.6.0', refType: 'tag' });
+    assert.equal(tagged.release.ref, '2.6.0');
+    assert.equal(tagged.release.refType, 'tag');
+    assert.equal(tagged.release.composition, null);
+    assert.equal(env.buildArgs[0].refType, 'tag');
+    await env.service.waitForBuild(tagged.release.id);
+
+    const branch = await env.service.createRelease({ projectId: 'p1', version: '2.6.1', ref: 'develop' });
+    assert.equal(branch.release.refType, 'branch', 'refType defaults to branch');
+    await env.service.waitForBuild(branch.release.id);
+
+    const none = await env.service.createRelease({ projectId: 'p1', version: '2.6.2' });
+    assert.equal(none.release.ref, null);
+    assert.equal(none.release.refType, null);
+    await env.service.waitForBuild(none.release.id);
+
+    await assert.rejects(
+      () => env.service.createRelease({ projectId: 'p1', version: '2.6.3', ref: 'x', refType: 'commit' }),
+      ValidationError,
+    );
+  } finally {
+    env.cleanup();
+  }
+
+  const config = makeProject().config;
+  const onTag = defaultCreateBuildAdapter({
+    provider: 'pipeline', config, version: '2.6.0', versionVariable: 'VERSION', ref: '2.6.0', refType: 'tag',
+  });
+  assert.equal(onTag.adapter.ciConfig.ref, '2.6.0');
+  assert.equal(onTag.adapter.ciConfig.refType, 'tag');
+  const onBranch = defaultCreateBuildAdapter({ provider: 'pipeline', config, version: '2.6.0', versionVariable: 'VERSION', ref: 'dev' });
+  assert.equal(onBranch.adapter.ciConfig.refType, 'branch');
+  // Jenkins keeps receiving the name as BRANCH.
+  const jenkins = defaultCreateBuildAdapter({
+    provider: 'jenkins', config, version: '2.6.0', versionVariable: 'VERSION', ref: '2.6.0', refType: 'tag',
+  });
+  assert.equal(jenkins.triggerParams.BRANCH, '2.6.0');
 });

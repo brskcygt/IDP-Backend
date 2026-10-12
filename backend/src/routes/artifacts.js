@@ -4,7 +4,7 @@
  * Artifact deploy HTTP routes (docs/ARTIFACT-DEPLOY.md).
  *
  *   GET    /api/projects/:id/releases              project:read
- *   POST   /api/projects/:id/releases              release:create  {version, ref?}  → build (SSE)
+ *   POST   /api/projects/:id/releases              release:create  {version, ref?, refType?}  → build (SSE)
  *   POST   /api/projects/:id/releases/import       release:create  {version}
  *   GET    /api/releases/:id                       project:read
  *   DELETE /api/releases/:id                       release:delete (admin; DB rows only)
@@ -45,7 +45,12 @@ const createReleaseSchema = object({
   // subset of what an admin already declared. That is the same kind of choice as
   // picking the version, which is why it is allowed at release:create level
   // while free-form build inputs still are not.
-  fields: { version: versionRule(), ref: optional(string({ max: 255 })), components: componentsRule() },
+  fields: {
+    version: versionRule(),
+    ref: optional(string({ max: 255 })),
+    refType: optional(string({ enum: ['branch', 'tag'] })),
+    components: componentsRule(),
+  },
   allowUnknown: false,
 });
 const importReleaseSchema = object({ fields: { version: versionRule() }, allowUnknown: false });
@@ -115,6 +120,7 @@ function createArtifactRoutes({ services, getProject, auditLogger, publicUrl = n
         projectId: req.params.id,
         version: body.value.version,
         ref: body.value.ref,
+        refType: body.value.refType,
         components: body.value.components,
         triggeredBy: actor(req),
       });

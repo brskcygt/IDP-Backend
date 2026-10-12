@@ -53,6 +53,9 @@ function rowToRelease(row) {
     status: row.status,
     manifest: parseJson(row.manifest_json),
     configSchema: parseJson(row.config_schema_json) ?? null,
+    ref: row.ref ?? null,
+    refType: row.ref_type ?? null,
+    composition: parseJson(row.composition_json) ?? null,
     buildDeploymentId: row.build_deployment_id ?? null,
     error: row.error ?? null,
     createdBy: row.created_by ?? null,
@@ -129,6 +132,9 @@ const RELEASE_PATCH_COLUMNS = {
   sourceIdentity: ['source_identity_json', toJson],
   manifest: ['manifest_json', toJson],
   configSchema: ['config_schema_json', toJson],
+  ref: ['ref', sqlValue],
+  refType: ['ref_type', sqlValue],
+  composition: ['composition_json', toJson],
   buildDeploymentId: ['build_deployment_id', sqlValue],
   error: ['error', sqlValue],
   createdBy: ['created_by', sqlValue],
@@ -187,8 +193,8 @@ function createArtifactDeployRepository(db) {
       const id = release.id || newId('rel');
       db.prepare(`
         INSERT INTO releases (id, project_id, version, commit_sha, source_platform, source_identity_json, status, manifest_json,
-          build_deployment_id, error, created_by, created_at, updated_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          build_deployment_id, error, created_by, ref, ref_type, composition_json, created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       `).run(
         id,
         release.projectId,
@@ -201,6 +207,9 @@ function createArtifactDeployRepository(db) {
         sqlValue(release.buildDeploymentId),
         sqlValue(release.error),
         sqlValue(release.createdBy),
+        sqlValue(release.ref),
+        sqlValue(release.refType),
+        toJson(release.composition),
         now,
         now
       );

@@ -34,6 +34,7 @@ const MANIFEST_ATTEMPTS = 3;
 const COMPONENTS_VARIABLE = 'COMPONENTS';
 /** Build parameter carrying the branch for providers without a ref concept. */
 const BRANCH_VARIABLE = 'BRANCH';
+const REF_TYPES = ['branch', 'tag'];
 
 /**
  * A version for a build nobody named: `0.0.0-<branch>.<utc timestamp>`.
@@ -74,13 +75,18 @@ function normalizeRequestedComponents(requested, configured) {
  * job parameters — see core/deployment/buildParameters.js for why secrets
  * must not travel this way.
  */
-function defaultCreateBuildAdapter({ provider, config, version, versionVariable, ref, parameters = {} }) {
+function defaultCreateBuildAdapter({ provider, config, version, versionVariable, ref, refType = null, parameters = {} }) {
   // Required lazily: keeps this module (and its tests) free of adapter
   // dependencies until a real build runs.
   if (provider === 'pipeline') {
     const CiPipelineAdapter = require('../../adapters/CiPipelineAdapter');
     const ciConfig = isPlainObject(config.ciConfig) ? { ...config.ciConfig } : {};
-    if (ref) ciConfig.ref = ref;
+    // Both halves of the target: a tag built with the configured ref_type
+    // 'branch' would make Bitbucket look for a branch of that name.
+    if (ref) {
+      ciConfig.ref = ref;
+      ciConfig.refType = refType || 'branch';
+    }
     try {
       const adapter = new CiPipelineAdapter({
         ciConfig,
@@ -131,7 +137,7 @@ function sleep(ms) {
  * @param {{ log: Function }} deps.auditLogger
  * @param {(id: string) => object} deps.getProject - persisted project (throws NotFoundError).
  * @param {(project: object) => Promise<object>} deps.resolveSecrets - decrypts secret:// refs into a copy.
- * @param {Function} [deps.createBuildAdapter] - test seam: ({provider, config, version, versionVariable, ref}) → {adapter, triggerParams}.
+ * @param {Function} [deps.createBuildAdapter] - test seam: ({provider, config, version, versionVariable, ref, refType}) → {adapter, triggerParams}.
  * @param {Function} [deps.createSourceClient] - test seam: (source, {token, username}) → source client.
  * @param {(releaseId: string) => boolean} [deps.isReleaseBusy] - true while an agent deploy uses the release.
  * @param {(projectId: string, version: string) => void} [deps.deleteLocalRelease]
@@ -226,8 +232,12 @@ function createReleaseService({
     }
   }
 
-  /** Creates the row, or resets a failed one for a retry. */
-  function claimReleaseRow(project, version, triggeredBy, { allowReady }) {
+  /**
+   * Creates the row, or resets a failed one for a retry. `origin` (ref,
+   * refType, composition) is written only when given, so an import keeps
+   * what the original build recorded.
+   */
+  function claimReleaseRow(project, version, triggeredBy, { allowReady, origin = null }) {
     const existing = repository.findReleaseByVersion(project.id, version);
     if (existing) {
       if (existing.status === 'building' || activeBuilds.has(`${project.id}:${version}`)) {
@@ -239,10 +249,12 @@ function createReleaseService({
       if (isReleaseBusy(existing.id)) {
         throw new ConflictError(`Release ${version} is being deployed and cannot be changed.`);
       }
-      return repository.updateRelease(existing.id, { status: 'building', error: null, createdBy: triggeredBy || existing.createdBy });
+      return repository.updateRelease(existing.id, {
+        status: 'building', error: null, createdBy: triggeredBy || existing.createdBy, ...(origin || {}),
+      });
     }
     try {
-      return repository.createRelease({ projectId: project.id, version, status: 'building', createdBy: triggeredBy || null });
+      return repository.createRelease({ projectId: project.id, version, status: 'building', createdBy: triggeredBy || null, ...(origin || {}) });
     } catch (err) {
       if (/UNIQUE/i.test(String(err && err.message))) throw new ConflictError(`Release ${version} already exists.`);
       throw err;
@@ -285,7 +297,15 @@ function createReleaseService({
     }
   }
 
-  async function runBuild({ project, runtimeProject, release, adapter, triggerParams, deploymentId, triggeredBy, provider, deployTo }) {
+  /**
+   * `prepare` runs inside the build session before the CI is contacted (the
+   * release composer merges its branches there, so every step streams to the
+   * same log); throwing fails the release without triggering a build.
+   * `afterBuild` runs once the build is terminal, whatever the outcome.
+   */
+  async function runBuild({
+    project, runtimeProject, release, adapter, triggerParams, deploymentId, triggeredBy, provider, deployTo, prepare, afterBuild,
+  }) {
     const startedAt = Date.now();
     const log = (line) => deploymentManager.pushLog(deploymentId, line);
     const throwIfAborted = () => {
@@ -293,6 +313,10 @@ function createReleaseService({
       if (session && session.signal && session.signal.aborted) throw new Error('Release build aborted by user');
     };
     try {
+      if (prepare) {
+        await prepare({ log, release, throwIfAborted });
+        throwIfAborted();
+      }
       await adapter.connect();
       throwIfAborted();
       await adapter.trigger(triggerParams);
@@ -363,6 +387,13 @@ function createReleaseService({
         adapter.config.apiToken = null;
         adapter.config.password = null;
       }
+      if (afterBuild) {
+        try {
+          await afterBuild({ log, release: repository.findRelease(release.id) || release });
+        } catch (err) {
+          log(`[Release] ⚠ Post-build cleanup failed: ${err.message}`);
+        }
+      }
     }
   }
 
@@ -380,10 +411,15 @@ function createReleaseService({
     },
 
     /**
-     * @param {{ projectId: string, version: string, ref?: string, triggeredBy?: string }} args
+     * `composition`, `prepare` and `afterBuild` are internal (composeService):
+     * the HTTP layer never forwards them.
+     *
+     * @param {{ projectId: string, version: string, ref?: string, refType?: 'branch'|'tag', triggeredBy?: string }} args
      * @returns {Promise<{ release: object, deploymentId: string }>}
      */
-    async createRelease({ projectId, version, ref, components, deployTo, triggeredBy }) {
+    async createRelease({
+      projectId, version, ref, refType, components, deployTo, triggeredBy, composition = null, prepare = null, afterBuild = null,
+    }) {
       const project = getProject(projectId);
       requireVersion(version);
       if (ref !== undefined && ref !== null && ref !== '') {
@@ -391,6 +427,10 @@ function createReleaseService({
           throw new ValidationError('Invalid ref: a branch or tag name.');
         }
       }
+      if (refType !== undefined && refType !== null && !REF_TYPES.includes(refType)) {
+        throw new ValidationError("Invalid refType: 'branch' or 'tag'.");
+      }
+      const resolvedRefType = ref ? refType || 'branch' : null;
       const config = requireConfig(project);
       const provider = config.build.provider;
       if (provider === 'none') {
@@ -410,6 +450,7 @@ function createReleaseService({
         version,
         versionVariable: config.versionVariable,
         ref: ref || null,
+        refType: resolvedRefType,
         // Nothing the caller sent reaches the build: the parameters come from
         // the project's config (project:write) and the global defaults, which
         // is what keeps a deployer from injecting build inputs.
@@ -429,7 +470,10 @@ function createReleaseService({
 
       let release;
       try {
-        release = claimReleaseRow(project, version, triggeredBy, { allowReady: false });
+        release = claimReleaseRow(project, version, triggeredBy, {
+          allowReady: false,
+          origin: { ref: ref || null, refType: resolvedRefType, composition: composition || null },
+        });
       } catch (err) {
         if (typeof adapter.releaseCredentials === 'function') adapter.releaseCredentials();
         throw err;
@@ -450,18 +494,20 @@ function createReleaseService({
         version,
         deploymentId,
         provider,
-        ...(ref ? { ref } : {}),
+        ...(ref ? { ref, refType: resolvedRefType } : {}),
       });
 
       adapter.onLog((line) => deploymentManager.pushLog(deploymentId, line));
       deploymentManager.setStatus(deploymentId, 'running');
       deploymentManager.pushLog(
         deploymentId,
-        `[Release] Building ${config.artifactName} ${version} via ${provider}${ref ? ` @ ${ref}` : ''} ` +
+        `[Release] Building ${config.artifactName} ${version} via ${provider}${ref ? ` @ ${resolvedRefType} ${ref}` : ''} ` +
           `(the build receives ${config.versionVariable}=${version}).`
       );
 
-      const promise = runBuild({ project, runtimeProject, release, adapter, triggerParams, deploymentId, triggeredBy, provider, deployTo })
+      const promise = runBuild({
+        project, runtimeProject, release, adapter, triggerParams, deploymentId, triggeredBy, provider, deployTo, prepare, afterBuild,
+      })
         .finally(() => pending.delete(release.id));
       pending.set(release.id, promise);
       return { release, deploymentId };
