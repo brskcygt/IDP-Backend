@@ -15,6 +15,7 @@ const config = require('./config');
 const { DEFAULT_REQUEST_TIMEOUT_MS } = require('./http');
 const BitbucketPipelinesClient = require('./BitbucketPipelinesClient');
 const GitHubActionsClient = require('./GitHubActionsClient');
+const BitbucketRepoClient = require('./BitbucketRepoClient');
 
 /**
  * @param {object} ciConfig - raw or normalized `project.config.ciConfig`.
@@ -66,10 +67,34 @@ function createCiScrubber({ token, username } = {}) {
   return createScrubber(secrets);
 }
 
+/**
+ * Repository-operations client (branches, tags, pull requests) for a
+ * normalized `artifactDeploy.source`. Bitbucket only for now.
+ * @param {{ platform: string, baseUrl: string, owner: string, repo: string, authType?: string }} source
+ * @param {{ token: string, username?: string, fetchImpl?: Function, requestTimeoutMs?: number, sleep?: Function, timing?: object }} options
+ * @returns {BitbucketRepoClient}
+ */
+function createRepoClient(source, { token, username, fetchImpl = undiciFetch, requestTimeoutMs, sleep, timing } = {}) {
+  if (!source || source.platform !== 'bitbucket') {
+    throw new Error('Repository operations are only supported for Bitbucket sources.');
+  }
+  return new BitbucketRepoClient(source, {
+    token,
+    username,
+    fetchImpl,
+    scrub: createCiScrubber({ token, username }),
+    requestTimeoutMs,
+    sleep,
+    timing,
+  });
+}
+
 module.exports = {
   ...config,
   createCiClient,
   createCiScrubber,
+  createRepoClient,
+  BitbucketRepoClient,
   BitbucketPipelinesClient,
   GitHubActionsClient,
 };
