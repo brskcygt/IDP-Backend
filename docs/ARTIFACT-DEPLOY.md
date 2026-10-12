@@ -194,7 +194,9 @@ CI sağlayıcısından bağımsız iki aşamalı sözleşme:
   release zaten `ready` ise external kaynağa import denenmez.
 - Bearer yok/geçersiz: `401`; upload kapalı: `503`; declared/stream boyutu limiti aşarsa `413`.
 - Varsayılan tek-artifact limiti 1 GiB; `IDP_ARTIFACT_MAX_BYTES` ile en fazla 20 GiB.
-- Her proje için son üç yerel `ready` release tutulur. Daha eski binary + release satırı otomatik silinir;
+- Her proje için **iki ayrı kovada** son üçer yerel `ready` release tutulur: önizlemeler (composer'ın
+  `composition` taşıyan release'leri ve üretilmiş `0.0.0-…` sürümleri) ve adlandırılmış (tag'li) release'ler.
+  Bir önizleme yığını gerçek bir release'i hiçbir zaman silemez. Daha eski binary + release satırı otomatik silinir;
   herhangi bir hedefte kurulu (`current_release_id`) veya aktif deploy'da kullanılan release korunur. Bu
   nedenle korunanlarla disk üzerinde üçten fazla release bulunabilir. External import release'leri bu
   retention'a dahil değildir.
@@ -237,7 +239,7 @@ override'ı yok).
 | `source.authType` | Bitbucket: `bearer` (Access Token) \| `basic` (Atlassian e-posta `username` + API token) |
 | `source.token` | **Secret** (`artifactDeploy.source.token`): şifreli saklanır, yanıtlarda `source.hasToken` olarak döner, boş/eksik gönderilirse saklı değer korunur. Boşsa projenin `apiToken`'ı (+`username`) kullanılır |
 | `build.provider` | `pipeline` (projenin `ciConfig` + `apiToken`), `jenkins` (projenin `url` / `jobName` / `username` / `apiToken`), `none` (yalnız import) |
-| `build.parameters` | Build'e sürümle birlikte gönderilen serbest anahtar/değer (en çok 25; ad: `^[A-Za-z_][A-Za-z0-9_]*$`, değer ≤ 2000 karakter). **Sır konulmaz** (bkz. 3.5) |
+| `build.parameters` | Build'e sürümle birlikte gönderilen serbest anahtar/değer (en çok 25; ad: `^[A-Za-z_][A-Za-z0-9_]*$`, değer ≤ 2000 karakter). **Sır konulmaz** (bkz. 3.6) |
 | `versionVariable` | Build'e sürümün geçtiği değişken/parametre adı (varsayılan `VERSION`) |
 | `artifactName` | Manifest `project` ve dosya adı öneki. Varsayılan: `source.repo` (küçük harf) |
 | `components[]` | En çok 10; `name` benzersiz, `subdir` tek klasör adı (`.`/`..` değil, büyük/küçük harf duyarsız benzersiz) |
@@ -325,7 +327,34 @@ Branch build'e nasıl ulaşır: CI Pipeline sağlayıcısında `ciConfig.ref` ol
 parametresi olarak (Jenkins'in `buildWithParameters` ucunda ref kavramı yok). Job bu parametre doluysa o
 branch'i checkout etmelidir; boşsa kendi yapılandırdığı branch'te kalır.
 
-### 3.5 Sırlar build parametresi olmaz
+### 3.5 Release composer (önizleme branch'i, yalnız Bitbucket)
+
+Bir taban (branch **veya** tag) ve 1-10 feature branch seçilir; IDP Bitbucket'ta geçici bir
+`preview/<ilk iki branch>-<UTC zaman damgası>` branch'i açar, her feature'ı sırayla **pull request ile**
+(`merge_commit`, kaynak branch kapatılmaz) içine merge eder ve mevcut release build'ini `ref = preview/…`
+ile tetikler. Bütün adımlar build oturumunun içinde çalışır, yani aynı SSE log'unda (`[Compose] …`) görünür.
+
+- Sürüm verilmezse `0.0.0-preview.<yyyymmddHHMMss>` üretilir. Release kaydı `ref`, `refType` ve
+  `composition` (`baseType, baseRef, baseSha, branches[{name, sha}], composeBranch, headSha`) taşır.
+- **Çakışma**: merge edilemeyen feature log'a yazılır, PR'ı decline edilir, preview branch silinir, release
+  `failed` olur (`Merge conflict: <feature> → <taban>`) ve build **hiç tetiklenmez**. Tabanda zaten bulunan
+  (değişikliği olmayan) feature atlanır.
+- **Temizlik**: build başarılı da olsa başarısız da olsa preview branch silinir (silinemezse log'a uyarı
+  düşer). Merge edilmiş PR'lar geçmiş olarak kalır.
+- **Prod kuralı**: composition taşıyan bir release Prod hedefe kurulamaz — hem `compose`'daki `deployTo`
+  hem `POST /api/targets/:id/deploy` `400 {code: 'PREVIEW_NOT_ALLOWED_ON_PROD'}` döner. Prod'a giden yol:
+  `POST /api/projects/:id/repo/tags` ile tag oluşturmak (adı geçerli bir release sürümü olmalı), sonra o tag'den
+  normal release almak (`POST /api/projects/:id/releases {version, ref: <tag>, refType: 'tag'}`).
+- Pipeline sağlayıcısında `refType` artık `ciConfig.ref_type` olarak da gider (tag, tag olarak derlenir).
+  Jenkins'te ad yine `BRANCH` parametresiyle gider; job'ın bu değeri tag olarak da checkout edebilmesi gerekir
+  (ör. `git checkout <BRANCH>` ya da refspec'e `+refs/tags/*:refs/tags/*` eklemek).
+
+**Token yetkileri**: composer `artifactDeploy.source` kimliğini kullanır (yoksa projenin `apiToken`'ı, resmi
+API adresinde). Repository/Project Access Token için `repository:write` + `pullrequest:write`; Atlassian API
+token (Basic, e-posta + token) için repository ve pull request **yazma** scope'ları gerekir. Yalnız okuma
+yetkili bir token ile ref listesi çalışır, compose ve tag oluşturma 403 ile düşer.
+
+### 3.6 Sırlar build parametresi olmaz
 
 Parametreler Jenkins'e **query string** olarak gider (`buildWithParameters?VERSION=...`) ve build log'una
 yazılır. Bir kimlik bilgisi buraya konursa hem Jenkins'in istek log'una hem konsol çıktısına düşer. Doğrusu
@@ -620,7 +649,10 @@ POST /api/projects/:id/targets
 | Uç | Yetki | Not |
 |---|---|---|
 | `GET /api/projects/:id/releases` | `project:read` | |
-| `POST /api/projects/:id/releases` `{version, ref?}` | `release:create` (deployer) | 202 + build `deploymentId` (SSE). `ref` yalnız pipeline build |
+| `POST /api/projects/:id/releases` `{version, ref?, refType?}` | `release:create` (deployer) | 202 + build `deploymentId` (SSE). `refType`: `branch` (varsayılan) \| `tag` |
+| `POST /api/projects/:id/releases/compose` `{base:{type,name}, branches[], version?, components?, deployTo?}` | `release:create` | 202 + SSE; bkz. §3.5. Prod `deployTo` → 400 `PREVIEW_NOT_ALLOWED_ON_PROD` |
+| `GET /api/projects/:id/repo/refs?q=&hidePreview=1` | `project:read` | `{platform, defaultBranch, branches[], tags[]}` (en yeni commit önce, en çok 500'er) |
+| `POST /api/projects/:id/repo/tags` `{name, from:{type:'branch'\|'commit', name}, message?}` | `release:tag` (admin) | 201 `{tag}`; tag varsa 409 |
 | `POST /api/projects/:id/releases/import` `{version}` | `release:create` | manifest'i okur; yeniden import artifact id'lerini korur |
 | `GET /api/releases/:id` | `project:read` | release + artifact'lar |
 | `DELETE /api/releases/:id` | `release:delete` (admin) | local release binary + DB satırları; kurulu/aktif release silinmez |
@@ -634,8 +666,8 @@ POST /api/projects/:id/targets
 | `POST /api/deploy/:id/abort` | `deploy:abort` | iptal (mevcut uç) |
 | `GET /api/artifacts/:artifactId/download` | indirme token'ı | oturum yok |
 
-Release/import/deploy/rollback/refresh IP başına 20 istek/dk ile sınırlıdır. Audit: `RELEASE_CREATED`,
-`RELEASE_BUILD_SUCCEEDED|FAILED`, `RELEASE_IMPORTED|IMPORT_FAILED`, `RELEASE_DELETED`,
+Release/import/deploy/rollback/refresh IP başına 20 istek/dk ile sınırlıdır. Compose ve tag oluşturma da bu sınıra tabidir. Audit: `RELEASE_CREATED`,
+`RELEASE_COMPOSED`, `RELEASE_TAG_CREATED`, `RELEASE_BUILD_SUCCEEDED|FAILED`, `RELEASE_IMPORTED|IMPORT_FAILED`, `RELEASE_DELETED`,
 `DEPLOY_TARGET_CREATED|UPDATED|DELETED`, `ARTIFACT_DEPLOY_TRIGGERED|SUCCEEDED|FAILED|CANCEL_REQUESTED|CANCELLED`,
 `ARTIFACT_ROLLBACK_*`, `ARTIFACT_DOWNLOADED|DOWNLOAD_REJECTED|DOWNLOAD_FAILED`.
 
