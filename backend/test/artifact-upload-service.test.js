@@ -271,3 +271,36 @@ test('retention follows successful finalization order, not the age of a pre-crea
     env.cleanup();
   }
 });
+
+test('retention keeps the newest three of each bucket: previews never evict named releases', async () => {
+  const env = setup();
+  try {
+    const named = [];
+    for (const version of ['1.0.0', '1.1.0', '1.2.0']) named.push(await stageAndFinalize(env, version));
+    // A composed preview: the build path pre-creates the row with its composition.
+    const composed = env.repository.createRelease({
+      projectId: 'p1', version: 'compose-a', status: 'building',
+      ref: 'preview/a-20261012000000', refType: 'branch',
+      composition: { baseType: 'branch', baseRef: 'main', baseSha: 'a', branches: [], composeBranch: 'preview/a', headSha: null },
+    });
+    await stageAndFinalize(env, 'compose-a');
+    const previews = [];
+    for (let i = 1; i <= 3; i += 1) previews.push(await stageAndFinalize(env, `0.0.0-preview.2026101200000${i}`));
+    assert.equal(env.repository.findRelease(composed.id), null, 'the oldest preview is pruned');
+    for (const release of named) assert.ok(env.repository.findRelease(release.id), `${release.version} survives a preview burst`);
+
+    const installed = previews[0];
+    env.repository.createTarget({
+      projectId: 'p1', name: 'test', agentId: 'WIN-02', os: 'windows', components: [], runtimeConfig: {}, currentReleaseId: installed.id,
+    });
+    await stageAndFinalize(env, '0.0.0-preview.20261012000004');
+    assert.ok(env.repository.findRelease(installed.id), 'a preview current on a target is protected');
+
+    await stageAndFinalize(env, '1.3.0');
+    assert.equal(env.repository.findRelease(named[0].id), null, 'named releases rotate in their own bucket');
+    const pruned = env.audit.filter((entry) => entry.action === 'RELEASE_PRUNED').map((entry) => [entry.metadata.version, entry.metadata.bucket]);
+    assert.deepEqual(pruned, [['compose-a', 'preview'], ['1.0.0', 'named']]);
+  } finally {
+    env.cleanup();
+  }
+});

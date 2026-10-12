@@ -22,8 +22,12 @@ const ARTIFACT_NAME_PATTERN = /^[a-z0-9][a-z0-9._-]{0,63}$/;
 const MANIFEST_PROJECT_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
 const SUBDIR_PATTERN = /^[A-Za-z0-9._-]+$/;
 const OWNER_REPO_PATTERN = /^[A-Za-z0-9._-]{1,255}$/;
-/** Branch/tag names for a release build: no whitespace, no `..`, no leading `-`/`/`. */
-const GIT_REF_PATTERN = /^[A-Za-z0-9._][A-Za-z0-9._/-]{0,254}$/;
+/**
+ * Branch/tag names for a release build: no whitespace, no `..`, no leading
+ * `-`/`/`. `+` is allowed after the first character: composed preview
+ * branches join their feature names with it (composeService.js).
+ */
+const GIT_REF_PATTERN = /^[A-Za-z0-9._][A-Za-z0-9._/+-]{0,254}$/;
 const VARIABLE_KEY_PATTERN = /^[A-Za-z_][A-Za-z0-9_]*$/;
 
 const RUNTIME_TYPES = ['nssm', 'windows-service', 'iis-static', 'systemd', 'none'];
@@ -863,6 +867,23 @@ function isProdTarget(target, project) {
   return /(^|[^a-z])prod/i.test(String(target.name || ''));
 }
 
+/** 400 code for a composed (preview) release aimed at a production target. */
+const PREVIEW_NOT_ALLOWED_ON_PROD = 'PREVIEW_NOT_ALLOWED_ON_PROD';
+
+/** A release built from composed branches (release composer). Never deployable to Prod. */
+function isComposedRelease(release) {
+  return Boolean(release && release.composition);
+}
+
+/**
+ * Retention bucket: composed previews and generated `0.0.0-…` builds are
+ * throwaway; named (tagged) releases are kept in their own bucket so a burst
+ * of previews never pushes a real release out.
+ */
+function isPreviewRelease(release) {
+  return isComposedRelease(release) || String((release && release.version) || '').startsWith('0.0.0-');
+}
+
 function checkTargetConfirmation(target, project, confirmation) {
   if (!isProdTarget(target, project)) return null;
   const provided = typeof confirmation === 'string' ? confirmation.trim() : '';
@@ -1059,6 +1080,9 @@ module.exports = {
   isLegacyRuntimeConfig,
   runtimeConfigForComponent,
   isProdTarget,
+  isComposedRelease,
+  isPreviewRelease,
+  PREVIEW_NOT_ALLOWED_ON_PROD,
   checkTargetConfirmation,
   targetArtifactOs,
   selectArtifact,

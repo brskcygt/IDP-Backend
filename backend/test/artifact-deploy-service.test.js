@@ -542,3 +542,27 @@ test('a dropped gateway subscription is re-established and the result still land
     env.cleanup();
   }
 });
+
+test('deploy: a composed preview release is refused on a production target before any agent command', async () => {
+  const env = setup();
+  try {
+    const composition = {
+      baseType: 'branch', baseRef: 'main', baseSha: 'a'.repeat(40),
+      branches: [{ name: 'feature/a', sha: 'b'.repeat(40) }], composeBranch: 'preview/feature-a-20261012000000', headSha: 'c'.repeat(40),
+    };
+    env.repository.updateRelease(env.release.id, { composition, ref: composition.composeBranch, refType: 'branch' });
+    const prod = env.repository.createTarget({ projectId: 'p1', name: 'temsa', agentId: 'WIN-09', os: 'windows', environment: 'Prod' });
+    const sentBefore = env.gateway.sent.length;
+    await assert.rejects(
+      () => env.service.deploy({ targetId: prod.id, releaseId: env.release.id, triggeredBy: 'bob', publicUrl: PUBLIC_URL }),
+      (err) => err instanceof ValidationError && err.code === 'PREVIEW_NOT_ALLOWED_ON_PROD',
+    );
+    assert.equal(env.gateway.sent.length, sentBefore, 'nothing reached the agent');
+    assert.equal(env.service.isTargetBusy(prod.id), false);
+    // The same preview still installs on a test target.
+    const { deployId } = await startDeploy(env);
+    assert.match(deployId, /^dep_/);
+  } finally {
+    env.cleanup();
+  }
+});

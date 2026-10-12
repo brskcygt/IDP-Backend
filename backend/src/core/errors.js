@@ -17,12 +17,16 @@ class NotFoundError extends Error {
   }
 }
 
-/** The caller's input failed validation or is otherwise malformed. */
+/**
+ * The caller's input failed validation or is otherwise malformed. `code` is
+ * an optional machine-readable reason a client can branch on.
+ */
 class ValidationError extends Error {
-  constructor(message, details) {
+  constructor(message, details, code) {
     super(message);
     this.name = 'ValidationError';
     this.details = details;
+    if (code !== undefined) this.code = code;
   }
 }
 

@@ -6,7 +6,7 @@
  * place that translates its error taxonomy into Express responses.
  *
  *   NotFoundError    → 404
- *   ValidationError  → 400 (includes `details` when the error carries them)
+ *   ValidationError  → 400 (includes `code` / `details` when the error carries them)
  *   ConflictError    → 409
  *   PermissionError  → 403
  *   UpstreamError    → 502
@@ -23,10 +23,10 @@ function mapErrorToResponse(err) {
     return { status: 404, body: { error: err.message } };
   }
   if (err instanceof ValidationError) {
-    return {
-      status: 400,
-      body: err.details !== undefined ? { error: err.message, details: err.details } : { error: err.message },
-    };
+    const body = { error: err.message };
+    if (typeof err.code === 'string') body.code = err.code;
+    if (err.details !== undefined) body.details = err.details;
+    return { status: 400, body };
   }
   if (err instanceof ConflictError) {
     return { status: 409, body: { error: err.message } };

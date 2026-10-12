@@ -1,7 +1,7 @@
 'use strict';
 
 /** CI upload/finalize orchestration and local-release retention. */
-const { validateManifest, normalizeArtifactDeployConfig, VERSION_PATTERN } = require('./contracts');
+const { validateManifest, normalizeArtifactDeployConfig, VERSION_PATTERN, isPreviewRelease } = require('./contracts');
 const { ValidationError, ConflictError, NotFoundError } = require('../errors');
 const { buildConfigSchema } = require('./envExample');
 
@@ -36,12 +36,20 @@ function createArtifactUploadService({
     return repository.isReleaseCurrent(release.id) || isReleaseBusy(release.id);
   }
 
+  /**
+   * Keeps the newest `retention` releases of EACH bucket — previews (composed
+   * or generated `0.0.0-…` builds) and named releases — so a run of test
+   * builds never evicts a real release. Releases current on a target or
+   * being deployed are never pruned.
+   */
   function prune(projectId) {
     const releases = repository.listReadyLocalReleases(projectId);
-    const keep = new Set(releases.slice(0, retention).map((release) => release.id));
+    const previews = releases.filter(isPreviewRelease);
+    const named = releases.filter((release) => !isPreviewRelease(release));
+    const candidates = [...previews.slice(retention), ...named.slice(retention)];
     const pruned = [];
-    for (const release of releases.slice(retention)) {
-      if (keep.has(release.id) || protectedRelease(release)) continue;
+    for (const release of candidates) {
+      if (protectedRelease(release)) continue;
       // Remove the row first. A concurrent deploy can no longer claim it;
       // failure to delete the now-orphaned directory is reported but cannot
       // make the release deployable without its metadata.
@@ -57,6 +65,7 @@ function createArtifactUploadService({
         releaseId: release.id,
         version: release.version,
         retention,
+        bucket: isPreviewRelease(release) ? 'preview' : 'named',
       });
     }
     return pruned;

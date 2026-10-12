@@ -32,6 +32,9 @@ const {
   computeDeployTimeoutSec,
   sanitizeAgentText,
   sanitizeVersion,
+  isProdTarget,
+  isComposedRelease,
+  PREVIEW_NOT_ALLOWED_ON_PROD,
 } = require('./contracts');
 const { openAgentChannel, sendAgentCommand, listGatewayAgents } = require('./agentChannel');
 
@@ -473,6 +476,16 @@ function createArtifactDeployService({
       if (!isPlainObject(release.manifest) || !release.manifest.project) throw new ConflictError('The release has no manifest — re-import it.');
 
       const project = getProject(target.projectId);
+      // A composed preview is unreviewed branches merged together: it may land
+      // on a test server, never on production. Tag it and build the tag instead.
+      if (isComposedRelease(release) && isProdTarget(target, project)) {
+        throw new ValidationError(
+          `Release ${release.version} is a composed preview and cannot be deployed to production target '${target.name}'. ` +
+            'Create a tag and build a release from it instead.',
+          undefined,
+          PREVIEW_NOT_ALLOWED_ON_PROD,
+        );
+      }
       const config = normalizeArtifactDeployConfig(project.config && project.config.artifactDeploy);
       if (!config || config.components.length === 0) {
         throw new ValidationError('No artifactDeploy.components are configured for this project.');
