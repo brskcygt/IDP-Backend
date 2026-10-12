@@ -59,6 +59,9 @@ const ACTION_MIN_ROLE = Object.freeze({
   // a deployer action; deleting release records is admin-only.
   'release:create': ROLES.DEPLOYER,
   'release:delete': ROLES.ADMIN,
+  // A tag on the repository is what a production release is built from, so
+  // creating one is an admin decision (release composer).
+  'release:tag': ROLES.ADMIN,
   'project:write': ROLES.ADMIN,
   'project:delete': ROLES.ADMIN,
   'settings:write': ROLES.ADMIN,

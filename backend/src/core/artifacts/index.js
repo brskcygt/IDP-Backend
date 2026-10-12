@@ -22,6 +22,7 @@ const { UpstreamError } = require('../errors');
 const contracts = require('./contracts');
 const { createDownloadTokenService } = require('./downloadTokens');
 const { createReleaseService } = require('./releaseService');
+const { createComposeService } = require('./composeService');
 const { settingsService } = require('../settings');
 const { createTargetService } = require('./targetService');
 const { createArtifactDeployService } = require('./artifactDeployService');
@@ -85,6 +86,14 @@ const releaseService = createReleaseService({
   isReleaseBusy: (releaseId) => artifactDeployService ? artifactDeployService.isReleaseBusy(releaseId) : false,
   deleteLocalRelease: (projectId, version) => localStore.removeReleaseSync(projectId, version),
 });
+// Release composer: preview branches built through the release service above.
+const composeService = createComposeService({
+  repository,
+  releaseService,
+  auditLogger,
+  getProject,
+  resolveSecrets,
+});
 artifactDeployService = createArtifactDeployService({
   repository,
   deploymentManager,
@@ -127,6 +136,7 @@ module.exports = {
   repository,
   tokens,
   releaseService,
+  composeService,
   targetService,
   artifactDeployService,
   uploadService,

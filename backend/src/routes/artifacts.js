@@ -6,6 +6,9 @@
  *   GET    /api/projects/:id/releases              project:read
  *   POST   /api/projects/:id/releases              release:create  {version, ref?, refType?}  → build (SSE)
  *   POST   /api/projects/:id/releases/import       release:create  {version}
+ *   POST   /api/projects/:id/releases/compose      release:create  {base, branches, version?, components?, deployTo?} → build (SSE)
+ *   GET    /api/projects/:id/repo/refs             project:read    ?q=&hidePreview=1
+ *   POST   /api/projects/:id/repo/tags             release:tag (admin)  {name, from, message?}
  *   GET    /api/releases/:id                       project:read
  *   DELETE /api/releases/:id                       release:delete (admin; DB rows only)
  *   GET    /api/projects/:id/targets               project:read
@@ -53,6 +56,25 @@ const createReleaseSchema = object({
   },
   allowUnknown: false,
 });
+const refTypeRule = (values) => string({ enum: values });
+const composeReleaseSchema = object({
+  fields: {
+    base: object({ fields: { type: refTypeRule(['branch', 'tag']), name: string({ min: 1, max: 255 }) } }),
+    branches: array({ max: 10, of: string({ min: 1, max: 255 }) }),
+    version: optional(versionRule()),
+    components: componentsRule(),
+    deployTo: optional(object({ fields: { targetId: string({ min: 1, max: 64 }), components: componentsRule() } })),
+  },
+  allowUnknown: false,
+});
+const createTagSchema = object({
+  fields: {
+    name: versionRule(),
+    from: object({ fields: { type: refTypeRule(['branch', 'commit']), name: string({ min: 1, max: 255 }) } }),
+    message: optional(string({ max: 1000 })),
+  },
+  allowUnknown: false,
+});
 const importReleaseSchema = object({ fields: { version: versionRule() }, allowUnknown: false });
 const buildAndDeploySchema = object({ fields: { components: componentsRule() }, allowUnknown: false });
 const deploySchema = object({
@@ -91,7 +113,7 @@ function bearerToken(req) {
 function createArtifactRoutes({ services, getProject, auditLogger, publicUrl = null, publicUrlError = null, upload = {}, rateLimits = {} }) {
   if (!services) throw new Error('createArtifactRoutes: services are required.');
   if (!auditLogger) throw new Error('createArtifactRoutes: auditLogger is required.');
-  const { releaseService, targetService, artifactDeployService, uploadService, downloadService } = services;
+  const { releaseService, composeService, targetService, artifactDeployService, uploadService, downloadService } = services;
   const trigger = rateLimits.trigger ? [rateLimits.trigger] : [];
   const actor = (req) => req.session?.user?.username;
   const invalid = (res, message, result) => res.status(400).json({ error: message, details: result.errors });
@@ -142,6 +164,59 @@ function createArtifactRoutes({ services, getProject, auditLogger, publicUrl = n
         triggeredBy: actor(req),
       });
       res.status(202).json({ release, deploymentId, sseUrl: `/api/deploy/logs/${deploymentId}` });
+    } catch (err) {
+      sendError(res, err);
+    }
+  });
+
+  // Release composer: base + feature branches merged into a preview branch,
+  // then the regular build. Business rules (unique branches, non-prod target,
+  // Bitbucket only) live in core/artifacts/composeService.js.
+  api.post('/api/projects/:id/releases/compose', requirePermission('release:create'), ...trigger, async (req, res) => {
+    const body = validate(req.body ?? {}, composeReleaseSchema);
+    if (!body.valid) return invalid(res, 'Invalid compose request.', body);
+    try {
+      const { release, deploymentId } = await composeService.compose({
+        projectId: req.params.id,
+        base: body.value.base,
+        branches: body.value.branches,
+        version: body.value.version,
+        components: body.value.components,
+        deployTo: body.value.deployTo,
+        triggeredBy: actor(req),
+      });
+      res.status(202).json({ release, deploymentId, sseUrl: `/api/deploy/logs/${deploymentId}` });
+    } catch (err) {
+      sendError(res, err);
+    }
+  });
+
+  api.get('/api/projects/:id/repo/refs', requirePermission('project:read'), async (req, res) => {
+    const q = typeof req.query.q === 'string' ? req.query.q : undefined;
+    if (req.query.q !== undefined && q === undefined) return res.status(400).json({ error: 'q must be a single string.' });
+    try {
+      res.set('Cache-Control', 'no-store');
+      res.json(await composeService.listRefs({
+        projectId: req.params.id,
+        q,
+        hidePreview: req.query.hidePreview === '1' || req.query.hidePreview === 'true',
+      }));
+    } catch (err) {
+      sendError(res, err);
+    }
+  });
+
+  api.post('/api/projects/:id/repo/tags', requirePermission('release:tag'), ...trigger, async (req, res) => {
+    const body = validate(req.body ?? {}, createTagSchema);
+    if (!body.valid) return invalid(res, 'Invalid tag request.', body);
+    try {
+      res.status(201).json(await composeService.createTag({
+        projectId: req.params.id,
+        name: body.value.name,
+        from: body.value.from,
+        message: body.value.message,
+        triggeredBy: actor(req),
+      }));
     } catch (err) {
       sendError(res, err);
     }

@@ -25,7 +25,7 @@ const { createDownloadTokenService } = require('../src/core/artifacts/downloadTo
 const { createArtifactDownloadService } = require('../src/core/artifacts/artifactDownloadService');
 const { createArtifactSourceClient } = require('../src/core/artifacts/artifactSourceClient');
 const { deriveArtifactUploadToken } = require('../src/auth/artifactUploadToken');
-const { ConflictError, UpstreamError, NotFoundError } = require('../src/core/errors');
+const { ConflictError, UpstreamError, NotFoundError, ValidationError } = require('../src/core/errors');
 
 const cleanups = [];
 after(async () => {
@@ -72,6 +72,11 @@ function fakeServices() {
       importRelease: record('importRelease', async () => ({ id: 'rel_1', status: 'ready' })),
       getRelease: record('getRelease', { id: 'rel_1' }),
       deleteRelease: record('deleteRelease', undefined),
+    },
+    composeService: {
+      listRefs: record('listRefs', async () => ({ platform: 'bitbucket', defaultBranch: 'main', branches: [], tags: [] })),
+      compose: record('compose', async () => ({ release: { id: 'rel_c', composition: {} }, deploymentId: 'deploy_c1' })),
+      createTag: record('createTag', async ({ name }) => ({ tag: { name, sha: 'a'.repeat(40), date: null, message: null } })),
     },
     targetService: {
       listTargets: record('listTargets', []),
@@ -139,6 +144,9 @@ const MATRIX = [
   ['GET', '/api/projects/p1/releases', null, 'viewer', 200],
   ['POST', '/api/projects/p1/releases', { version: '2.5.0' }, 'deployer', 202],
   ['POST', '/api/projects/p1/releases/import', { version: '2.5.0' }, 'deployer', 200],
+  ['POST', '/api/projects/p1/releases/compose', { base: { type: 'branch', name: 'main' }, branches: ['feature/a'] }, 'deployer', 202],
+  ['GET', '/api/projects/p1/repo/refs', null, 'viewer', 200],
+  ['POST', '/api/projects/p1/repo/tags', { name: '2.6.0', from: { type: 'branch', name: 'main' } }, 'admin', 201],
   ['GET', '/api/releases/rel_1', null, 'viewer', 200],
   ['DELETE', '/api/releases/rel_1', null, 'admin', 204],
   ['GET', '/api/projects/p1/targets', null, 'viewer', 200],
@@ -455,4 +463,69 @@ test('download: source failure or size mismatch → 502, never a wrong body', as
   });
   assert.equal(goneResponse.status, 502);
   assert.deepEqual(await goneResponse.json(), { error: 'The artifact source is unavailable.' });
+});
+
+// ------------------------------------------------------------ release composer
+
+test('release composer routes: refs query, compose 202 + server-side actor, prod refusal code, tags 201/409', async () => {
+  const services = fakeServices();
+  const { base } = await startApi({ services });
+
+  const refs = await call(base, 'GET', '/api/projects/p1/repo/refs?q=feat&hidePreview=1', { role: 'viewer' });
+  assert.equal(refs.status, 200);
+  assert.equal(refs.headers.get('cache-control'), 'no-store');
+  assert.deepEqual(await refs.json(), { platform: 'bitbucket', defaultBranch: 'main', branches: [], tags: [] });
+  assert.deepEqual(services.calls.find((c) => c.name === 'listRefs').args[0], { projectId: 'p1', q: 'feat', hidePreview: true });
+  assert.equal((await call(base, 'GET', '/api/projects/p1/repo/refs?q=a&q=b', { role: 'viewer' })).status, 400);
+
+  const body = {
+    base: { type: 'tag', name: '2.5.0' }, branches: ['feature/a', 'feature/b'], version: '0.0.0-qa.1',
+    components: ['frontend'], deployTo: { targetId: 'tgt_dev', components: ['frontend'] },
+  };
+  const composed = await call(base, 'POST', '/api/projects/p1/releases/compose', { role: 'deployer', body });
+  assert.equal(composed.status, 202);
+  assert.deepEqual(await composed.json(), {
+    release: { id: 'rel_c', composition: {} }, deploymentId: 'deploy_c1', sseUrl: '/api/deploy/logs/deploy_c1',
+  });
+  assert.deepEqual(services.calls.find((c) => c.name === 'compose').args[0], { projectId: 'p1', ...body, triggeredBy: 'user-deployer' });
+
+  for (const bad of [
+    { base: { type: 'commit', name: 'x' }, branches: ['a'] },
+    { base: { type: 'branch', name: 'main' }, branches: Array.from({ length: 11 }, (_, i) => `f${i}`) },
+    { base: { type: 'branch', name: 'main' }, branches: ['a'], ref: 'evil' },
+    { base: { type: 'branch', name: 'main' }, branches: ['a'], deployTo: { targetId: 'tgt_dev', confirmation: 'x' } },
+    { branches: ['a'] },
+  ]) {
+    assert.equal((await call(base, 'POST', '/api/projects/p1/releases/compose', { role: 'deployer', body: bad })).status, 400, JSON.stringify(bad));
+  }
+
+  services.composeService.compose = async () => {
+    throw new ValidationError('Target is production.', undefined, 'PREVIEW_NOT_ALLOWED_ON_PROD');
+  };
+  const prod = await call(base, 'POST', '/api/projects/p1/releases/compose', {
+    role: 'deployer', body: { base: { type: 'branch', name: 'main' }, branches: ['a'], deployTo: { targetId: 'tgt_prod' } },
+  });
+  assert.equal(prod.status, 400);
+  assert.deepEqual(await prod.json(), { error: 'Target is production.', code: 'PREVIEW_NOT_ALLOWED_ON_PROD' });
+
+  const tagBody = { name: '2.6.0', from: { type: 'commit', name: 'abc1234' }, message: 'Release' };
+  assert.equal((await call(base, 'POST', '/api/projects/p1/repo/tags', { role: 'deployer', body: tagBody })).status, 403);
+  const tagged = await call(base, 'POST', '/api/projects/p1/repo/tags', { role: 'admin', body: tagBody });
+  assert.equal(tagged.status, 201);
+  assert.deepEqual(await tagged.json(), { tag: { name: '2.6.0', sha: 'a'.repeat(40), date: null, message: null } });
+  assert.deepEqual(services.calls.find((c) => c.name === 'createTag').args[0], { projectId: 'p1', ...tagBody, triggeredBy: 'user-admin' });
+  assert.equal((await call(base, 'POST', '/api/projects/p1/repo/tags', { role: 'admin', body: { ...tagBody, name: '../x' } })).status, 400);
+
+  services.composeService.createTag = async () => { throw new ConflictError('Tag 2.6.0 already exists.'); };
+  assert.equal((await call(base, 'POST', '/api/projects/p1/repo/tags', { role: 'admin', body: tagBody })).status, 409);
+});
+
+test('POST /releases forwards an optional refType and rejects unknown ones', async () => {
+  const services = fakeServices();
+  const { base } = await startApi({ services });
+  const ok = await call(base, 'POST', '/api/projects/p1/releases', { role: 'deployer', body: { version: '2.6.0', ref: '2.6.0', refType: 'tag' } });
+  assert.equal(ok.status, 202);
+  assert.equal(services.calls.find((c) => c.name === 'createRelease').args[0].refType, 'tag');
+  const bad = await call(base, 'POST', '/api/projects/p1/releases', { role: 'deployer', body: { version: '2.6.0', refType: 'commit' } });
+  assert.equal(bad.status, 400);
 });
