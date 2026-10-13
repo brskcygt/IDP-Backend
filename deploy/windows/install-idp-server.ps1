@@ -765,6 +765,18 @@ $BackendEntry   = Join-Path $BackendDir 'src\server.js'
 $GatewayEntry   = Join-Path $GatewayDir 'src\server.js'
 $BackendEnvPath = Join-Path $BackendDir '.env'
 $GatewayEnvPath = Join-Path $DataDir 'gateway.env'
+
+# Port parametresi verilmediyse mevcut kurulumun portu korunur: 3001'i baska bir servisin tuttugu bir
+# sunucuda -Port 3101 ile kurulmus IDP, sonraki parametresiz guncellemede 3001'e geri donmesin.
+if (-not $PSBoundParameters.ContainsKey('Port') -and (Test-Path -LiteralPath $BackendEnvPath -PathType Leaf)) {
+    $existingPort = Get-EnvValue @(Get-Content -LiteralPath $BackendEnvPath) 'PORT'
+    if ($existingPort -cmatch '^[0-9]{1,5}$') { $Port = [int]$existingPort }
+}
+if (-not $PSBoundParameters.ContainsKey('GatewayPort') -and (Test-Path -LiteralPath $GatewayEnvPath -PathType Leaf)) {
+    $existingGatewayPort = Get-EnvValue @(Get-Content -LiteralPath $GatewayEnvPath) 'IDP_AGENT_GATEWAY_PORT'
+    if ($existingGatewayPort -cmatch '^[0-9]{1,5}$') { $GatewayPort = [int]$existingGatewayPort }
+}
+if ($Port -eq $GatewayPort) { throw ('Backend ve gateway portu ayni olamaz (' + $Port + ').') }
 $LogDir         = Join-Path $DataDir 'logs'
 $BackendLog     = Join-Path $LogDir 'backend.log'
 $GatewayLog     = Join-Path $LogDir 'gateway.log'
