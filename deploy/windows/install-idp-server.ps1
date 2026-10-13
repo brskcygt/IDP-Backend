@@ -21,6 +21,10 @@
 
 .EXAMPLE
     powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\deploy\windows\install-idp-server.ps1 -Uninstall
+
+.EXAMPLE
+    # Sistem Node'u eski kalmak zorunda: Node 24 zip'ini C:\IDP\node'a acin, betik onu kendisi bulur.
+    powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\deploy\windows\install-idp-server.ps1
 #>
 [CmdletBinding()]
 param(
@@ -41,6 +45,11 @@ param(
     # Agent'larin baglanacagi adres -> backend .env IDP_AGENT_PUBLIC_URL (ws:// veya wss://, orn. wss://agent.ornek.com).
     # Verilmezse .env'deki mevcut deger korunur; o da yoksa ws://<ilk ic IP>:<GatewayPort> yazilir (ic ag davranisi).
     [string]$AgentPublicUrl,
+
+    # node.exe'nin tam yolu. Sistemdeki Node baska uygulamalar icin eski kalmak zorundaysa IDP'ye ayri bir
+    # Node verilir. Verilmezse sira: <RepoPath'in ust dizini>\node\node.exe (orn. C:\IDP\node, Node zip'i
+    # buraya acilir; sonraki guncellemeler parametresiz de bunu bulur), C:\Program Files\nodejs, PATH.
+    [string]$NodePath,
 
     # Cloudflare Access service token -> backend .env IDP_AGENT_CF_ACCESS_CLIENT_ID / _SECRET (ikisi birlikte).
     # -CfAccessClientId verilip secret verilmezse secret gizli girisle sorulur. Verilmezse mevcut degerler korunur.
@@ -837,9 +846,15 @@ try {
     Write-Info ('Veri    : ' + $DataDir)
 
     # --- Node: tam yol. Zamanlanmis gorev altinda PATH surec baslangicinda donar; gorevlerde tam yol kullanilir.
-    $nodeCandidates = @((Join-Path $env:ProgramFiles 'nodejs\node.exe'))
-    $nodeOnPath = Get-Command node.exe -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
-    if ($nodeOnPath) { $nodeCandidates += $nodeOnPath.Path }
+    if ($NodePath) {
+        if (-not (Test-Path -LiteralPath $NodePath -PathType Leaf)) { throw ('-NodePath bulunamadi: ' + $NodePath) }
+        $nodeCandidates = @($NodePath)
+    } else {
+        # IDP'ye ozel Node (sistem Node'una dokunmadan) once gelir.
+        $nodeCandidates = @((Join-Path (Split-Path -Parent $RepoPath) 'node\node.exe'), (Join-Path $env:ProgramFiles 'nodejs\node.exe'))
+        $nodeOnPath = Get-Command node.exe -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
+        if ($nodeOnPath) { $nodeCandidates += $nodeOnPath.Path }
+    }
     $NodeExe = $null
     foreach ($candidate in $nodeCandidates) {
         if (Test-Path -LiteralPath $candidate -PathType Leaf) { $NodeExe = (Resolve-Path -LiteralPath $candidate).ProviderPath; break }
