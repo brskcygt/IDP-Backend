@@ -254,7 +254,9 @@ function manifestFileName(artifactName, version) {
 // 2.2 Project config: config.artifactDeploy
 // ---------------------------------------------------------------------------
 
-const ARTIFACT_DEPLOY_KEYS = ['source', 'build', 'versionVariable', 'artifactName', 'components'];
+const ARTIFACT_DEPLOY_KEYS = ['source', 'build', 'versionVariable', 'artifactName', 'components', 'localFolder'];
+// Absolute folder on the IDP server holding ready .tar.gz builds: C:\\builds, \\\\host\\share or /srv/builds.
+const LOCAL_FOLDER_PATTERN = /^(?:[A-Za-z]:[\\/]|\\\\[^\\/]|\/)[^\u0000-\u001f]*$/;
 const SOURCE_KEYS = ['platform', 'owner', 'repo', 'baseUrl', 'authType', 'username', 'token', 'hasToken'];
 const BUILD_KEYS = ['provider', 'parameters'];
 const COMPONENT_KEYS = ['name', 'subdir', 'os', 'runtime', 'preserve', 'health', 'writeRuntimeConfig', 'hooks'];
@@ -512,6 +514,11 @@ function validateArtifactDeployConfig(value, path = 'artifactDeploy') {
   }
   optionalPatternString(value.versionVariable, VARIABLE_KEY_PATTERN, 100, childPath(path, 'versionVariable'), errors);
   optionalPatternString(value.artifactName, ARTIFACT_NAME_PATTERN, 64, childPath(path, 'artifactName'), errors);
+  if (value.localFolder !== undefined && value.localFolder !== null && value.localFolder !== '') {
+    if (typeof value.localFolder !== 'string' || value.localFolder.length > 1000 || !LOCAL_FOLDER_PATTERN.test(value.localFolder.trim())) {
+      errors.push({ path: childPath(path, 'localFolder'), message: 'Must be an absolute folder path on the IDP server.' });
+    }
+  }
 
   if (value.components !== undefined && value.components !== null) {
     const componentsPath = childPath(path, 'components');
@@ -624,6 +631,8 @@ function normalizeArtifactDeployConfig(raw) {
     versionVariable: trimmed(raw.versionVariable) || 'VERSION',
     artifactName,
     components: Array.isArray(raw.components) ? raw.components.filter(isPlainObject).map(normalizeComponent) : [],
+    // Where the project's own CI drops finished builds; '' = no folder source.
+    localFolder: typeof raw.localFolder === 'string' ? raw.localFolder.trim() : '',
   };
 }
 

@@ -98,7 +98,7 @@ function createArtifactUploadService({
       }
     },
 
-    async finalizeRelease({ projectId, version, manifest }) {
+    async finalizeRelease({ projectId, version, manifest, createdBy = 'ci-upload' }) {
       const project = requireProject(projectId);
       requireVersion(version);
       const check = validateManifest(manifest, { project: artifactName(project), version });
@@ -131,9 +131,9 @@ function createArtifactUploadService({
         }
         if (release && protectedRelease(release)) throw new ConflictError(`Release ${version} is active on a target and cannot be replaced.`);
         if (!release) {
-          release = repository.createRelease({ projectId, version, status: 'building', createdBy: 'ci-upload' });
+          release = repository.createRelease({ projectId, version, status: 'building', createdBy });
         } else if (release.status !== 'building') {
-          release = repository.updateRelease(release.id, { status: 'building', error: null, createdBy: release.createdBy || 'ci-upload' });
+          release = repository.updateRelease(release.id, { status: 'building', error: null, createdBy: release.createdBy || createdBy });
         }
 
         await store.finalize({ projectId, version, manifest: check.manifest });

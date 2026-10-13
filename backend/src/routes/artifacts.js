@@ -76,6 +76,20 @@ const createTagSchema = object({
   allowUnknown: false,
 });
 const importReleaseSchema = object({ fields: { version: versionRule() }, allowUnknown: false });
+const folderReleaseSchema = object({
+  fields: {
+    version: versionRule(),
+    files: array({
+      min: 1,
+      max: 10,
+      of: object({
+        fields: { component: string({ min: 1, max: 32, pattern: COMPONENT_NAME_PATTERN }), file: string({ min: 1, max: 255 }) },
+        allowUnknown: false,
+      }),
+    }),
+  },
+  allowUnknown: false,
+});
 const buildAndDeploySchema = object({ fields: { components: componentsRule() }, allowUnknown: false });
 const deploySchema = object({
   fields: {
@@ -113,7 +127,7 @@ function bearerToken(req) {
 function createArtifactRoutes({ services, getProject, auditLogger, publicUrl = null, publicUrlError = null, upload = {}, rateLimits = {} }) {
   if (!services) throw new Error('createArtifactRoutes: services are required.');
   if (!auditLogger) throw new Error('createArtifactRoutes: auditLogger is required.');
-  const { releaseService, composeService, targetService, artifactDeployService, uploadService, downloadService } = services;
+  const { releaseService, composeService, targetService, artifactDeployService, uploadService, folderImportService, downloadService } = services;
   const trigger = rateLimits.trigger ? [rateLimits.trigger] : [];
   const actor = (req) => req.session?.user?.username;
   const invalid = (res, message, result) => res.status(400).json({ error: message, details: result.errors });
@@ -227,6 +241,30 @@ function createArtifactRoutes({ services, getProject, auditLogger, publicUrl = n
     if (!body.valid) return invalid(res, 'Invalid import request.', body);
     try {
       res.json(await releaseService.importRelease({ projectId: req.params.id, version: body.value.version, triggeredBy: actor(req) }));
+    } catch (err) {
+      sendError(res, err);
+    }
+  });
+
+  // Build folder on this server: ready .tar.gz files another CI copied here.
+  api.get('/api/projects/:id/build-folder', requirePermission('release:create'), async (req, res) => {
+    try {
+      res.json(await folderImportService.listFolder(req.params.id));
+    } catch (err) {
+      sendError(res, err);
+    }
+  });
+
+  api.post('/api/projects/:id/releases/from-folder', requirePermission('release:create'), ...trigger, async (req, res) => {
+    const body = validate(req.body ?? {}, folderReleaseSchema);
+    if (!body.valid) return invalid(res, 'Invalid folder release request.', body);
+    try {
+      res.json(await folderImportService.importFromFolder({
+        projectId: req.params.id,
+        version: body.value.version,
+        files: body.value.files,
+        triggeredBy: actor(req),
+      }));
     } catch (err) {
       sendError(res, err);
     }

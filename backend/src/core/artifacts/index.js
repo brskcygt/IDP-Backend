@@ -28,6 +28,7 @@ const { createTargetService } = require('./targetService');
 const { createArtifactDeployService } = require('./artifactDeployService');
 const { createArtifactDownloadService } = require('./artifactDownloadService');
 const { createArtifactUploadService } = require('./artifactUploadService');
+const { createFolderImportService } = require('./folderImportService');
 const { createLocalArtifactStore } = require('./localArtifactStore');
 const { validateArtifactStorageEnv, validateArtifactPublicUrlEnv } = require('../../config');
 const {
@@ -129,6 +130,8 @@ const uploadService = createArtifactUploadService({
   getProject,
   isReleaseBusy: (releaseId) => artifactDeployService ? artifactDeployService.isReleaseBusy(releaseId) : false,
 });
+// Ready builds another CI drops into a folder on this server.
+const folderImportService = createFolderImportService({ repository, uploadService, auditLogger, getProject });
 const downloadService = createArtifactDownloadService({ repository, tokens, getProject, resolveSecrets, localStore });
 
 module.exports = {
@@ -140,6 +143,7 @@ module.exports = {
   targetService,
   artifactDeployService,
   uploadService,
+  folderImportService,
   downloadService,
   localStore,
 };
