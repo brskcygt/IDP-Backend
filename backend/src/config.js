@@ -270,7 +270,10 @@ function validateArtifactStorageEnv(env = process.env) {
  * blocks startup — same rule as IDP_AGENT_PUBLIC_URL. Must be http(s) with no
  * credentials, query or fragment; a path prefix (reverse proxy) is allowed.
  * With NODE_ENV=production only https:// is accepted, because agents send
- * their download token to this address.
+ * their download token to this address — unless the install is the
+ * documented plain-HTTP internal one (IDP_COOKIE_SECURE=false, which the
+ * Windows installer writes): there the session cookie already travels in the
+ * clear, so refusing http:// here only made artifact deploy impossible.
  *
  * Pure (reads only `env`).
  * @param {NodeJS.ProcessEnv} [env]
@@ -297,7 +300,11 @@ function validateArtifactPublicUrlEnv(env = process.env) {
   } else if (parsed.search || parsed.hash) {
     publicUrlError = 'IDP_PUBLIC_URL geçersiz: sorgu (?) veya # parçası içeremez.';
   } else if (isProduction && parsed.protocol !== 'https:') {
-    publicUrlError = "IDP_PUBLIC_URL geçersiz: NODE_ENV=production iken https:// olmalı (agent'lar indirme token'ını bu adrese gönderir).";
+    if (String(env.IDP_COOKIE_SECURE || '').trim().toLowerCase() === 'false') {
+      warnings.push("IDP_PUBLIC_URL düz HTTP: agent'ların indirme token'ı ağda şifresiz gider, sadece güvenilir iç ağda kullanın.");
+    } else {
+      publicUrlError = "IDP_PUBLIC_URL geçersiz: NODE_ENV=production iken https:// olmalı (agent'lar indirme token'ını bu adrese gönderir). Düz HTTP iç ağ kurulumunda IDP_COOKIE_SECURE=false olmalı.";
+    }
   }
   if (publicUrlError) {
     warnings.push(`${publicUrlError} Artifact deploy (POST /api/targets/:id/deploy) 503 döner.`);

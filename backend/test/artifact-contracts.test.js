@@ -393,6 +393,15 @@ test('IDP_PUBLIC_URL validation', () => {
   assert.equal(validateArtifactPublicUrlEnv({ IDP_PUBLIC_URL: 'https://idp.example/' }).publicUrl, 'https://idp.example');
   assert.equal(validateArtifactPublicUrlEnv({ IDP_PUBLIC_URL: 'https://idp.example/idp' }).publicUrl, 'https://idp.example/idp');
   assert.equal(validateArtifactPublicUrlEnv({ IDP_PUBLIC_URL: 'http://10.0.0.5:3001' }).publicUrl, 'http://10.0.0.5:3001');
+  // Production: https only, except the plain-HTTP internal install (IDP_COOKIE_SECURE=false), with a warning.
+  const prodLan = validateArtifactPublicUrlEnv({ IDP_PUBLIC_URL: 'http://192.168.0.246:3101', NODE_ENV: 'production' });
+  assert.equal(prodLan.publicUrl, null);
+  assert.match(prodLan.publicUrlError, /IDP_COOKIE_SECURE=false/);
+  const internal = validateArtifactPublicUrlEnv({ IDP_PUBLIC_URL: 'http://192.168.0.246:3101', NODE_ENV: 'production', IDP_COOKIE_SECURE: 'false' });
+  assert.equal(internal.publicUrl, 'http://192.168.0.246:3101');
+  assert.equal(internal.publicUrlError, null);
+  assert.match(internal.warnings[0], /düz HTTP/);
+  assert.equal(validateArtifactPublicUrlEnv({ IDP_PUBLIC_URL: 'https://idp.example', NODE_ENV: 'production', IDP_COOKIE_SECURE: 'false' }).warnings.length, 0);
   for (const value of ['ftp://x', 'not a url', 'https://u:p@idp.example', 'https://idp.example/?x=1', 'https://idp.example/#a']) {
     const result = validateArtifactPublicUrlEnv({ IDP_PUBLIC_URL: value });
     assert.equal(result.publicUrl, null, value);

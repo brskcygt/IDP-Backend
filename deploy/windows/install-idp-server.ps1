@@ -1097,6 +1097,19 @@ try {
         Set-EnvValue $backendLines 'IDP_AGENT_PUBLIC_URL' $agentPublicUrlSummary
         Write-Info ('IDP_AGENT_PUBLIC_URL: ' + $agentPublicUrlSummary + ' (varsayilan, ic ag). Internetten erisim icin -AgentPublicUrl wss://... verin.')
     }
+    # Agent'larin surum paketlerini indirdigi backend adresi. Yoksa ic agdaki ilk IP + backend portu yazilir;
+    # mevcut deger (orn. https://idp.<alan>) hic degistirilmez. Bu kurulum duz HTTP (IDP_COOKIE_SECURE=false)
+    # oldugu icin backend http:// adresi uyariyla kabul eder.
+    $existingBackendPublicUrl = Get-EnvValue $backendLines 'IDP_PUBLIC_URL'
+    if ([string]::IsNullOrWhiteSpace($existingBackendPublicUrl)) {
+        $backendPublicHost = [string](@(Get-ReachableHosts $BindHost) | Select-Object -First 1)
+        if ($backendPublicHost.Contains(':')) { $backendPublicHost = '[' + $backendPublicHost + ']' }
+        $backendPublicUrl = 'http://' + $backendPublicHost + ':' + $Port
+        Set-EnvValue $backendLines 'IDP_PUBLIC_URL' $backendPublicUrl
+        Write-Info ('IDP_PUBLIC_URL: ' + $backendPublicUrl + ' (varsayilan, ic ag). Farkliysa backend\.env icinde degistirin.')
+    } else {
+        Write-Info ('IDP_PUBLIC_URL: mevcut deger korundu (' + $existingBackendPublicUrl.Trim() + ')')
+    }
     if ($agentPublicUrlSummary -match '^ws://') {
         Set-EnvValue $backendLines 'IDP_ALLOW_INSECURE_AGENT_WS' 'true'
         Write-Warn 'Agent WebSocket duz ws://: yalniz kontrollu LAN testi icindir. Public kullanimdan once wss:// yapin.'
