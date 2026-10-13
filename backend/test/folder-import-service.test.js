@@ -223,3 +223,77 @@ test('importFromFolder: refuses files still being copied, missing, unknown or do
     ctx.cleanup();
   }
 });
+
+test('build folders: listed next to archives, packed on import with their contents at the root', async (t) => {
+  const { spawnSync } = require('node:child_process');
+  if (spawnSync('tar', ['--version']).status !== 0) return t.skip('tar is not available');
+  const ctx = setup();
+  try {
+    const frontend = path.join(ctx.buildFolder, 'front-build');
+    fs.mkdirSync(path.join(frontend, 'assets'), { recursive: true });
+    fs.writeFileSync(path.join(frontend, 'index.html'), '<html></html>');
+    fs.writeFileSync(path.join(frontend, 'assets', 'app.js'), 'console.log(1)');
+    const backend = path.join(ctx.buildFolder, 'jetsrm-backend');
+    fs.mkdirSync(path.join(backend, 'dist'), { recursive: true });
+    fs.writeFileSync(path.join(backend, 'package.json'), JSON.stringify({ name: 'jetsrm', version: '2.3.1' }));
+    fs.writeFileSync(path.join(backend, 'dist', 'app.js'), 'module.exports = 1');
+    fs.mkdirSync(path.join(ctx.buildFolder, '.git'));
+    const old = new Date(Date.now() - HOUR);
+    for (const file of [frontend, path.join(frontend, 'index.html'), path.join(frontend, 'assets'), path.join(frontend, 'assets', 'app.js'),
+      backend, path.join(backend, 'package.json'), path.join(backend, 'dist'), path.join(backend, 'dist', 'app.js')]) {
+      fs.utimesSync(file, old, old);
+    }
+
+    const listing = await ctx.service.listFolder('p1');
+    const front = listing.files.find((file) => file.name === 'front-build');
+    const back = listing.files.find((file) => file.name === 'jetsrm-backend');
+    assert.deepEqual([front.kind, front.component, front.size, front.version], ['directory', 'frontend', null, null]);
+    assert.deepEqual([back.kind, back.component, back.version], ['directory', 'backend', '2.3.1']);
+    assert.ok(!listing.files.some((file) => file.name === '.git'), 'hidden folders stay out');
+
+    const release = await ctx.service.importFromFolder({
+      projectId: 'p1',
+      version: '2.3.1',
+      files: [{ component: 'backend', file: 'jetsrm-backend' }, { component: 'frontend', file: 'front-build' }],
+      triggeredBy: 'baris',
+    });
+    assert.equal(release.status, 'ready');
+    assert.deepEqual(release.manifest.artifacts.map((artifact) => artifact.file), ['jetsrm-backend-2.3.1.tar.gz', 'jetsrm-frontend-2.3.1.tar.gz']);
+
+    // Contents at the archive root, like the CI's own `tar -C <dir> .`.
+    const { stream } = await ctx.store.open({ artifact: { fileName: 'jetsrm-frontend-2.3.1.tar.gz' }, release: { projectId: 'p1', version: '2.3.1' } });
+    const archive = path.join(ctx.dir, 'check.tar.gz');
+    await require('node:stream/promises').pipeline(stream, fs.createWriteStream(archive));
+    const entries = spawnSync('tar', ['-tzf', archive], { encoding: 'utf8' }).stdout.split('\n').map((line) => line.replace(/^\.\//, '')).filter(Boolean);
+    assert.ok(entries.includes('index.html') && entries.includes('assets/app.js'), entries.join(','));
+
+    // The CI overwrites the folder: the release keeps what was packed.
+    fs.writeFileSync(path.join(frontend, 'index.html'), 'next build');
+    assert.equal(ctx.repository.findReleaseByVersion('p1', '2.3.1').manifest.artifacts[1].size, release.manifest.artifacts[1].size);
+    assert.ok(ctx.audit.some((entry) => entry.action === 'RELEASE_IMPORTED_FROM_FOLDER' && entry.metadata.files.includes('frontend:front-build')));
+  } finally {
+    ctx.cleanup();
+  }
+});
+
+test('build folders: a folder with a file still being written is refused, and no path escapes the folder', async () => {
+  const ctx = setup();
+  try {
+    const frontend = path.join(ctx.buildFolder, 'front-build');
+    fs.mkdirSync(path.join(frontend, 'assets'), { recursive: true });
+    const old = new Date(Date.now() - HOUR);
+    fs.utimesSync(frontend, old, old);
+    // Only a nested file is fresh: the folder's own mtime does not show it.
+    fs.writeFileSync(path.join(frontend, 'assets', 'app.js'), 'half');
+    const justNow = new Date(Date.now() + HOUR - 2_000); // the service clock runs an hour ahead
+    fs.utimesSync(path.join(frontend, 'assets', 'app.js'), justNow, justNow);
+    const run = (file) => ctx.service.importFromFolder({ projectId: 'p1', version: '3.0.0', files: [{ component: 'frontend', file }] });
+
+    await assert.rejects(() => run('front-build'), (err) => err instanceof ConflictError && /may still be being copied/.test(err.message));
+    await assert.rejects(() => run('..'), /Invalid file name/);
+    await assert.rejects(() => run('a/b'), /Invalid file name/);
+    await assert.rejects(() => run('a\\b'), /Invalid file name/);
+  } finally {
+    ctx.cleanup();
+  }
+});
