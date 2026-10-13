@@ -14,6 +14,11 @@ const axios = require('axios');
  * 2. Poll the Jenkins Queue to resolve the actual Build Number
  * 3. Stream real-time console output via /logText/progressiveText
  * 4. Abort a running build via /stop
+ *
+ * With `jobType: 'multibranch'`, `jobName` is a Multibranch Pipeline and the
+ * build runs in the child job of `branch` (falling back to `defaultBranch`,
+ * then 'main'). A branch Jenkins has not discovered yet triggers a repository
+ * scan first; see resolveBranchJob().
  */
 class JenkinsAdapter extends DeploymentAdapter {
   constructor(config) {
@@ -30,6 +35,15 @@ class JenkinsAdapter extends DeploymentAdapter {
     // streamLogs() below.
     this.supportsLogStreaming = true;
     this.logPrefix = '[Jenkins]';
+
+    // The job builds run in: the configured one, or for a multibranch job the
+    // branch child that resolveBranchJob() picks.
+    this.jobName = this.config.jobName;
+    this.multibranch = this.config.jobType === 'multibranch';
+    this.branchJobResolved = false;
+    const timing = this.config.timing || {};
+    this.scanTimeoutMs = timing.scanTimeoutMs ?? 120_000;
+    this.scanPollMs = timing.scanPollMs ?? 3_000;
 
     // Build axios instance with Jenkins auth
     this.client = axios.create({
@@ -78,8 +92,11 @@ class JenkinsAdapter extends DeploymentAdapter {
    *   Poll queue URL/api/json until `executable.number` is present
    */
   async trigger(params) {
-    const jobPath = jenkinsJobPath(this.config.jobName);
-    this.log(`Triggering job "${this.config.jobName}" with params: ${JSON.stringify(params)}`);
+    if (this.multibranch && !this.branchJobResolved) {
+      await this.resolveBranchJob(this.config.branch || this.config.defaultBranch || 'main');
+    }
+    const jobPath = this._jobPath();
+    this.log(`Triggering job "${this.jobName}" with params: ${JSON.stringify(params)}`);
 
     try {
       // 1. Trigger the build
@@ -108,10 +125,110 @@ class JenkinsAdapter extends DeploymentAdapter {
       return assertTriggerResult({ buildNumber: this.buildNumber, status: 'started' }, 'JenkinsAdapter');
     } catch (err) {
       if (err.response?.status === 404) {
-        throw new Error(`Jenkins job "${this.config.jobName}" not found. Check the job name.`);
+        throw new Error(`Jenkins job "${this.jobName}" not found. Check the job name.`);
       }
       throw new Error(`Failed to trigger Jenkins build: ${err.message}`);
     }
+  }
+
+  /**
+   * Multibranch: points this adapter at the child job of `ref`.
+   *
+   * Jenkins creates a child per branch (and per tag, when tag discovery is on)
+   * only when it scans the repository, so a branch pushed a minute ago — a
+   * composed preview branch, typically — has no job yet. Asking for a scan and
+   * waiting for the child is what lets IDP build it without a trip to Jenkins.
+   *
+   * A new child also does not know its parameters until its Jenkinsfile has
+   * run once (the `parameters { }` block registers them), and buildWithParameters
+   * on a job without parameters fails. Jenkins builds a newly discovered branch
+   * on its own; this waits for that run rather than starting a parameterless
+   * build itself, which could publish something under the Jenkinsfile's defaults.
+   */
+  async resolveBranchJob(ref) {
+    const parent = this.config.jobName;
+    const parentPath = jenkinsJobPath(parent);
+
+    let child = await this._findBranchJob(parentPath, ref);
+    if (!child) {
+      this.log(`No job for '${ref}' in "${parent}" yet — asking Jenkins to scan the repository...`);
+      await this.client.post(`${parentPath}/build`, null, {
+        params: { delay: '0' },
+        validateStatus: (status) => status < 400,
+      });
+      child = await this._pollUntil(() => this._findBranchJob(parentPath, ref));
+      if (!child) {
+        throw new Error(
+          `"${parent}" has no job for '${ref}' even after a repository scan. Check that the repository it scans has this branch, and for a tag that tag discovery is enabled.`
+        );
+      }
+    }
+
+    this.jobName = `${parent}/${child.name}`;
+    this.log(`Building in "${parent}" » ${child.displayName || ref}.`);
+    await this._waitForParameters(ref);
+    this.branchJobResolved = true;
+  }
+
+  /** The child job of a multibranch project whose branch/tag is `ref`, or null. */
+  async _findBranchJob(parentPath, ref) {
+    const { data } = await this.client.get(`${parentPath}/api/json`, {
+      params: { tree: '_class,jobs[name,displayName]' },
+    });
+    if (!/MultiBranch/i.test(String(data?._class || ''))) {
+      throw new Error(`"${this.config.jobName}" is not a Multibranch Pipeline job — set the job type to standard in project settings.`);
+    }
+    const jobs = Array.isArray(data.jobs) ? data.jobs : [];
+    // Jenkins names the child with the branch URL-encoded (feature/x → feature%2Fx)
+    // and shows the real name as its display name.
+    return (
+      jobs.find((job) => job.name === ref) ||
+      jobs.find((job) => job.displayName === ref || safeDecode(job.name) === ref) ||
+      null
+    );
+  }
+
+  async _waitForParameters(ref) {
+    let waitingLogged = false;
+    const found = await this._pollUntil(async () => {
+      const { data } = await this.client.get(`${this._jobPath()}/api/json`, {
+        params: { tree: 'inQueue,lastBuild[number,building],property[parameterDefinitions[name]]' },
+      });
+      const definitions = (data?.property || []).flatMap((property) => property?.parameterDefinitions || []);
+      if (definitions.length > 0) return true;
+      const busy = data?.inQueue || data?.lastBuild?.building;
+      if (!busy && data?.lastBuild) {
+        throw new Error(
+          `The job for '${ref}' declares no parameters — the Jenkinsfile on that branch needs a parameters { } block with VERSION.`
+        );
+      }
+      if (!waitingLogged) {
+        waitingLogged = true;
+        this.log(`Waiting for the first run of '${ref}' so Jenkins learns its parameters...`);
+      }
+      return null;
+    });
+    if (!found) {
+      throw new Error(
+        `The job for '${ref}' has never run, so Jenkins does not know its parameters yet. Run it once in Jenkins (it stops at "VERSION parameter is required"), then build again.`
+      );
+    }
+  }
+
+  /** Calls `probe` until it returns something truthy or the scan timeout passes. */
+  async _pollUntil(probe) {
+    const deadline = Date.now() + this.scanTimeoutMs;
+    for (;;) {
+      if (this.aborted) throw new Error('Build aborted while waiting for Jenkins.');
+      const result = await probe();
+      if (result) return result;
+      if (Date.now() >= deadline) return null;
+      await this._sleep(this.scanPollMs);
+    }
+  }
+
+  _jobPath() {
+    return jenkinsJobPath(this.jobName);
   }
 
   /**
@@ -145,7 +262,7 @@ class JenkinsAdapter extends DeploymentAdapter {
           }
         } else {
           // No queue ID — try fetching the latest build number
-          const jobPath = jenkinsJobPath(this.config.jobName);
+          const jobPath = this._jobPath();
           const res = await this.client.get(`${jobPath}/lastBuild/api/json`);
           if (res.data?.number) {
             return res.data.number;
@@ -176,7 +293,7 @@ class JenkinsAdapter extends DeploymentAdapter {
       return;
     }
 
-    const jobPath = jenkinsJobPath(this.config.jobName);
+    const jobPath = this._jobPath();
     let textOffset = 0;
     let reportedPercent = null;
 
@@ -269,7 +386,7 @@ class JenkinsAdapter extends DeploymentAdapter {
     if (this._logTimer) clearTimeout(this._logTimer);
 
     if (this.buildNumber) {
-      const jobPath = jenkinsJobPath(this.config.jobName);
+      const jobPath = this._jobPath();
       try {
         await this.client.post(`${jobPath}/${this.buildNumber}/stop`);
         this.log(`✓ Build #${this.buildNumber} abort signal sent to Jenkins.`);
@@ -286,6 +403,14 @@ class JenkinsAdapter extends DeploymentAdapter {
     return new Promise(resolve => {
       this._pollTimer = setTimeout(resolve, ms);
     });
+  }
+}
+
+function safeDecode(value) {
+  try {
+    return decodeURIComponent(value);
+  } catch {
+    return value;
   }
 }
 

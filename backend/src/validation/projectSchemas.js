@@ -22,6 +22,7 @@ const PROVIDERS = ['Jenkins', 'PMP', 'Server', 'Pipeline'];
 const TARGET_OS_VALUES = ['linux', 'windows'];
 const WINDOWS_TRANSPORT_VALUES = ['winrm', 'idp-agent'];
 const AUTH_TYPES = ['manual', 'pmp'];
+const JENKINS_JOB_TYPES = ['standard', 'multibranch'];
 const HOST_KEY_POLICIES = ['tofu', 'strict', 'insecure'];
 const USER_ROLES = ['admin', 'deployer', 'viewer'];
 
@@ -92,6 +93,10 @@ const ciConfigRule = () => optional(object({
 const baseConfigFields = {
   url: optional(string({ max: 2000 })),
   jobName: optional(string({ max: 255 })),
+  // 'multibranch': jobName is a Multibranch Pipeline and every branch/tag is its own child job.
+  jobType: optional(string({ enum: JENKINS_JOB_TYPES })),
+  // Multibranch only: the child job a build without a branch uses.
+  defaultBranch: optional(string({ max: 255 })),
   username: optional(string({ max: 255 })),
   password: optional(string({ max: 2000 })),
   apiToken: optional(string({ max: 2000 })),

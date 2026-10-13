@@ -487,6 +487,17 @@ test('defaultCreateBuildAdapter: pipeline gets extraVariables + ref, jenkins get
   // (whose whole point is "build this branch") unable to use the provider.
   const jenkinsOnBranch = defaultCreateBuildAdapter({ provider: 'jenkins', config, version: '2.5.0', versionVariable: 'VERSION', ref: 'test' });
   assert.deepEqual(jenkinsOnBranch.triggerParams, { BRANCH: 'test', VERSION: '2.5.0' });
+  // A multibranch job also needs the branch to pick its child job.
+  const multibranch = defaultCreateBuildAdapter({
+    provider: 'jenkins',
+    config: { ...config, jobType: 'multibranch', defaultBranch: 'main' },
+    version: '2.5.0',
+    versionVariable: 'VERSION',
+    ref: 'feature/a',
+  });
+  assert.equal(multibranch.adapter.multibranch, true);
+  assert.equal(multibranch.adapter.config.branch, 'feature/a');
+  assert.equal(multibranch.adapter.config.defaultBranch, 'main');
   assert.throws(() => defaultCreateBuildAdapter({ provider: 'none', config, version: '2.5.0', versionVariable: 'VERSION' }), ValidationError);
   assert.throws(
     () => defaultCreateBuildAdapter({ provider: 'pipeline', config: { ciConfig: {} }, version: '2.5.0', versionVariable: 'VERSION' }),

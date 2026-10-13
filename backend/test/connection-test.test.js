@@ -47,6 +47,9 @@ function fakeJenkinsAdapterClass({ connectBehavior = 'ok', jobLookup = 'ok' } = 
       this.client = {
         get: async (urlPath) => {
           if (jobLookup === 'ok') return { data: { name: config.jobName } };
+          if (jobLookup === 'multibranch') {
+            return { data: { _class: 'org.jenkinsci.plugins.workflow.multibranch.WorkflowMultiBranchProject', jobs: [{ name: 'main' }, { name: 'feature%2Fa' }] } };
+          }
           if (jobLookup === '404') {
             throw Object.assign(new Error('Not Found'), { response: { status: 404 } });
           }
@@ -102,6 +105,23 @@ test('Jenkins: API reachable + job exists -> both checks ok:true', async () => {
   assert.equal(api.ok, true);
   assert.equal(job.ok, true);
   assert.match(job.detail, /deploy-job/);
+});
+
+test('Jenkins: multibranch job type checks that the job really is a multibranch project', async () => {
+  const config = { url: 'http://jenkins.local', jobName: 'release', jobType: 'multibranch' };
+  const run = (jobLookup) =>
+    testProjectConnection({
+      project: baseProject({ provider: 'Jenkins', config }),
+      deps: { JenkinsAdapter: fakeJenkinsAdapterClass({ jobLookup }), resolveSecrets: passThroughResolveSecrets },
+    });
+
+  const ok = (await run('multibranch')).checks.find((c) => c.name === 'Jenkins Job');
+  assert.equal(ok.ok, true);
+  assert.match(ok.detail, /2 branch\/tag job/);
+
+  const plain = (await run('ok')).checks.find((c) => c.name === 'Jenkins Job');
+  assert.equal(plain.ok, false);
+  assert.match(plain.detail, /not a Multibranch Pipeline/);
 });
 
 test('Jenkins: connection refused -> Jenkins API fails with an actionable message, job not tested', async () => {

@@ -112,6 +112,10 @@ function defaultCreateBuildAdapter({ provider, config, version, versionVariable,
       username: config.username,
       apiToken: config.apiToken,
       jobName: config.jobName,
+      jobType: config.jobType,
+      defaultBranch: config.defaultBranch,
+      // Multibranch: the branch picks the child job. A standard job ignores it.
+      branch: ref || null,
     });
     return { adapter, triggerParams: { ...parameters, ...(ref ? { [BRANCH_VARIABLE]: ref } : {}), [versionVariable]: version } };
   }

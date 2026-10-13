@@ -62,8 +62,20 @@ async function testJenkins({ config, appConfig, JenkinsAdapter, timeoutMs }) {
   } else {
     try {
       // Read-only: fetches the job's own /api/json, never triggers a build.
-      await withTimeout(adapter.client.get(`${jenkinsJobPath(jobName)}/api/json`), timeoutMs, 'Jenkins Job');
-      checks.push(makeCheck('Jenkins Job', true, `Job '${jobName}' exists.`));
+      const job = await withTimeout(
+        adapter.client.get(`${jenkinsJobPath(jobName)}/api/json`, { params: { tree: '_class,jobs[name]' } }),
+        timeoutMs,
+        'Jenkins Job'
+      );
+      if (config.jobType === 'multibranch') {
+        const isMultibranch = /MultiBranch/i.test(String(job?.data?._class || ''));
+        const branches = Array.isArray(job?.data?.jobs) ? job.data.jobs.length : 0;
+        checks.push(isMultibranch
+          ? makeCheck('Jenkins Job', true, `Multibranch '${jobName}' exists with ${branches} branch/tag job(s).`)
+          : makeCheck('Jenkins Job', false, `'${jobName}' exists but is not a Multibranch Pipeline — set the job type to standard.`));
+      } else {
+        checks.push(makeCheck('Jenkins Job', true, `Job '${jobName}' exists.`));
+      }
     } catch (err) {
       const status = err && err.response && err.response.status;
       if (status === 404) {

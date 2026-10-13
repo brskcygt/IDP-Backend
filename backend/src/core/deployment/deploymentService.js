@@ -62,6 +62,8 @@ function createAdapter(project, appConfig) {
       username: pCfg.username || appConfig.jenkins.user,
       apiToken: pCfg.apiToken || appConfig.jenkins.apiToken,
       jobName: pCfg.jobName || project.name,
+      jobType: pCfg.jobType,
+      defaultBranch: pCfg.defaultBranch,
     });
   } else if (project.provider === 'PMP') {
     return new PmpWebAdapter({
