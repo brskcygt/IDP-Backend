@@ -29,6 +29,8 @@ class JenkinsAdapter extends DeploymentAdapter {
     this._aborting = false;
     this._pollTimer = null;
     this._logTimer = null;
+    /** Resolves the sleep in progress, if any (see _sleep / abort). */
+    this._wake = null;
 
     // (T-57) JenkinsAdapter is the one adapter with a genuine, separate
     // post-trigger log stream (Jenkins' progressiveText API) — see
@@ -120,6 +122,12 @@ class JenkinsAdapter extends DeploymentAdapter {
 
       // 2. Poll to resolve Build Number
       this.buildNumber = await this._pollForBuildNumber();
+      // Aborted while the queue item was turning into a build: abort() found
+      // no build number then, so the build it was cancelling is stopped here.
+      if (this.aborted) {
+        await this._stopBuild();
+        throw new Error(`Build #${this.buildNumber} was aborted.`);
+      }
       this.log(`✓ Build #${this.buildNumber} started.`);
 
       return assertTriggerResult({ buildNumber: this.buildNumber, status: 'started' }, 'JenkinsAdapter');
@@ -384,24 +392,50 @@ class JenkinsAdapter extends DeploymentAdapter {
 
     if (this._pollTimer) clearTimeout(this._pollTimer);
     if (this._logTimer) clearTimeout(this._logTimer);
+    // Wake whatever is sleeping between polls. Clearing the timer alone left
+    // that promise pending forever: the deploy never finished, the project
+    // stayed "running" and its lock was never released.
+    this._wakeSleeper();
 
     if (this.buildNumber) {
-      const jobPath = this._jobPath();
+      await this._stopBuild();
+    } else if (this.queueId) {
+      // Still queued: without this Jenkins starts the build anyway, later.
       try {
-        await this.client.post(`${jobPath}/${this.buildNumber}/stop`);
-        this.log(`✓ Build #${this.buildNumber} abort signal sent to Jenkins.`);
+        await this.client.post('/queue/cancelItem', null, {
+          params: { id: this.queueId },
+          validateStatus: (status) => status < 500,
+        });
+        this.log(`✓ Queued build (queue item ${this.queueId}) cancelled on Jenkins.`);
       } catch (err) {
-        this.log(`⚠ Failed to abort build on Jenkins: ${err.message}`);
+        this.log(`⚠ Failed to cancel the queued build on Jenkins: ${err.message}`);
       }
     } else {
-      this.log(`Build aborted (no active build number).`);
+      this.log(`Build aborted before it reached Jenkins.`);
     }
   }
 
-  /** Utility: promisified sleep */
+  async _stopBuild() {
+    try {
+      await this.client.post(`${this._jobPath()}/${this.buildNumber}/stop`);
+      this.log(`✓ Build #${this.buildNumber} abort signal sent to Jenkins.`);
+    } catch (err) {
+      this.log(`⚠ Failed to abort build on Jenkins: ${err.message}`);
+    }
+  }
+
+  _wakeSleeper() {
+    const wake = this._wake;
+    this._wake = null;
+    if (wake) wake();
+  }
+
+  /** Utility: promisified sleep that abort() cuts short. */
   _sleep(ms) {
+    if (this.aborted) return Promise.resolve();
     return new Promise(resolve => {
-      this._pollTimer = setTimeout(resolve, ms);
+      this._wake = resolve;
+      this._pollTimer = setTimeout(() => this._wakeSleeper(), ms);
     });
   }
 }
