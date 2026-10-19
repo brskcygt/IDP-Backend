@@ -152,6 +152,7 @@ module.exports = {
   targetService,
   artifactDeployService,
   uploadService,
+  autoDeployService,
   folderImportService,
   downloadService,
   localStore,

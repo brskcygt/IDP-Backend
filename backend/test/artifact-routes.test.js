@@ -113,9 +113,11 @@ async function startApi({
   publicUrl = 'https://idp.example',
   audit = fakeAudit(),
   upload = { token: 'U'.repeat(32), maxArtifactBytes: 1024 },
+  listProjects = () => [],
 } = {}) {
   const routes = createArtifactRoutes({
     services,
+    listProjects,
     getProject: () => ({ id: 'p1', name: 'JetSRM', environment: 'Dev' }),
     auditLogger: audit,
     publicUrl,
@@ -299,6 +301,31 @@ test('CI upload is bearer-only, streams raw artifacts and finalizes a manifest',
   assert.equal((await finalized.json()).status, 'ready');
   assert.ok(services.calls.some((call) => call.name === 'uploadArtifact'));
   assert.ok(services.calls.some((call) => call.name === 'finalizeRelease'));
+});
+
+test('CI upload context: the token alone names the project and its auto-deploy branches', async () => {
+  const masterToken = 'U'.repeat(32);
+  const services = {
+    ...fakeServices(),
+    autoDeployService: { autoDeployBranches: (projectId) => (projectId === 'p2' ? ['test'] : []) },
+  };
+  const projects = [
+    { id: 'p1', name: 'JetSRM', config: { artifactDeploy: { artifactName: 'jetsrm' } } },
+    { id: 'p2', name: 'mdp-srm', config: { artifactDeploy: { artifactName: 'mdp-srm' } } },
+  ];
+  const { base, audit } = await startApi({ services, listProjects: () => projects, upload: { token: masterToken, maxArtifactBytes: 1024 } });
+  const url = `${base}/api/artifact-uploads/context`;
+
+  const ok = await fetch(url, { headers: { authorization: `Bearer ${deriveArtifactUploadToken(masterToken, 'p2')}` } });
+  assert.equal(ok.status, 200);
+  assert.deepEqual(await ok.json(), { projectId: 'p2', projectName: 'mdp-srm', artifactName: 'mdp-srm', autoDeployBranches: ['test'] });
+
+  assert.equal((await fetch(url)).status, 401);
+  assert.equal((await fetch(url, { headers: { authorization: `Bearer ${deriveArtifactUploadToken(masterToken, 'p9')}` } })).status, 401);
+  assert.ok(audit.entries.some((entry) => entry.action === 'ARTIFACT_UPLOAD_REJECTED'));
+
+  const disabled = await startApi({ listProjects: () => projects, upload: { token: null } });
+  assert.equal((await fetch(`${disabled.base}/api/artifact-uploads/context`)).status, 503);
 });
 
 test('CI upload fails closed when disabled and rejects media type / declared oversize', async () => {

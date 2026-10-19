@@ -8,7 +8,7 @@ const os = require('node:os');
 const path = require('node:path');
 const { test } = require('node:test');
 
-const { parseArgs, normalizeBaseUrl, loadAndVerifyManifest, uploadRelease } = require('./upload-artifacts');
+const { parseArgs, normalizeBaseUrl, loadAndVerifyManifest, fetchContext, uploadRelease, main } = require('./upload-artifacts');
 const { parseEntry, makeManifest } = require('./make-manifest');
 
 const TOKEN = 'test-token-that-is-longer-than-thirty-two-characters';
@@ -101,6 +101,48 @@ test('uploads every artifact in manifest order and finalizes once', async () => 
     assert.deepEqual(JSON.parse(calls[3].body), env.manifest);
   } finally {
     fs.rmSync(env.directory, { recursive: true, force: true });
+  }
+});
+
+test('without --project-id the upload token names the project', async () => {
+  const env = fixture();
+  const calls = [];
+  try {
+    const fetchImpl = async (url, options = {}) => {
+      calls.push({ url, method: options.method || 'GET', auth: options.headers?.authorization });
+      if (url.endsWith('/api/artifact-uploads/context')) {
+        return response(200, JSON.stringify({ projectId: 'p2', projectName: 'mdp-srm', artifactName: 'jetsrm', autoDeployBranches: ['test'] }));
+      }
+      if (options.body && typeof options.body !== 'string') await readBody(options.body);
+      return response(201, '{}');
+    };
+    await uploadRelease({ version: '2.5.0', manifestPath: env.manifestPath, baseUrl: 'https://idp.example', token: TOKEN }, { fetchImpl });
+    assert.equal(calls[0].method, 'GET');
+    assert.equal(calls[0].auth, `Bearer ${TOKEN}`);
+    assert.ok(calls.slice(1).every((call) => call.url.includes('/api/artifact-uploads/p2/2.5.0/')));
+  } finally {
+    fs.rmSync(env.directory, { recursive: true, force: true });
+  }
+});
+
+test('context is validated, and --wants-branch answers with the exit code', async () => {
+  const ok = async () => response(200, JSON.stringify({ projectId: 'p2', projectName: 'mdp-srm', autoDeployBranches: ['test'] }));
+  assert.deepEqual((await fetchContext({ baseUrl: 'https://idp.example', token: TOKEN }, { fetchImpl: ok })).autoDeployBranches, ['test']);
+  await assert.rejects(fetchContext({ baseUrl: 'https://idp.example', token: TOKEN }, { fetchImpl: async () => response(200, '{}') }), /malformed/);
+  await assert.rejects(fetchContext({ baseUrl: 'https://idp.example', token: TOKEN }, { fetchImpl: async () => response(401, 'Unauthorized') }), /401/);
+  assert.deepEqual(parseArgs(['--wants-branch', 'test', '--allow-http']), { allowHttp: true, wantsBranch: 'test' });
+
+  const realFetch = globalThis.fetch;
+  const write = process.stdout.write;
+  globalThis.fetch = ok;
+  process.stdout.write = () => true;
+  try {
+    const env = { IDP_URL: 'https://idp.example', IDP_ARTIFACT_UPLOAD_TOKEN: TOKEN };
+    assert.equal(await main(['--wants-branch', 'test'], env), 0);
+    assert.equal(await main(['--wants-branch', 'feature/x'], env), 3);
+  } finally {
+    globalThis.fetch = realFetch;
+    process.stdout.write = write;
   }
 });
 

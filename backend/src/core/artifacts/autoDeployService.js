@@ -31,6 +31,19 @@ function createAutoDeployService({ repository, auditLogger, getProject, deployRe
   }
 
   return {
+    /**
+     * Branches whose push builds some target of the project installs. CI asks
+     * this (upload context) to decide whether a push is worth a release, so the
+     * list lives in one place: the targets' "install on push" settings.
+     */
+    autoDeployBranches(projectId) {
+      const project = getProject(projectId);
+      const refs = repository.listTargets(projectId)
+        .filter((target) => target.autoDeploy && target.ref && !isProdTarget(target, project))
+        .map((target) => target.ref);
+      return [...new Set(refs)].sort();
+    },
+
     async onCiReleaseReady({ projectId, release, ref }) {
       const project = getProject(projectId);
       const targets = repository.listTargets(projectId).filter((target) => target.autoDeploy && target.ref === ref);

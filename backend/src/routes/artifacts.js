@@ -24,6 +24,7 @@
  *   GET    /api/artifacts/:artifactId/download     NO session — `Authorization: Bearer <download token>` only
  *   PUT    /api/artifact-uploads/:projectId/:version/:fileName  CI bearer + raw .tar.gz
  *   POST   /api/artifact-uploads/:projectId/:version/finalize  CI bearer + manifest JSON
+ *   GET    /api/artifact-uploads/context                       CI bearer → its project + auto-deploy branches
  *
  * Cancel = the existing POST /api/deploy/:id/abort (deploy:abort).
  * Business logic lives in core/artifacts/*; this file maps HTTP in/out.
@@ -124,10 +125,10 @@ function bearerToken(req) {
  * @param {{ trigger?: Function, download?: Function, upload?: Function }} [deps.rateLimits]
  * @returns {{ apiRouter: import('express').Router, downloadRouter: import('express').Router, uploadRouter: import('express').Router }}
  */
-function createArtifactRoutes({ services, getProject, auditLogger, publicUrl = null, publicUrlError = null, upload = {}, rateLimits = {} }) {
+function createArtifactRoutes({ services, getProject, listProjects = () => [], auditLogger, publicUrl = null, publicUrlError = null, upload = {}, rateLimits = {} }) {
   if (!services) throw new Error('createArtifactRoutes: services are required.');
   if (!auditLogger) throw new Error('createArtifactRoutes: auditLogger is required.');
-  const { releaseService, composeService, targetService, artifactDeployService, uploadService, folderImportService, downloadService } = services;
+  const { releaseService, composeService, targetService, artifactDeployService, uploadService, autoDeployService, folderImportService, downloadService } = services;
   const trigger = rateLimits.trigger ? [rateLimits.trigger] : [];
   const actor = (req) => req.session?.user?.username;
   const invalid = (res, message, result) => res.status(400).json({ error: message, details: result.errors });
@@ -513,6 +514,29 @@ function createArtifactRoutes({ services, getProject, auditLogger, publicUrl = n
     }
     return next();
   }
+
+  // The token is derived per project, so it alone says which project CI is
+  // building: CI needs no project id, and no list of branches of its own —
+  // whether a push becomes a release is decided by the targets in IDP.
+  uploadRouter.get('/api/artifact-uploads/context', ...uploadGuards, (req, res) => {
+    if (!upload.token || !uploadService) return res.status(503).json({ error: 'CI artifact upload is not configured.' });
+    const received = bearerToken(req);
+    const project = received ? listProjects().find((item) => verifyArtifactUploadToken(upload.token, item.id, received)) : null;
+    if (!project) {
+      auditLogger.log(null, 'ARTIFACT_UPLOAD_REJECTED', 'CI upload context rejected', {}, { outcome: 'failure' });
+      return res.status(401).json({ error: 'Unauthorized' });
+    }
+    try {
+      return res.json({
+        projectId: project.id,
+        projectName: project.name,
+        artifactName: project.config?.artifactDeploy?.artifactName ?? null,
+        autoDeployBranches: autoDeployService ? autoDeployService.autoDeployBranches(project.id) : [],
+      });
+    } catch (err) {
+      return sendError(res, err);
+    }
+  });
 
   uploadRouter.put('/api/artifact-uploads/:projectId/:version/:fileName', ...uploadGuards, requireUploadToken, async (req, res) => {
     const type = String(req.get('content-type') || '').split(';', 1)[0].trim().toLowerCase();

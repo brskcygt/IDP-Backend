@@ -15,7 +15,13 @@ const OS_VALUES = new Set(['win-x64', 'linux-x64', 'any']);
 
 function usage() {
   return [
-    'Usage: node scripts/upload-artifacts.js --project-id <id> --version <version> --manifest <file> [--base-url <url>] [--allow-http]',
+    'Usage: node scripts/upload-artifacts.js [--project-id <id>] --version <version> --manifest <file> [--base-url <url>] [--allow-http]',
+    '       node scripts/upload-artifacts.js --context [--base-url <url>] [--allow-http]',
+    '       node scripts/upload-artifacts.js --wants-branch <branch> [--base-url <url>] [--allow-http]',
+    '',
+    'The upload token belongs to one project, so --project-id is optional: IDP names the project.',
+    '--context prints that project and the branches whose pushes its targets install automatically.',
+    '--wants-branch exits 0 if pushes of <branch> should become a release, 3 if not.',
     '',
     'Environment:',
     '  IDP_URL                         IDP backend origin (unless --base-url is used)',
@@ -32,8 +38,14 @@ function parseArgs(argv) {
       options.allowHttp = true;
       continue;
     }
+    if (arg === '--context') {
+      options.context = true;
+      continue;
+    }
     if (arg === '--help' || arg === '-h') return { help: true };
-    const key = { '--project-id': 'projectId', '--version': 'version', '--manifest': 'manifestPath', '--base-url': 'baseUrl' }[arg];
+    const key = {
+      '--project-id': 'projectId', '--version': 'version', '--manifest': 'manifestPath', '--base-url': 'baseUrl', '--wants-branch': 'wantsBranch',
+    }[arg];
     if (!key) throw new Error(`Unknown argument: ${arg}`);
     const value = argv[index + 1];
     if (!value || value.startsWith('--')) throw new Error(`${arg} requires a value.`);
@@ -133,17 +145,44 @@ async function responseError(response, secrets = []) {
   return message;
 }
 
-async function uploadRelease(options, dependencies = {}) {
-  const fetchImpl = dependencies.fetchImpl || globalThis.fetch;
-  if (typeof fetchImpl !== 'function') throw new Error('Node 24 with global fetch is required.');
-  if (!options.projectId || /[\x00-\x20/\\]/.test(options.projectId)) throw new Error('A valid --project-id is required.');
-  if (!VERSION.test(options.version || '')) throw new Error('A valid --version is required.');
-  if (!options.manifestPath) throw new Error('--manifest is required.');
-  const token = options.token;
+function requireToken(token) {
   if (typeof token !== 'string' || token.length < 32 || /\s/.test(token)) {
     throw new Error('IDP_ARTIFACT_UPLOAD_TOKEN must be at least 32 non-whitespace characters.');
   }
+  return token;
+}
+
+/** The project this upload token belongs to, and the branches its targets install on push. */
+async function fetchContext(options, dependencies = {}) {
+  const fetchImpl = dependencies.fetchImpl || globalThis.fetch;
+  if (typeof fetchImpl !== 'function') throw new Error('Node 24 with global fetch is required.');
+  const token = requireToken(options.token);
   const baseUrl = normalizeBaseUrl(options.baseUrl, options.allowHttp);
+  const response = await fetchImpl(`${baseUrl}/api/artifact-uploads/context`, {
+    headers: { authorization: `Bearer ${token}` },
+    redirect: 'error',
+    signal: AbortSignal.timeout(30_000),
+  });
+  if (!response.ok) throw new Error(`Upload context failed: ${await responseError(response, [token])}`);
+  const context = await response.json();
+  if (!context || typeof context.projectId !== 'string' || !Array.isArray(context.autoDeployBranches)) {
+    throw new Error('Upload context response is malformed.');
+  }
+  return context;
+}
+
+async function uploadRelease(options, dependencies = {}) {
+  const fetchImpl = dependencies.fetchImpl || globalThis.fetch;
+  if (typeof fetchImpl !== 'function') throw new Error('Node 24 with global fetch is required.');
+  if (!VERSION.test(options.version || '')) throw new Error('A valid --version is required.');
+  if (!options.manifestPath) throw new Error('--manifest is required.');
+  const token = requireToken(options.token);
+  const baseUrl = normalizeBaseUrl(options.baseUrl, options.allowHttp);
+  if (!options.projectId) {
+    options = { ...options, projectId: (await fetchContext(options, dependencies)).projectId };
+    process.stdout.write(`project ${options.projectId} (from the upload token)\n`);
+  }
+  if (/[\x00-\x20/\\]/.test(options.projectId)) throw new Error('A valid --project-id is required.');
   const timeoutMs = Number(options.timeoutMs || 1_800_000);
   if (!Number.isSafeInteger(timeoutMs) || timeoutMs < 1_000 || timeoutMs > 2_147_483_647) {
     throw new Error('Upload timeout must be an integer between 1000 and 2147483647 ms.');
@@ -190,19 +229,35 @@ async function main(argv = process.argv.slice(2), env = process.env) {
     process.stdout.write(`${usage()}\n`);
     return;
   }
-  await uploadRelease({
+  const options = {
     ...parsed,
     baseUrl: parsed.baseUrl || env.IDP_URL,
     token: env.IDP_ARTIFACT_UPLOAD_TOKEN,
     timeoutMs: env.IDP_ARTIFACT_UPLOAD_TIMEOUT_MS,
-  });
+  };
+  if (parsed.context) {
+    process.stdout.write(`${JSON.stringify(await fetchContext(options))}\n`);
+    return 0;
+  }
+  if (parsed.wantsBranch) {
+    const context = await fetchContext(options);
+    const wanted = context.autoDeployBranches.includes(parsed.wantsBranch);
+    process.stdout.write(wanted
+      ? `'${parsed.wantsBranch}': a target of ${context.projectName || context.projectId} installs its pushes.\n`
+      : `'${parsed.wantsBranch}': no target installs its pushes (auto-deploy branches: ${context.autoDeployBranches.join(', ') || 'none'}).\n`);
+    return wanted ? 0 : 3;
+  }
+  await uploadRelease(options);
+  return 0;
 }
 
 if (require.main === module) {
-  main().catch((err) => {
+  main().then((code) => {
+    process.exitCode = code || 0;
+  }).catch((err) => {
     process.stderr.write(`upload-artifacts: ${err.message}\n`);
     process.exitCode = 1;
   });
 }
 
-module.exports = { parseArgs, normalizeBaseUrl, hashFile, validateManifestShape, loadAndVerifyManifest, uploadRelease, main };
+module.exports = { parseArgs, normalizeBaseUrl, hashFile, validateManifestShape, loadAndVerifyManifest, fetchContext, uploadRelease, main };

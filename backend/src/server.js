@@ -112,6 +112,7 @@ app.use(requestContextMiddleware);
 const artifactRoutes = createArtifactRoutes({
   services: artifactServices,
   getProject: (id) => projectService.getProject(id),
+  listProjects: () => projectService.listProjects(),
   auditLogger,
   publicUrl: serverConfig.artifactDeploy.publicUrl,
   publicUrlError: serverConfig.artifactDeploy.publicUrlError,

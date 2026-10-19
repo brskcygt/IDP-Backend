@@ -333,8 +333,11 @@ branch'i checkout etmelidir; boşsa kendi yapılandırdığı branch'te kalır.
 Yukarıdaki akışı IDP başlatır. Tersi de mümkün: Jenkins bir branch'e gelen **push**'la kendiliğinden build
 alır ve sonucu yükler; IDP o branch'i bekleyen hedeflere kurar. İki uçta da açıkça istenmelidir:
 
-- **CI:** yalnız seçilen branch'lerin push'u sürüm üretir. Sürüm adını CI verir (`0.0.0-<branch>.<UTC zaman>`),
-  manifest'e branch yazılır: `make-manifest.js --ref <branch> ...` → `"ref": "<branch>"`.
+- **CI:** yalnız bir hedefin beklediği branch'in push'u sürüm üretir. Liste CI'da tutulmaz: CI upload token'ıyla
+  `GET /api/artifact-uploads/context` çağırır (`upload-artifacts.js --wants-branch <branch>` → çıkış 0/3); yanıt
+  token'ın projesini ve `autoDeployBranches`'ı (otomatik kurulum açık, Prod olmayan hedeflerin branch'leri) verir.
+  Sürüm adını CI verir, manifest'e branch yazılır: `make-manifest.js --ref <branch> ...` → `"ref": "<branch>"`.
+  Token projeye özgü olduğundan `--project-id` da gerekmez; CI'da yalnız `IDP_URL` + projenin token'ı kalır.
 - **Hedef:** `autoDeploy: true` + aynı `ref`. Arayüzde Ayarlar → Müşteriler → hedef → "Push'ta otomatik kur".
   Branch'siz ya da Prod hedefte kaydedilemez (`targetAutoDeployErrors`); kurulum anında Prod yeniden kontrol edilir.
 

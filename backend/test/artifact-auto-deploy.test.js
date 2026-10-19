@@ -70,7 +70,7 @@ function setup({ deployRelease = async () => ({ deploymentId: 'dep_1' }), enviro
     projectId: 'p1', os: 'windows', agentId: `agent-${fields.name}`, components: null, runtimeConfig: null, ...fields,
   });
   return {
-    repository, service, audit, deploys, calls, addTarget, project,
+    repository, service, audit, deploys, calls, addTarget, project, autoDeploy,
     cleanup: () => { db.close(); fs.rmSync(dir, { recursive: true, force: true }); },
   };
 }
@@ -162,6 +162,20 @@ test('no install for uploads without a ref or for builds IDP started', async () 
 
     assert.equal(env.calls.length, 0);
     assert.equal(env.deploys.length, 0);
+  } finally {
+    env.cleanup();
+  }
+});
+
+test('autoDeployBranches lists the branches opted-in non-production targets follow', () => {
+  const env = setup();
+  try {
+    env.addTarget({ name: 'test-a', ref: 'test', autoDeploy: true });
+    env.addTarget({ name: 'test-b', ref: 'test', autoDeploy: true });
+    env.addTarget({ name: 'dev', ref: 'dev', autoDeploy: true });
+    env.addTarget({ name: 'manual', ref: 'feature/x', autoDeploy: false });
+    env.addTarget({ name: 'musteri-prod', ref: 'release', autoDeploy: true });
+    assert.deepEqual(env.autoDeploy.autoDeployBranches('p1'), ['dev', 'test']);
   } finally {
     env.cleanup();
   }
