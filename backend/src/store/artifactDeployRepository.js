@@ -89,6 +89,7 @@ function rowToTarget(row) {
     environment: row.environment ?? null,
     basePath: row.base_path ?? null,
     ref: row.ref ?? null,
+    autoDeploy: Boolean(row.auto_deploy),
     components: parseJson(row.components_json),
     runtimeConfig: parseJson(row.runtime_config_json),
     currentReleaseId: row.current_release_id ?? null,
@@ -147,6 +148,7 @@ const TARGET_PATCH_COLUMNS = {
   environment: ['environment', sqlValue],
   basePath: ['base_path', sqlValue],
   ref: ['ref', sqlValue],
+  autoDeploy: ['auto_deploy', (value) => (value ? 1 : 0)],
   components: ['components_json', toJson],
   runtimeConfig: ['runtime_config_json', toJson],
   currentReleaseId: ['current_release_id', sqlValue],
@@ -346,9 +348,9 @@ function createArtifactDeployRepository(db) {
       const now = new Date().toISOString();
       const id = target.id || newId('tgt');
       db.prepare(`
-        INSERT INTO deploy_targets (id, project_id, name, agent_id, os, environment, base_path, ref, components_json,
+        INSERT INTO deploy_targets (id, project_id, name, agent_id, os, environment, base_path, ref, auto_deploy, components_json,
           runtime_config_json, current_release_id, current_versions_json, created_at, updated_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       `).run(
         id,
         target.projectId,
@@ -358,6 +360,7 @@ function createArtifactDeployRepository(db) {
         sqlValue(target.environment),
         sqlValue(target.basePath),
         sqlValue(target.ref),
+        target.autoDeploy ? 1 : 0,
         toJson(target.components),
         toJson(target.runtimeConfig),
         sqlValue(target.currentReleaseId),

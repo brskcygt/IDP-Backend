@@ -56,6 +56,7 @@ yüklenir.
 | `schema` | `1` |
 | `project` | `artifactDeploy.artifactName` ile **aynı** olmalı |
 | `version` | `^[0-9A-Za-z][0-9A-Za-z._-]{0,63}$`, istenen sürümle aynı |
+| `ref` | opsiyonel; CI'ın kendi başlattığı (push) build'in branch'i. Bkz. §3.4.1 |
 | `artifacts[].component` | `^[a-z][a-z0-9-]{0,31}$` |
 | `artifacts[].os` | `any` \| `win-x64` \| `linux-x64`; bir bileşen+os çifti bir kez |
 | `artifacts[].file` | yalın dosya adı `^[A-Za-z0-9._-]+\.tar\.gz$` (klasör yok) |
@@ -326,6 +327,21 @@ bitmez aynı hedefe kurar. Release kaydı yine oluşur — rollback ve "burada n
 Branch build'e nasıl ulaşır: CI Pipeline sağlayıcısında `ciConfig.ref` olarak, Jenkins'te `BRANCH` build
 parametresi olarak (Jenkins'in `buildWithParameters` ucunda ref kavramı yok). Job bu parametre doluysa o
 branch'i checkout etmelidir; boşsa kendi yapılandırdığı branch'te kalır.
+
+#### 3.4.1 Push'ta otomatik kurulum (opt-in)
+
+Yukarıdaki akışı IDP başlatır. Tersi de mümkün: Jenkins bir branch'e gelen **push**'la kendiliğinden build
+alır ve sonucu yükler; IDP o branch'i bekleyen hedeflere kurar. İki uçta da açıkça istenmelidir:
+
+- **CI:** yalnız seçilen branch'lerin push'u sürüm üretir. Sürüm adını CI verir (`0.0.0-<branch>.<UTC zaman>`),
+  manifest'e branch yazılır: `make-manifest.js --ref <branch> ...` → `"ref": "<branch>"`.
+- **Hedef:** `autoDeploy: true` + aynı `ref`. Arayüzde Ayarlar → Müşteriler → hedef → "Push'ta otomatik kur".
+  Branch'siz ya da Prod hedefte kaydedilemez (`targetAutoDeployErrors`); kurulum anında Prod yeniden kontrol edilir.
+
+Finalize, release satırını **yeni oluşturduysa** (IDP'nin başlattığı build'lerde satır zaten `building`'dir) ve
+manifest'te `ref` varsa, `autoDeployService` eşleşen hedeflere yalnız hedefin çalıştırdığı ve upload'da olan
+bileşenleri kurar (`triggeredBy: ci-auto-deploy`). Kurulum başlayamazsa (agent kapalı, hedefte deploy sürüyor)
+upload başarılı kalır; sonuç audit'e `RELEASE_AUTO_DEPLOY_STARTED | SKIPPED | FAILED` olarak düşer.
 
 ### 3.5 Release composer (önizleme branch'i, yalnız Bitbucket)
 

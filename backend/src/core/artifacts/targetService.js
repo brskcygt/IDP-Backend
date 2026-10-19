@@ -18,6 +18,7 @@ const {
   sanitizeAgentText,
   sanitizeVersion,
   COMPONENT_NAME_PATTERN,
+  targetAutoDeployErrors,
 } = require('./contracts');
 const { openAgentChannel, sendAgentCommand, listGatewayAgents } = require('./agentChannel');
 
@@ -136,6 +137,7 @@ function createTargetService({ repository, auditLogger, getProject, getGateway, 
       const { errors, value } = validateTargetInput(input);
       errors.push(...componentErrors(project, value.components));
       errors.push(...runtimeConfigComponentErrors(project, value.runtimeConfig, value.components));
+      errors.push(...targetAutoDeployErrors(value, project));
       if (errors.length > 0) throw new ValidationError('Invalid deploy target.', errors);
 
       ensureAgentFree(value.agentId);
@@ -174,6 +176,7 @@ function createTargetService({ repository, auditLogger, getProject, getGateway, 
         value.runtimeConfig !== undefined ? value.runtimeConfig : (value.components !== undefined ? target.runtimeConfig : undefined),
         value.components !== undefined ? value.components : target.components
       ));
+      errors.push(...targetAutoDeployErrors({ ...target, ...value }, project));
       if (errors.length > 0) throw new ValidationError('Invalid deploy target.', errors);
 
       const agentChanged = value.agentId !== undefined && value.agentId !== target.agentId;

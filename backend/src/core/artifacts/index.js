@@ -28,6 +28,7 @@ const { createTargetService } = require('./targetService');
 const { createArtifactDeployService } = require('./artifactDeployService');
 const { createArtifactDownloadService } = require('./artifactDownloadService');
 const { createArtifactUploadService } = require('./artifactUploadService');
+const { createAutoDeployService } = require('./autoDeployService');
 const { createFolderImportService } = require('./folderImportService');
 const { createLocalArtifactStore } = require('./localArtifactStore');
 const { validateArtifactStorageEnv, validateArtifactPublicUrlEnv } = require('../../config');
@@ -123,12 +124,20 @@ targetService = createTargetService({
   },
 });
 
+// CI's own builds of a branch (a push), installed on the targets that opted in.
+const autoDeployService = createAutoDeployService({
+  repository,
+  auditLogger,
+  getProject,
+  deployRelease: (args) => artifactDeployService.deploy({ ...args, publicUrl: validateArtifactPublicUrlEnv().publicUrl }),
+});
 const uploadService = createArtifactUploadService({
   repository,
   store: localStore,
   auditLogger,
   getProject,
   isReleaseBusy: (releaseId) => artifactDeployService ? artifactDeployService.isReleaseBusy(releaseId) : false,
+  onCiReleaseReady: (args) => autoDeployService.onCiReleaseReady(args),
 });
 // Ready builds another CI drops into a folder on this server.
 const folderImportService = createFolderImportService({ repository, uploadService, auditLogger, getProject });

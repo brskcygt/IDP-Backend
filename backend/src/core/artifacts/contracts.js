@@ -190,6 +190,12 @@ function validateManifest(manifest, expected = {}) {
     && (typeof manifest.createdAt !== 'string' || manifest.createdAt.length > 64 || hasControlChars(manifest.createdAt))) {
     errors.push('createdAt must be a short string.');
   }
+  // The branch CI built, when CI started the build itself (a push). It is what
+  // matches an upload to targets that install their branch automatically.
+  if (manifest.ref !== undefined && manifest.ref !== null
+    && (typeof manifest.ref !== 'string' || !GIT_REF_PATTERN.test(manifest.ref) || manifest.ref.includes('..'))) {
+    errors.push('ref must be a branch name.');
+  }
 
   const artifacts = [];
   if (!Array.isArray(manifest.artifacts) || manifest.artifacts.length === 0) {
@@ -240,6 +246,9 @@ function validateManifest(manifest, expected = {}) {
       version: manifest.version,
       commit: typeof manifest.commit === 'string' ? manifest.commit : null,
       createdAt: typeof manifest.createdAt === 'string' ? manifest.createdAt : null,
+      // Only when given: a manifest without it must stay byte-identical, or an
+      // idempotent re-finalize of an older release would read as a conflict.
+      ...(typeof manifest.ref === 'string' ? { ref: manifest.ref } : {}),
       artifacts,
     },
   };
@@ -684,7 +693,7 @@ function resolveSourceCredentials(runtimeConfig, normalized) {
 // Deploy targets (one agent = one target = one project per server)
 // ---------------------------------------------------------------------------
 
-const TARGET_KEYS = ['name', 'agentId', 'os', 'environment', 'basePath', 'ref', 'components', 'runtimeConfig'];
+const TARGET_KEYS = ['name', 'agentId', 'os', 'environment', 'basePath', 'ref', 'autoDeploy', 'components', 'runtimeConfig'];
 const TARGET_COMPONENT_KEYS = ['name', 'runtime', 'health'];
 const AGENT_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]{2,127}$/;
 
@@ -855,6 +864,10 @@ function validateTargetInput(input, { partial = false } = {}) {
       errors.push({ path: 'ref', message: 'Must be a branch or tag name.' });
     } else value.ref = input.ref || null;
   }
+  if (present('autoDeploy')) {
+    if (typeof input.autoDeploy !== 'boolean') errors.push({ path: 'autoDeploy', message: 'Must be true or false.' });
+    else value.autoDeploy = input.autoDeploy;
+  }
   if (present('components')) {
     validateTargetComponents(input.components, 'components', errors);
     value.components = Array.isArray(input.components) && input.components.length > 0 ? input.components : null;
@@ -874,6 +887,19 @@ function isProdTarget(target, project) {
   if (target.environment === 'Prod') return true;
   if (!target.environment && project && project.environment === 'Prod') return true;
   return /(^|[^a-z])prod/i.test(String(target.name || ''));
+}
+
+/**
+ * A target that installs CI's own builds of its branch (`autoDeploy`) needs a
+ * branch to match, and is never production: there a person picks a tagged,
+ * verified version. `target` is the stored target merged with the update.
+ */
+function targetAutoDeployErrors(target, project) {
+  if (!target.autoDeploy) return [];
+  const errors = [];
+  if (!target.ref) errors.push({ path: 'autoDeploy', message: 'Automatic install needs a branch on the target.' });
+  if (isProdTarget(target, project)) errors.push({ path: 'autoDeploy', message: 'Production targets cannot install automatically.' });
+  return errors;
 }
 
 /** 400 code for a composed (preview) release aimed at a production target. */
@@ -1089,6 +1115,7 @@ module.exports = {
   isLegacyRuntimeConfig,
   runtimeConfigForComponent,
   isProdTarget,
+  targetAutoDeployErrors,
   isComposedRelease,
   isPreviewRelease,
   PREVIEW_NOT_ALLOWED_ON_PROD,

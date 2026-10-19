@@ -12,6 +12,9 @@ function createArtifactUploadService({
   getProject,
   isReleaseBusy = () => false,
   retention = 3,
+  // Called (not awaited) after CI finalized a release it built on its own — a
+  // push, not a build IDP started. See autoDeployService.
+  onCiReleaseReady = null,
 }) {
   const activeFinalizations = new Set();
   const activeUploads = new Set();
@@ -130,8 +133,14 @@ function createArtifactUploadService({
           throw new ConflictError(`Release ${version} is already immutable and ready.`);
         }
         if (release && protectedRelease(release)) throw new ConflictError(`Release ${version} is active on a target and cannot be replaced.`);
+        // No row yet = CI built this on its own. A build IDP started already has
+        // its 'building' row, with the ref and the install it asked for.
+        const ciInitiated = !release;
+        const ref = check.manifest.ref || null;
         if (!release) {
-          release = repository.createRelease({ projectId, version, status: 'building', createdBy });
+          release = repository.createRelease({
+            projectId, version, status: 'building', createdBy, ref, refType: ref ? 'branch' : null,
+          });
         } else if (release.status !== 'building') {
           release = repository.updateRelease(release.id, { status: 'building', error: null, createdBy: release.createdBy || createdBy });
         }
@@ -156,6 +165,14 @@ function createArtifactUploadService({
           projectId, releaseId: release.id, version, artifacts: artifacts.length,
         });
         const pruned = prune(projectId);
+        if (ciInitiated && ref && typeof onCiReleaseReady === 'function') {
+          const readyRelease = release;
+          setImmediate(() => {
+            Promise.resolve()
+              .then(() => onCiReleaseReady({ projectId, release: readyRelease, ref }))
+              .catch((err) => console.error(`[auto-deploy] ${version}: ${err.message}`));
+          });
+        }
         return { ...release, artifacts: repository.listArtifacts(release.id), idempotent: false, pruned: pruned.map((item) => item.version) };
       } catch (err) {
         if (release && repository.findRelease(release.id)?.status === 'building') {

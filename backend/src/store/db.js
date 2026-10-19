@@ -233,6 +233,8 @@ function ensureDeploymentColumns(db) {
 function ensureDeployTargetColumns(db) {
   const existing = new Set(db.prepare('PRAGMA table_info(deploy_targets)').all().map((row) => row.name));
   if (!existing.has('ref')) db.exec('ALTER TABLE deploy_targets ADD COLUMN ref TEXT');
+  // 1 = install CI's own builds of `ref` as they are uploaded (opt-in, never Prod).
+  if (!existing.has('auto_deploy')) db.exec('ALTER TABLE deploy_targets ADD COLUMN auto_deploy INTEGER NOT NULL DEFAULT 0');
 }
 
 function ensureReleaseColumns(db) {

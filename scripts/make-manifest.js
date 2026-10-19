@@ -1,7 +1,10 @@
 #!/usr/bin/env node
 'use strict';
 
-// node scripts/make-manifest.js <artifactName> <version> <commit> <component>:<os>:<file> ...
+// node scripts/make-manifest.js [--ref <branch>] <artifactName> <version> <commit> <component>:<os>:<file> ...
+//
+// --ref: the branch CI built when it started the build itself (a push). IDP
+// installs such a build on targets of that branch that have automatic install on.
 
 const crypto = require('node:crypto');
 const fs = require('node:fs');
@@ -11,6 +14,23 @@ const NAME = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
 const VERSION = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
 const COMPONENT = /^[a-z][a-z0-9-]{0,31}$/;
 const OS_VALUES = new Set(['win-x64', 'linux-x64', 'any']);
+const REF = /^[A-Za-z0-9._][A-Za-z0-9._/+-]{0,254}$/;
+
+/** Pulls `--ref <branch>` out of the arguments; the rest stay positional. */
+function takeRef(args) {
+  const rest = [];
+  let ref = null;
+  for (let index = 0; index < args.length; index += 1) {
+    if (args[index] !== '--ref') {
+      rest.push(args[index]);
+      continue;
+    }
+    ref = args[index + 1];
+    index += 1;
+    if (typeof ref !== 'string' || !REF.test(ref) || ref.includes('..')) throw new Error('--ref must be a branch name.');
+  }
+  return { ref, rest };
+}
 
 function parseEntry(entry) {
   const first = entry.indexOf(':');
@@ -40,7 +60,8 @@ async function hashFile(file) {
 }
 
 async function makeManifest(args, cwd = process.cwd()) {
-  const [project, version, commit, ...rawEntries] = args;
+  const { ref, rest } = takeRef(args);
+  const [project, version, commit, ...rawEntries] = rest;
   if (!NAME.test(project || '')) throw new Error('artifactName must be 1-64 letters, digits, dot, underscore or dash.');
   if (!VERSION.test(version || '')) throw new Error('version must be 1-64 letters, digits, dot, underscore or dash.');
   if (typeof commit !== 'string' || commit.length < 7 || commit.length > 128 || /\s/.test(commit)) {
@@ -75,6 +96,7 @@ async function makeManifest(args, cwd = process.cwd()) {
       version,
       commit,
       createdAt: new Date().toISOString(),
+      ...(ref ? { ref } : {}),
       artifacts,
     },
   };
@@ -97,4 +119,4 @@ if (require.main === module) {
   });
 }
 
-module.exports = { parseEntry, hashFile, makeManifest, main };
+module.exports = { parseEntry, takeRef, hashFile, makeManifest, main };
