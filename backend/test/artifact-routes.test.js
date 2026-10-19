@@ -24,7 +24,7 @@ const { createArtifactDeployRepository } = require('../src/store/artifactDeployR
 const { createDownloadTokenService } = require('../src/core/artifacts/downloadTokens');
 const { createArtifactDownloadService } = require('../src/core/artifacts/artifactDownloadService');
 const { createArtifactSourceClient } = require('../src/core/artifacts/artifactSourceClient');
-const { deriveArtifactUploadToken } = require('../src/auth/artifactUploadToken');
+const { deriveArtifactUploadToken, deriveCiServerToken } = require('../src/auth/artifactUploadToken');
 const { ConflictError, UpstreamError, NotFoundError, ValidationError } = require('../src/core/errors');
 
 const cleanups = [];
@@ -326,6 +326,42 @@ test('CI upload context: the token alone names the project and its auto-deploy b
 
   const disabled = await startApi({ listProjects: () => projects, upload: { token: null } });
   assert.equal((await fetch(`${disabled.base}/api/artifact-uploads/context`)).status, 503);
+});
+
+test('CI server token: one credential for every project, named by artifact name', async () => {
+  const masterToken = 'U'.repeat(32);
+  const serverToken = deriveCiServerToken(masterToken);
+  assert.match(serverToken, /^idpc_/);
+  assert.notEqual(serverToken, deriveArtifactUploadToken(masterToken, 'p1'));
+  const services = { ...fakeServices(), autoDeployService: { autoDeployBranches: () => ['test'] } };
+  const projects = [
+    { id: 'p1', name: 'JetSRM', config: { artifactDeploy: { artifactName: 'jetsrm' } } },
+    { id: 'p2', name: 'mdp-srm', config: { artifactDeploy: { artifactName: 'mdp-srm' } } },
+    { id: 'p3', name: 'kopya-a', config: { artifactDeploy: { artifactName: 'dup' } } },
+    { id: 'p4', name: 'kopya-b', config: { artifactDeploy: { artifactName: 'dup' } } },
+  ];
+  const { base } = await startApi({ services, listProjects: () => projects, upload: { token: masterToken, maxArtifactBytes: 1024 } });
+  const auth = (token) => ({ headers: { authorization: `Bearer ${token}` } });
+  const context = (query, token = serverToken) => fetch(`${base}/api/artifact-uploads/context${query}`, auth(token));
+
+  const ok = await context('?artifact=mdp-srm');
+  assert.equal(ok.status, 200);
+  assert.equal((await ok.json()).projectId, 'p2');
+  assert.equal((await context('')).status, 400);
+  assert.equal((await context('?artifact=yok')).status, 404);
+  assert.equal((await context('?artifact=dup')).status, 409);
+  // A project's own token cannot be pointed at another project's artifact.
+  assert.equal((await context('?artifact=mdp-srm', deriveArtifactUploadToken(masterToken, 'p1'))).status, 409);
+  assert.equal((await context('?artifact=jetsrm', deriveArtifactUploadToken(masterToken, 'p1'))).status, 200);
+
+  // The server token uploads to any project; a wrong token still does not.
+  const body = Buffer.from('artifact');
+  const sha256 = require('node:crypto').createHash('sha256').update(body).digest('hex');
+  const put = (token) => fetch(`${base}/api/artifact-uploads/p2/2.5.0/mdp-srm-frontend-2.5.0.tar.gz`, {
+    method: 'PUT', headers: { authorization: `Bearer ${token}`, 'content-type': 'application/gzip', 'x-artifact-sha256': sha256 }, body,
+  });
+  assert.equal((await put(serverToken)).status, 201);
+  assert.equal((await put(`idpc_${'x'.repeat(43)}`)).status, 401);
 });
 
 test('CI upload fails closed when disabled and rejects media type / declared oversize', async () => {

@@ -16,10 +16,11 @@ const OS_VALUES = new Set(['win-x64', 'linux-x64', 'any']);
 function usage() {
   return [
     'Usage: node scripts/upload-artifacts.js [--project-id <id>] --version <version> --manifest <file> [--base-url <url>] [--allow-http]',
-    '       node scripts/upload-artifacts.js --context [--base-url <url>] [--allow-http]',
-    '       node scripts/upload-artifacts.js --wants-branch <branch> [--base-url <url>] [--allow-http]',
+    '       node scripts/upload-artifacts.js --context [--artifact <name>] [--base-url <url>] [--allow-http]',
+    '       node scripts/upload-artifacts.js --wants-branch <branch> [--artifact <name>] [--base-url <url>] [--allow-http]',
     '',
-    'The upload token belongs to one project, so --project-id is optional: IDP names the project.',
+    '--project-id is optional: IDP names the project from the token. A project token says it by itself;',
+    'the CI server token (one for every project) uses --artifact, or the manifest\'s project when uploading.',
     '--context prints that project and the branches whose pushes its targets install automatically.',
     '--wants-branch exits 0 if pushes of <branch> should become a release, 3 if not.',
     '',
@@ -45,6 +46,7 @@ function parseArgs(argv) {
     if (arg === '--help' || arg === '-h') return { help: true };
     const key = {
       '--project-id': 'projectId', '--version': 'version', '--manifest': 'manifestPath', '--base-url': 'baseUrl', '--wants-branch': 'wantsBranch',
+      '--artifact': 'artifact',
     }[arg];
     if (!key) throw new Error(`Unknown argument: ${arg}`);
     const value = argv[index + 1];
@@ -158,7 +160,8 @@ async function fetchContext(options, dependencies = {}) {
   if (typeof fetchImpl !== 'function') throw new Error('Node 24 with global fetch is required.');
   const token = requireToken(options.token);
   const baseUrl = normalizeBaseUrl(options.baseUrl, options.allowHttp);
-  const response = await fetchImpl(`${baseUrl}/api/artifact-uploads/context`, {
+  const query = options.artifact ? `?artifact=${encodeURIComponent(options.artifact)}` : '';
+  const response = await fetchImpl(`${baseUrl}/api/artifact-uploads/context${query}`, {
     headers: { authorization: `Bearer ${token}` },
     redirect: 'error',
     signal: AbortSignal.timeout(30_000),
@@ -178,16 +181,18 @@ async function uploadRelease(options, dependencies = {}) {
   if (!options.manifestPath) throw new Error('--manifest is required.');
   const token = requireToken(options.token);
   const baseUrl = normalizeBaseUrl(options.baseUrl, options.allowHttp);
+  const { manifest, files } = await loadAndVerifyManifest(options.manifestPath, options.version);
   if (!options.projectId) {
-    options = { ...options, projectId: (await fetchContext(options, dependencies)).projectId };
-    process.stdout.write(`project ${options.projectId} (from the upload token)\n`);
+    // The manifest's project is the artifact name: what names the project for a CI server token.
+    const context = await fetchContext({ ...options, artifact: options.artifact || manifest.project }, dependencies);
+    options = { ...options, projectId: context.projectId };
+    process.stdout.write(`project ${context.projectName || context.projectId} (${context.projectId}), named by IDP\n`);
   }
   if (/[\x00-\x20/\\]/.test(options.projectId)) throw new Error('A valid --project-id is required.');
   const timeoutMs = Number(options.timeoutMs || 1_800_000);
   if (!Number.isSafeInteger(timeoutMs) || timeoutMs < 1_000 || timeoutMs > 2_147_483_647) {
     throw new Error('Upload timeout must be an integer between 1000 and 2147483647 ms.');
   }
-  const { manifest, files } = await loadAndVerifyManifest(options.manifestPath, options.version);
   const releasePath = `${encodeURIComponent(options.projectId)}/${encodeURIComponent(options.version)}`;
 
   for (const { artifact, filePath } of files) {

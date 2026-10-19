@@ -24,7 +24,7 @@
  *   GET    /api/artifacts/:artifactId/download     NO session — `Authorization: Bearer <download token>` only
  *   PUT    /api/artifact-uploads/:projectId/:version/:fileName  CI bearer + raw .tar.gz
  *   POST   /api/artifact-uploads/:projectId/:version/finalize  CI bearer + manifest JSON
- *   GET    /api/artifact-uploads/context                       CI bearer → its project + auto-deploy branches
+ *   GET    /api/artifact-uploads/context[?artifact=<name>]     CI bearer → its project + auto-deploy branches
  *
  * Cancel = the existing POST /api/deploy/:id/abort (deploy:abort).
  * Business logic lives in core/artifacts/*; this file maps HTTP in/out.
@@ -32,7 +32,7 @@
 
 const express = require('express');
 const { pipeline } = require('node:stream/promises');
-const { verifyArtifactUploadToken } = require('../auth/artifactUploadToken');
+const { verifyArtifactUploadToken, verifyCiServerToken } = require('../auth/artifactUploadToken');
 const { requirePermission } = require('../auth/permissions');
 const { validate, string, array, object, optional } = require('../validation/schema');
 const { sendError } = require('../http/errorMapper');
@@ -133,8 +133,10 @@ function createArtifactRoutes({ services, getProject, listProjects = () => [], a
   const actor = (req) => req.session?.user?.username;
   const invalid = (res, message, result) => res.status(400).json({ error: message, details: result.errors });
 
+  // The project's own token, or the CI server token (any project).
   function validUploadBearer(req) {
-    return verifyArtifactUploadToken(upload.token, req.params.projectId, bearerToken(req));
+    const received = bearerToken(req);
+    return verifyArtifactUploadToken(upload.token, req.params.projectId, received) || verifyCiServerToken(upload.token, received);
   }
 
   const api = express.Router();
@@ -515,13 +517,26 @@ function createArtifactRoutes({ services, getProject, listProjects = () => [], a
     return next();
   }
 
-  // The token is derived per project, so it alone says which project CI is
-  // building: CI needs no project id, and no list of branches of its own —
+  // Which project CI is building: a project token says it by itself; the CI
+  // server token names it with `?artifact=<artifactName>` (the manifest's
+  // `project`). CI keeps no project id and no list of branches of its own —
   // whether a push becomes a release is decided by the targets in IDP.
   uploadRouter.get('/api/artifact-uploads/context', ...uploadGuards, (req, res) => {
     if (!upload.token || !uploadService) return res.status(503).json({ error: 'CI artifact upload is not configured.' });
     const received = bearerToken(req);
-    const project = received ? listProjects().find((item) => verifyArtifactUploadToken(upload.token, item.id, received)) : null;
+    const artifact = typeof req.query.artifact === 'string' ? req.query.artifact.trim() : '';
+    const artifactNameOf = (item) => item.config?.artifactDeploy?.artifactName ?? null;
+    const projects = received ? listProjects() : [];
+    let project = projects.find((item) => verifyArtifactUploadToken(upload.token, item.id, received)) || null;
+    if (!project && received && verifyCiServerToken(upload.token, received)) {
+      if (!artifact) return res.status(400).json({ error: 'The CI server token needs ?artifact=<artifactName> to name the project.' });
+      const matches = projects.filter((item) => artifactNameOf(item) === artifact);
+      if (matches.length === 0) return res.status(404).json({ error: `No IDP project has artifact name '${artifact}'.` });
+      if (matches.length > 1) return res.status(409).json({ error: `More than one IDP project has artifact name '${artifact}'.` });
+      project = matches[0];
+    } else if (project && artifact && artifactNameOf(project) !== artifact) {
+      return res.status(409).json({ error: `This token belongs to '${project.name}', whose artifact name is not '${artifact}'.` });
+    }
     if (!project) {
       auditLogger.log(null, 'ARTIFACT_UPLOAD_REJECTED', 'CI upload context rejected', {}, { outcome: 'failure' });
       return res.status(401).json({ error: 'Unauthorized' });

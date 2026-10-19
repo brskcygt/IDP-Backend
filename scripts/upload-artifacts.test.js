@@ -110,7 +110,7 @@ test('without --project-id the upload token names the project', async () => {
   try {
     const fetchImpl = async (url, options = {}) => {
       calls.push({ url, method: options.method || 'GET', auth: options.headers?.authorization });
-      if (url.endsWith('/api/artifact-uploads/context')) {
+      if (url.includes('/api/artifact-uploads/context')) {
         return response(200, JSON.stringify({ projectId: 'p2', projectName: 'mdp-srm', artifactName: 'jetsrm', autoDeployBranches: ['test'] }));
       }
       if (options.body && typeof options.body !== 'string') await readBody(options.body);
@@ -119,6 +119,8 @@ test('without --project-id the upload token names the project', async () => {
     await uploadRelease({ version: '2.5.0', manifestPath: env.manifestPath, baseUrl: 'https://idp.example', token: TOKEN }, { fetchImpl });
     assert.equal(calls[0].method, 'GET');
     assert.equal(calls[0].auth, `Bearer ${TOKEN}`);
+    // The manifest's project names the project for a CI server token.
+    assert.match(calls[0].url, /context\?artifact=jetsrm$/);
     assert.ok(calls.slice(1).every((call) => call.url.includes('/api/artifact-uploads/p2/2.5.0/')));
   } finally {
     fs.rmSync(env.directory, { recursive: true, force: true });

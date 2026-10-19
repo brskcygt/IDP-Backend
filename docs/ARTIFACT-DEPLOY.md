@@ -337,7 +337,12 @@ alır ve sonucu yükler; IDP o branch'i bekleyen hedeflere kurar. İki uçta da 
   `GET /api/artifact-uploads/context` çağırır (`upload-artifacts.js --wants-branch <branch>` → çıkış 0/3); yanıt
   token'ın projesini ve `autoDeployBranches`'ı (otomatik kurulum açık, Prod olmayan hedeflerin branch'leri) verir.
   Sürüm adını CI verir, manifest'e branch yazılır: `make-manifest.js --ref <branch> ...` → `"ref": "<branch>"`.
-  Token projeye özgü olduğundan `--project-id` da gerekmez; CI'da yalnız `IDP_URL` + projenin token'ı kalır.
+  Token projeye özgü olduğundan `--project-id` da gerekmez; CI'da yalnız `IDP_URL` + token kalır.
+- **Tek CI sunucusu, çok proje:** Jenkins'te job başına credential istemiyorsanız sunucuda
+  `node scripts/derive-artifact-upload-token.js --ci-server` ile **CI sunucu token'ı** (`idpc_…`) üretin ve tek
+  global credential yapın. Her projeye yükleyebilir; projeyi `?artifact=<artifactName>` (manifest'teki `project`)
+  belirler — `upload-artifacts.js --artifact <ad>`, yüklemede manifest'ten kendiliğinden. Bedeli: bu token'ı ele
+  geçiren her projeye sürüm yükler (canlıya kendiliğinden kurulmaz). Proje token'ları çalışmaya devam eder.
 - **Hedef:** `autoDeploy: true` + aynı `ref`. Arayüzde Ayarlar → Müşteriler → hedef → "Push'ta otomatik kur".
   Branch'siz ya da Prod hedefte kaydedilemez (`targetAutoDeployErrors`); kurulum anında Prod yeniden kontrol edilir.
 
