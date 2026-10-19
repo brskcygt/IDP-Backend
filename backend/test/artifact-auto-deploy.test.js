@@ -140,7 +140,11 @@ test('a CI-started upload of a branch installs on the opted-in targets of that b
     assert.deepEqual(env.deploys, [{
       targetId: onTest.id, releaseId: ready.id, components: ['frontend'], triggeredBy: AUTO_DEPLOY_USER,
     }]);
-    assert.ok(env.audit.some((entry) => entry.action === 'RELEASE_AUTO_DEPLOY_STARTED' && entry.metadata.deploymentId === 'dep_1'));
+    assert.ok(env.audit.some((entry) => entry.action === 'RELEASE_AUTO_DEPLOY_STARTED'
+      && entry.metadata.deploymentId === 'dep_1' && entry.metadata.targetName === 'test-sunucu'));
+    const uploaded = env.audit.find((entry) => entry.action === 'RELEASE_UPLOADED');
+    assert.equal(uploaded.metadata.ciInitiated, true);
+    assert.equal(uploaded.metadata.ref, 'test');
   } finally {
     env.cleanup();
   }

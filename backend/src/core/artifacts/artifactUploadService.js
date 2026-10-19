@@ -162,7 +162,9 @@ function createArtifactUploadService({
           error: null,
         });
         auditLogger.log(null, 'RELEASE_UPLOADED', `Local release ${version} finalized for project: ${project.name}`, {
-          projectId, releaseId: release.id, version, artifacts: artifacts.length,
+          // ciInitiated + ref: a push build CI started on its own (the dashboard
+          // shows those, including the ones no target picked up).
+          projectId, releaseId: release.id, version, artifacts: artifacts.length, ciInitiated, ref,
         });
         const pruned = prune(projectId);
         if (ciInitiated && ref && typeof onCiReleaseReady === 'function') {

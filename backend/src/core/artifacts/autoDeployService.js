@@ -36,7 +36,7 @@ function createAutoDeployService({ repository, auditLogger, getProject, deployRe
       const targets = repository.listTargets(projectId).filter((target) => target.autoDeploy && target.ref === ref);
       const results = [];
       for (const target of targets) {
-        const meta = { projectId, targetId: target.id, releaseId: release.id, version: release.version, ref };
+        const meta = { projectId, targetId: target.id, targetName: target.name, releaseId: release.id, version: release.version, ref };
         if (isProdTarget(target, project)) {
           auditLogger.log(AUTO_DEPLOY_USER, 'RELEASE_AUTO_DEPLOY_SKIPPED',
             `Skipped automatic install of ${release.version} on production target '${target.name}'`, meta, { outcome: 'failure' });
