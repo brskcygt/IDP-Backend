@@ -26,6 +26,8 @@ const {
   normalizeArtifactDeployConfig,
   resolveTargetComponents,
   selectArtifact,
+  selectBrandLayer,
+  brandLayerMarker,
   targetArtifactOs,
   buildDeployPayload,
   runtimeConfigForComponent,
@@ -124,6 +126,7 @@ function createArtifactDeployService({
   getGateway,
   refreshTargetStatus = null,
   resolveTarget = async (target) => target,
+  layered = null,
   timing = {},
 }) {
   const resultGraceMs = timing.resultGraceMs ?? RESULT_GRACE_MS;
@@ -325,6 +328,9 @@ function createArtifactDeployService({
       const history = [previousVersion, ...(previous && Array.isArray(previous.previousVersions) ? previous.previousVersions : [])]
         .filter((version) => version && version !== run.release.version);
       current[name] = { version: run.release.version, deployedAt, previousVersions: [...new Set(history)].slice(0, 10) };
+      // Which brand layer went with it ('*' = a release with every brand inside):
+      // applyConfig compares it with the target's config to know a brand change.
+      if (run.layers && run.layers.has(name)) current[name].layer = run.layers.get(name);
     }
     repository.updateTarget(run.target.id, { currentReleaseId: run.release.id, currentVersions: current });
   }
@@ -392,9 +398,10 @@ function createArtifactDeployService({
     // The run stays locked until the agent's terminal deploy_result (or the timeout).
   }
 
-  async function startRun({ kind, target, project, release, triggeredBy, components, timeoutSec, buildPayload, description, sensitiveValues = [] }) {
+  async function startRun({ kind, target, project, release, triggeredBy, components, timeoutSec, buildPayload, description, sensitiveValues = [], layers = null }) {
     const run = {
       kind,
+      layers,
       deployId: newDeployId(),
       target,
       project,
@@ -450,7 +457,31 @@ function createArtifactDeployService({
     return { deploymentId: run.deploymentId, deployId: run.deployId };
   }
 
-  return {
+  /**
+   * Components whose brand (runtime config `brandLayer.configKey`) differs from
+   * the layer installed with them. Unknown (installed before layers were
+   * recorded) counts as changed only when the installed release has layers.
+   */
+  function brandChanges(target, components) {
+    const installedRelease = target.currentReleaseId ? repository.findRelease(target.currentReleaseId) : null;
+    const artifacts = installedRelease ? repository.listArtifacts(installedRelease.id) : [];
+    const changed = [];
+    for (const component of components) {
+      if (!component.brandLayer) continue;
+      const current = isPlainObject(target.currentVersions) ? target.currentVersions[component.name] : null;
+      const installed = isPlainObject(current) && current.layer !== undefined ? current.layer : undefined;
+      if (installed === '*') continue;
+      const wanted = selectBrandLayer(artifacts, component, target.runtimeConfig);
+      if (installed === undefined) {
+        if (installedRelease && !wanted.bundled) changed.push(component.name);
+        continue;
+      }
+      if ((installed || null) !== wanted.variant) changed.push(component.name);
+    }
+    return changed;
+  }
+
+  const service = {
     isTargetBusy(targetId) {
       return activeTargets.has(targetId) || preparingTargets.has(targetId);
     },
@@ -504,10 +535,29 @@ function createArtifactDeployService({
       if (missing.length > 0) {
         throw new ValidationError(`Release ${release.version} has no ${targetArtifactOs(target.os)} or 'any' artifact for: ${missing.join(', ')}.`);
       }
+      // Brand layers: the variant the target's runtime config names, merged into the package.
+      const brandLayers = new Map();
+      const layerErrors = [];
+      for (const component of resolved.components) {
+        const selection = selectBrandLayer(artifacts, component, target.runtimeConfig);
+        if (!selection) continue;
+        if (selection.error) layerErrors.push(selection.error);
+        else brandLayers.set(component.name, selection);
+      }
+      if (layerErrors.length > 0) throw new ValidationError(`Release ${release.version} has ${layerErrors.join('; ')}.`);
 
       reservePreparation(target, release.id);
       try {
         await ensureAgentOnline(target.agentId);
+        // What the agent downloads per component: the package, or package + layer merged.
+        const served = new Map(selected);
+        for (const [name, selection] of brandLayers) {
+          if (!selection.artifact) continue;
+          if (!layered) throw new ValidationError('Brand layers are not available on this server.');
+          const component = resolved.components.find((item) => item.name === name);
+          const merged = await layered.ensure({ release, base: selected.get(name), layer: selection.artifact, dir: component.brandLayer.dir });
+          served.set(name, { ...selected.get(name), sha256: merged.sha256, size: merged.size });
+        }
         assertTargetUnchanged(target);
         const freshRelease = repository.findRelease(release.id);
         if (!freshRelease || freshRelease.status !== 'ready') throw new ConflictError(`Release ${release.version} changed while deployment was being prepared.`);
@@ -521,14 +571,17 @@ function createArtifactDeployService({
         components: resolved.components.map((component) => component.name),
         timeoutSec: computeDeployTimeoutSec(resolved.components),
         sensitiveValues: collectSensitiveValues(target.runtimeConfig, resolved.components),
+        layers: new Map([...brandLayers].map(([name, selection]) => [name, brandLayerMarker(selection)])),
         description: `Artifact deploy of ${release.version} to target '${target.name}' (project: ${project.name})`,
         buildPayload: (run) => {
           const issued = new Map();
           for (const component of resolved.components) {
+            const layer = brandLayers.get(component.name);
             issued.set(component.name, tokens.issue({
               artifactId: selected.get(component.name).id,
               agentId: target.agentId,
               deploymentId: run.deploymentId,
+              ...(layer && layer.artifact ? { layerArtifactId: layer.artifact.id, layerDir: component.brandLayer.dir } : {}),
             }));
             const artifact = selected.get(component.name);
             const componentConfig = runtimeConfigForComponent(target.runtimeConfig, component);
@@ -539,13 +592,19 @@ function createArtifactDeployService({
                 : null,
             ].filter(Boolean);
             log(run, `${component.name}: ${artifact.fileName} (${artifact.os}, ${artifact.size} bytes) → ${component.subdir}/ via ${component.runtime.type}${extras.length ? `; ${extras.join('; ')}` : ''}`);
+            if (layer) {
+              const dir = component.brandLayer.dir;
+              if (layer.artifact) log(run, `${component.name}: + brand layer '${layer.variant}' (${layer.artifact.fileName}) → ${component.subdir}/${dir}/ — this target receives no other brand.`);
+              else if (layer.bundled) log(run, `${component.name}: this release has no brand layers (every brand is inside the package).`);
+              else log(run, `${component.name}: ${component.brandLayer.configKey} is not set — no brand layer, the package's default brand.`);
+            }
           }
           log(run, `${release.version} → target '${target.name}' (agent ${target.agentId}).`);
           return buildDeployPayload({
             deployId: run.deployId,
             release,
             components: resolved.components,
-            artifacts: selected,
+            artifacts: served,
             tokens: issued,
             runtimeConfig: target.runtimeConfig,
             publicUrl,
@@ -599,8 +658,16 @@ function createArtifactDeployService({
       }
     },
 
-    /** Applies the stored target config without changing the installed release. */
-    async applyConfig({ targetId, triggeredBy }) {
+    /**
+     * Applies the stored target config without changing the installed release.
+     *
+     * Except a changed brand: the brand is files (the brand layer), not
+     * config.js. When the brand a component's config names differs from the
+     * layer installed with it, the installed release is reinstalled for those
+     * components instead (which writes their config too); the result then
+     * carries `redeployed`.
+     */
+    async applyConfig({ targetId, triggeredBy, publicUrl }) {
       const target = await requireTarget(targetId);
       const project = getProject(target.projectId);
       const config = normalizeArtifactDeployConfig(project.config && project.config.artifactDeploy);
@@ -609,6 +676,23 @@ function createArtifactDeployService({
       }
       const resolved = resolveTargetComponents(config.components, target.components, null);
       if (resolved.errors.length > 0) throw new ValidationError(resolved.errors.join(' '));
+
+      const rebrand = brandChanges(target, resolved.components);
+      if (rebrand.length > 0) {
+        if (!target.currentReleaseId) {
+          throw new ValidationError(`The brand of ${rebrand.join(', ')} changed but nothing is installed on '${target.name}' yet — install a release.`);
+        }
+        const result = await service.deploy({ targetId, releaseId: target.currentReleaseId, components: rebrand, triggeredBy, publicUrl });
+        deploymentManager.pushLog(result.deploymentId,
+          `[Config apply] The brand changed for ${rebrand.join(', ')}: reinstalling the installed release with the new brand layer.`);
+        const others = resolved.components.filter((component) => !rebrand.includes(component.name)
+          && runtimeConfigForComponent(target.runtimeConfig, component) !== null);
+        if (others.length > 0) {
+          deploymentManager.pushLog(result.deploymentId,
+            `[Config apply] ⚠ Not applied in this run: ${others.map((component) => component.name).join(', ')} — apply config again once it finishes.`);
+        }
+        return { ...result, redeployed: rebrand };
+      }
       const configured = resolved.components
         .map((component) => ({ component, runtimeConfig: runtimeConfigForComponent(target.runtimeConfig, component) }))
         .filter((entry) => entry.runtimeConfig !== null);
@@ -671,6 +755,7 @@ function createArtifactDeployService({
       return repository.listEvents(deploymentId);
     },
   };
+  return service;
 }
 
 module.exports = { createArtifactDeployService, RESULT_GRACE_MS };

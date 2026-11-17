@@ -18,7 +18,7 @@ const { createArtifactDeployRepository } = require('../src/store/artifactDeployR
 const { createLocalArtifactStore } = require('../src/core/artifacts/localArtifactStore');
 const { createArtifactUploadService } = require('../src/core/artifacts/artifactUploadService');
 const { createFolderImportService, guessComponent, guessVersion } = require('../src/core/artifacts/folderImportService');
-const { validateArtifactDeployConfig } = require('../src/core/artifacts/contracts');
+const { normalizeArtifactDeployConfig, validateArtifactDeployConfig } = require('../src/core/artifacts/contracts');
 const { ConflictError, NotFoundError, ValidationError } = require('../src/core/errors');
 
 const HOUR = 60 * 60 * 1000;
@@ -82,11 +82,26 @@ test('guessComponent / guessVersion read what a CI usually puts in a file name',
   assert.equal(guessVersion('jetsrm-backend-latest.tar.gz'), null);
 });
 
+test('guessComponent: the name written in one piece wins over scattered words', () => {
+  const brands = ['frontend-evyap', 'frontend-koksan', 'frontend-mdp', 'frontend-temsa'];
+  for (const brand of ['evyap', 'koksan', 'mdp', 'temsa']) {
+    assert.equal(guessComponent(`mdp-srm-frontend-${brand}-0.0.0-main.1.78388ac1.tar.gz`, brands), `frontend-${brand}`);
+  }
+});
+
+test('localFolder: a pasted path is cleaned, a Windows one keeps its backslashes', () => {
+  const clean = (localFolder) => normalizeArtifactDeployConfig({ localFolder }).localFolder;
+  assert.equal(clean('  "/Users/me/my builds" '), '/Users/me/my builds');
+  assert.equal(clean('/Users/me/Ekran\\ Resmi'), '/Users/me/Ekran Resmi');
+  assert.equal(clean('~/my\\ builds'), '~/my builds');
+  assert.equal(clean("'C:\\my builds\\out'"), 'C:\\my builds\\out');
+});
+
 test('localFolder: absolute paths only', () => {
-  for (const folder of ['C:\\builds\\jetsrm', 'D:/out', '\\\\fileserver\\builds', '/srv/builds', '']) {
+  for (const folder of ['C:\\builds\\jetsrm', 'D:/out', '\\\\fileserver\\builds', '/srv/builds', '/Users/me/Ekran\\ Resmi', '~', '~/builds', '"/srv/my builds"', '']) {
     assert.deepEqual(validateArtifactDeployConfig({ localFolder: folder }), [], folder);
   }
-  for (const folder of ['builds', '..\\builds', 'C:', 42]) {
+  for (const folder of ['builds', '..\\builds', 'C:', '~other/builds', 42]) {
     assert.equal(validateArtifactDeployConfig({ localFolder: folder }).length, 1, String(folder));
   }
 });
@@ -295,5 +310,72 @@ test('build folders: a folder with a file still being written is refused, and no
     await assert.rejects(() => run('a\\b'), /Invalid file name/);
   } finally {
     ctx.cleanup();
+  }
+});
+
+test('localFolder: ~ is the home of the user the server runs as', async () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'idp-home-'));
+  fs.writeFileSync(path.join(home, 'jetsrm-frontend-1.0.0.tar.gz'), 'x');
+  const realHome = os.homedir;
+  os.homedir = () => home;
+  try {
+    const ctx = setup({ localFolder: '~/' });
+    const listed = await ctx.service.listFolder(ctx.project.id);
+    assert.equal(listed.folder, home);
+  } finally {
+    os.homedir = realHome;
+    fs.rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test('localFolder: a Windows path on a server that is not Windows says so', { skip: process.platform === 'win32' }, async () => {
+  const ctx = setup({ localFolder: 'C:\\builds\\jetsrm' });
+  await assert.rejects(ctx.service.listFolder(ctx.project.id), (err) => err instanceof ValidationError && /does not run on Windows/.test(err.message));
+});
+
+test('listFolder: a folder holding packages lists the packages, not the folder', async () => {
+  const ctx = setup({ components: [
+    { name: 'frontend-evyap', subdir: 'frontend-evyap', runtime: { type: 'iis-static' } },
+    { name: 'frontend-mdp', subdir: 'frontend-mdp', runtime: { type: 'iis-static' } },
+  ] });
+  try {
+    const release = path.join(ctx.buildFolder, '0.0.0-main.3.ddcc239d');
+    fs.mkdirSync(release);
+    fs.writeFileSync(path.join(release, 'mdp-srm-frontend-evyap-0.0.0-main.3.ddcc239d.tar.gz'), 'x');
+    fs.writeFileSync(path.join(release, 'mdp-srm-0.0.0-main.3.ddcc239d-manifest.json'), '{}');
+    // A release already taken from it: the same file under another version.
+    const copy = path.join(ctx.buildFolder, '0.0.0-main.3.ddcc239d-evyap');
+    fs.mkdirSync(copy);
+    fs.writeFileSync(path.join(copy, 'mdp-srm-frontend-evyap-0.0.0-main.3.ddcc239d.tar.gz'), 'x');
+    fs.utimesSync(release, new Date(0), new Date(0));
+    fs.utimesSync(path.join(release, 'mdp-srm-frontend-evyap-0.0.0-main.3.ddcc239d.tar.gz'), new Date(1000), new Date(1000));
+    const { files } = await ctx.service.listFolder('p1');
+    const nested = files.filter((file) => /main\.3/.test(file.name));
+    assert.equal(nested.length, 1);
+    assert.equal(nested[0].name, '0.0.0-main.3.ddcc239d/mdp-srm-frontend-evyap-0.0.0-main.3.ddcc239d.tar.gz');
+    assert.equal(nested[0].kind, 'file');
+    assert.equal(nested[0].component, 'frontend-evyap');
+    assert.equal(nested[0].version, '0.0.0-main.3.ddcc239d');
+  } finally {
+    ctx.cleanup?.();
+  }
+});
+
+test('importFromFolder: a package one folder down is stored by its own name; longer paths are refused', async () => {
+  const ctx = setup({ components: [{ name: 'frontend-evyap', subdir: 'frontend-evyap', runtime: { type: 'iis-static' } }] });
+  try {
+    const release = path.join(ctx.buildFolder, 'build-3');
+    fs.mkdirSync(release);
+    const name = 'jetsrm-frontend-evyap-3.0.0.tar.gz';
+    fs.writeFileSync(path.join(release, name), 'package');
+    fs.utimesSync(path.join(release, name), new Date(1000), new Date(1000));
+    const created = await ctx.service.importFromFolder({ projectId: 'p1', version: '3.0.0-evyap', files: [{ component: 'frontend-evyap', file: `build-3/${name}` }] });
+    assert.equal(created.manifest.artifacts[0].file, name);
+    assert.equal(created.manifest.artifacts[0].size, 'package'.length);
+    for (const file of [`../${name}`, `build-3/sub/${name}`, `/etc/${name}`, 'build-3/notes.txt']) {
+      await assert.rejects(ctx.service.importFromFolder({ projectId: 'p1', version: '3.0.1', files: [{ component: 'frontend-evyap', file }] }), ValidationError, file);
+    }
+  } finally {
+    ctx.cleanup?.();
   }
 });

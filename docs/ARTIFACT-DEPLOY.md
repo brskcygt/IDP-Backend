@@ -197,6 +197,7 @@ CI sağlayıcısından bağımsız iki aşamalı sözleşme:
 - Varsayılan tek-artifact limiti 1 GiB; `IDP_ARTIFACT_MAX_BYTES` ile en fazla 20 GiB.
 - Her proje için **iki ayrı kovada** son üçer yerel `ready` release tutulur: önizlemeler (composer'ın
   `composition` taşıyan release'leri ve üretilmiş `0.0.0-…` sürümleri) ve adlandırılmış (tag'li) release'ler.
+  Kovalar bileşen kümesine göre de ayrılır: yalnız `frontend-evyap` taşıyan release'ler başka firmanınkini silmez.
   Bir önizleme yığını gerçek bir release'i hiçbir zaman silemez. Daha eski binary + release satırı otomatik silinir;
   herhangi bir hedefte kurulu (`current_release_id`) veya aktif deploy'da kullanılan release korunur. Bu
   nedenle korunanlarla disk üzerinde üçten fazla release bulunabilir. External import release'leri bu

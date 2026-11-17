@@ -35,10 +35,12 @@ function createDownloadTokenService({ repository, now = () => Date.now(), ttlMs 
 
   return {
     /**
-     * @param {{ artifactId: string, agentId: string, deploymentId: string }} binding
+     * `layerArtifactId` + `layerDir`: the download is the artifact with that
+     * layer merged in under `layerDir/` (see layeredArtifacts.js).
+     * @param {{ artifactId: string, agentId: string, deploymentId: string, layerArtifactId?: string, layerDir?: string }} binding
      * @returns {string} the plaintext token (goes into the agent payload only)
      */
-    issue({ artifactId, agentId, deploymentId }) {
+    issue({ artifactId, agentId, deploymentId, layerArtifactId = null, layerDir = null }) {
       if (!artifactId) throw new Error('A download token must be bound to an artifact.');
       try {
         repository.deleteExpiredTokens(now());
@@ -51,6 +53,8 @@ function createDownloadTokenService({ repository, now = () => Date.now(), ttlMs 
         artifactId,
         agentId: agentId || null,
         deploymentId: deploymentId || null,
+        layerArtifactId: layerArtifactId || null,
+        layerDir: layerArtifactId ? layerDir : null,
         expiresAt: now() + ttlMs,
         maxUses,
         createdAt: new Date(now()).toISOString(),

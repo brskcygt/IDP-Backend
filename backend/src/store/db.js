@@ -237,6 +237,16 @@ function ensureDeployTargetColumns(db) {
   if (!existing.has('auto_deploy')) db.exec('ALTER TABLE deploy_targets ADD COLUMN auto_deploy INTEGER NOT NULL DEFAULT 0');
 }
 
+function ensureArtifactLayerColumns(db) {
+  // A layer artifact's variant (e.g. brand `koksan`); NULL for a component's own package.
+  const artifacts = new Set(db.prepare('PRAGMA table_info(release_artifacts)').all().map((row) => row.name));
+  if (!artifacts.has('variant')) db.exec('ALTER TABLE release_artifacts ADD COLUMN variant TEXT');
+  // A token for a package installed with a layer: the download serves the two merged.
+  const tokens = new Set(db.prepare('PRAGMA table_info(artifact_download_tokens)').all().map((row) => row.name));
+  if (!tokens.has('layer_artifact_id')) db.exec('ALTER TABLE artifact_download_tokens ADD COLUMN layer_artifact_id TEXT');
+  if (!tokens.has('layer_dir')) db.exec('ALTER TABLE artifact_download_tokens ADD COLUMN layer_dir TEXT');
+}
+
 function ensureReleaseColumns(db) {
   const existing = new Set(db.prepare('PRAGMA table_info(releases)').all().map((row) => row.name));
   if (!existing.has('source_identity_json')) {
@@ -319,6 +329,7 @@ function openDatabase(filePath = resolveDbFile()) {
   ensureAuditLogColumns(db);
   ensureReleaseColumns(db);
   ensureDeployTargetColumns(db);
+  ensureArtifactLayerColumns(db);
 
   // The database holds project configuration and the full audit trail, so it
   // should not be world-readable. SQLite creates the file with the process

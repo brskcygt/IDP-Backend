@@ -16,6 +16,12 @@ const VERSION_PATTERN = /^[0-9A-Za-z][0-9A-Za-z._-]{0,63}$/;
 const COMPONENT_NAME_PATTERN = /^[a-z][a-z0-9-]{0,31}$/;
 const ARTIFACT_OS_VALUES = ['any', 'win-x64', 'linux-x64'];
 const ARTIFACT_FILE_PATTERN = /^[A-Za-z0-9._-]+\.tar\.gz$/;
+/**
+ * A layer artifact's variant (e.g. the brand `koksan` of component `brand`):
+ * one build ships every variant, a target receives only the one its runtime
+ * config names (see `brandLayer` on a component).
+ */
+const ARTIFACT_VARIANT_PATTERN = /^[a-z0-9][a-z0-9_-]{0,31}$/;
 const SHA256_PATTERN = /^[0-9a-f]{64}$/;
 /** `manifest.project` and the artifact file-name prefix (e.g. `jetsrm`). */
 const ARTIFACT_NAME_PATTERN = /^[a-z0-9][a-z0-9._-]{0,63}$/;
@@ -217,13 +223,23 @@ function validateManifest(manifest, expected = {}) {
       if (typeof artifact.file !== 'string' || !ARTIFACT_FILE_PATTERN.test(artifact.file)) problems.push('file');
       if (typeof artifact.sha256 !== 'string' || !SHA256_PATTERN.test(artifact.sha256)) problems.push('sha256');
       if (!Number.isSafeInteger(artifact.size) || artifact.size <= 0) problems.push('size');
+      const hasVariant = artifact.variant !== undefined && artifact.variant !== null;
+      if (hasVariant && (typeof artifact.variant !== 'string' || !ARTIFACT_VARIANT_PATTERN.test(artifact.variant))) problems.push('variant');
+      // Components IDP derives from this package when a release is made from the build (frontend
+      // per customer): see variantReleaseService.
+      const hasDerives = artifact.derives !== undefined && artifact.derives !== null;
+      if (hasDerives && (!Array.isArray(artifact.derives) || artifact.derives.length === 0 || artifact.derives.length > 50
+        || artifact.derives.some((name) => typeof name !== 'string' || !COMPONENT_NAME_PATTERN.test(name))
+        || new Set(artifact.derives).size !== artifact.derives.length)) problems.push('derives');
       if (problems.length > 0) {
         errors.push(`${at} has invalid ${problems.join(', ')}.`);
         return;
       }
       if (seenFiles.has(artifact.file)) errors.push(`${at}.file '${artifact.file}' is listed twice.`);
-      const key = `${artifact.component}/${artifact.os}`;
-      if (seenComponentOs.has(key)) errors.push(`${at} duplicates component '${artifact.component}' for os '${artifact.os}'.`);
+      const key = `${artifact.component}/${artifact.os}${hasVariant ? `@${artifact.variant}` : ''}`;
+      if (seenComponentOs.has(key)) {
+        errors.push(`${at} duplicates component '${artifact.component}' for os '${artifact.os}'${hasVariant ? ` and variant '${artifact.variant}'` : ''}.`);
+      }
       seenFiles.add(artifact.file);
       seenComponentOs.add(key);
       artifacts.push({
@@ -232,6 +248,9 @@ function validateManifest(manifest, expected = {}) {
         file: artifact.file,
         sha256: artifact.sha256,
         size: artifact.size,
+        // Only when given, like `ref`: older manifests stay byte-identical.
+        ...(hasVariant ? { variant: artifact.variant } : {}),
+        ...(hasDerives ? { derives: [...artifact.derives] } : {}),
       });
     });
   }
@@ -265,10 +284,25 @@ function manifestFileName(artifactName, version) {
 
 const ARTIFACT_DEPLOY_KEYS = ['source', 'build', 'versionVariable', 'artifactName', 'components', 'localFolder'];
 // Absolute folder on the IDP server holding ready .tar.gz builds: C:\\builds, \\\\host\\share or /srv/builds.
-const LOCAL_FOLDER_PATTERN = /^(?:[A-Za-z]:[\\/]|\\\\[^\\/]|\/)[^\u0000-\u001f]*$/;
+// Absolute on Windows (C:\x, D:/x, \\\\host\\x) or macOS/Linux (/x, ~/x).
+const LOCAL_FOLDER_PATTERN = /^(?:[A-Za-z]:[\\/]|\\\\[^\\/]|\/|~(?:[\\/]|$))[^\u0000-\u001f]*$/;
+
+/**
+ * A folder path as it arrives from a copy-paste: surrounding quotes go, and so
+ * does the backslash a macOS terminal puts before a space (`/a/Ekran\ Resmi`).
+ * Windows paths keep their backslashes: there they separate folders.
+ */
+function cleanLocalFolder(value) {
+  let folder = String(value).trim();
+  const quoted = folder.match(/^(['"])(.*)\1$/);
+  if (quoted) folder = quoted[2].trim();
+  return /^[/~]/.test(folder) ? folder.replace(/\\ /g, ' ') : folder;
+}
 const SOURCE_KEYS = ['platform', 'owner', 'repo', 'baseUrl', 'authType', 'username', 'token', 'hasToken'];
 const BUILD_KEYS = ['provider', 'parameters'];
-const COMPONENT_KEYS = ['name', 'subdir', 'os', 'runtime', 'preserve', 'health', 'writeRuntimeConfig', 'hooks'];
+const COMPONENT_KEYS = ['name', 'subdir', 'os', 'runtime', 'preserve', 'health', 'writeRuntimeConfig', 'hooks', 'brandLayer'];
+const BRAND_LAYER_KEYS = ['artifact', 'configKey', 'dir'];
+const BRAND_LAYER_DEFAULTS = { artifact: 'brand', configKey: 'VITE_COMPANY_NAME', dir: 'brand' };
 const RUNTIME_KEYS = ['type', 'serviceName', 'appPool'];
 const HEALTH_KEYS = ['url', 'expectVersionPath', 'timeoutSec'];
 const HOOKS_KEYS = ['preStart'];
@@ -495,6 +529,42 @@ function validateComponent(component, path, errors) {
     errors.push({ path: childPath(path, 'writeRuntimeConfig'), message: 'Must be a boolean.' });
   }
   validateHooks(component.hooks, childPath(path, 'hooks'), errors);
+  validateBrandLayer(component.brandLayer, childPath(path, 'brandLayer'), errors);
+}
+
+/**
+ * `brandLayer`: the component's package is installed together with ONE
+ * variant of a layer artifact — the one the target's runtime config names
+ * under `configKey` — unpacked into `dir/` inside the component. Used so a
+ * single frontend build ships to each customer with only that customer's
+ * brand. Every field is optional (`true`/`{}` = the defaults).
+ */
+function validateBrandLayer(layer, path, errors) {
+  if (layer === undefined || layer === null || layer === false || layer === true) return;
+  if (!isPlainObject(layer)) {
+    errors.push({ path, message: 'Must be an object (or true for the defaults).' });
+    return;
+  }
+  errors.push(...unknownKeyErrors(layer, BRAND_LAYER_KEYS, path));
+  if (layer.artifact !== undefined && (typeof layer.artifact !== 'string' || !COMPONENT_NAME_PATTERN.test(layer.artifact))) {
+    errors.push({ path: childPath(path, 'artifact'), message: 'Must match ^[a-z][a-z0-9-]{0,31}$.' });
+  }
+  if (layer.configKey !== undefined && (typeof layer.configKey !== 'string' || !RUNTIME_CONFIG_KEY_PATTERN.test(layer.configKey))) {
+    errors.push({ path: childPath(path, 'configKey'), message: 'Must be an UPPER_SNAKE runtime config key.' });
+  }
+  if (layer.dir !== undefined && !isSafeSubdir(layer.dir)) {
+    errors.push({ path: childPath(path, 'dir'), message: "Must be a single folder name (letters, digits, '.', '_', '-'), not '.' or '..'." });
+  }
+}
+
+function normalizeBrandLayer(layer) {
+  if (layer === true) return { ...BRAND_LAYER_DEFAULTS };
+  if (!isPlainObject(layer)) return null;
+  return {
+    artifact: layer.artifact || BRAND_LAYER_DEFAULTS.artifact,
+    configKey: layer.configKey || BRAND_LAYER_DEFAULTS.configKey,
+    dir: layer.dir || BRAND_LAYER_DEFAULTS.dir,
+  };
 }
 
 /**
@@ -524,7 +594,7 @@ function validateArtifactDeployConfig(value, path = 'artifactDeploy') {
   optionalPatternString(value.versionVariable, VARIABLE_KEY_PATTERN, 100, childPath(path, 'versionVariable'), errors);
   optionalPatternString(value.artifactName, ARTIFACT_NAME_PATTERN, 64, childPath(path, 'artifactName'), errors);
   if (value.localFolder !== undefined && value.localFolder !== null && value.localFolder !== '') {
-    if (typeof value.localFolder !== 'string' || value.localFolder.length > 1000 || !LOCAL_FOLDER_PATTERN.test(value.localFolder.trim())) {
+    if (typeof value.localFolder !== 'string' || value.localFolder.length > 1000 || !LOCAL_FOLDER_PATTERN.test(cleanLocalFolder(value.localFolder))) {
       errors.push({ path: childPath(path, 'localFolder'), message: 'Must be an absolute folder path on the IDP server.' });
     }
   }
@@ -604,6 +674,7 @@ function normalizeComponent(component) {
     health: normalizeHealth(component.health),
     writeRuntimeConfig: component.writeRuntimeConfig === true,
     hooks: normalizeHooks(component.hooks),
+    brandLayer: normalizeBrandLayer(component.brandLayer),
   };
 }
 
@@ -641,7 +712,7 @@ function normalizeArtifactDeployConfig(raw) {
     artifactName,
     components: Array.isArray(raw.components) ? raw.components.filter(isPlainObject).map(normalizeComponent) : [],
     // Where the project's own CI drops finished builds; '' = no folder source.
-    localFolder: typeof raw.localFolder === 'string' ? raw.localFolder.trim() : '',
+    localFolder: typeof raw.localFolder === 'string' ? cleanLocalFolder(raw.localFolder) : '',
   };
 }
 
@@ -916,7 +987,25 @@ function isComposedRelease(release) {
  * of previews never pushes a real release out.
  */
 function isPreviewRelease(release) {
-  return isComposedRelease(release) || String((release && release.version) || '').startsWith('0.0.0-');
+  return isComposedRelease(release) || isBuildVersion((release && release.version) || '');
+}
+
+/**
+ * A build nobody named is not a version: `DDMMYYYYHHMM-<name>` (local time of
+ * the IDP server), e.g. `120420261954-mdp-srm-frontend`. Older generated builds
+ * are `0.0.0-<branch>.<stamp>`; both count as builds, never as releases.
+ */
+const BUILD_VERSION_PATTERN = /^\d{12}-/;
+function isBuildVersion(version) {
+  const text = String(version || '');
+  return text.startsWith('0.0.0-') || BUILD_VERSION_PATTERN.test(text);
+}
+
+function buildVersionName(name, date = new Date()) {
+  const two = (value) => String(value).padStart(2, '0');
+  const stamp = `${two(date.getDate())}${two(date.getMonth() + 1)}${date.getFullYear()}${two(date.getHours())}${two(date.getMinutes())}`;
+  const slug = String(name || '').replace(/[^0-9A-Za-z._-]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 40) || 'build';
+  return `${stamp}-${slug}`;
 }
 
 function checkTargetConfirmation(target, project, confirmation) {
@@ -946,7 +1035,8 @@ function targetArtifactOs(targetOs) {
  */
 function selectArtifact(artifacts, component, targetOs) {
   const nativeOs = targetArtifactOs(targetOs);
-  const candidates = artifacts.filter((artifact) => artifact.component === component.name);
+  // Variant artifacts are layers (see selectBrandLayer), never a component's own package.
+  const candidates = artifacts.filter((artifact) => artifact.component === component.name && !artifact.variant);
   const acceptable = component.os && component.os !== 'any'
     ? (component.os === nativeOs ? [nativeOs] : [])
     : component.os === 'any' ? ['any'] : [nativeOs, 'any'];
@@ -955,6 +1045,44 @@ function selectArtifact(artifacts, component, targetOs) {
     if (match) return match;
   }
   return null;
+}
+
+/**
+ * The brand layer a component with `brandLayer` receives on a target, or null
+ * when the component has none.
+ *   variant  what the target's runtime config names under `configKey`
+ *            (lowercased), null when it names nothing → no layer, the
+ *            package's built-in default brand.
+ *   artifact the release's layer artifact for that variant.
+ *   bundled  the release ships no layer artifacts at all (built before
+ *            layers existed, every brand inside): installed as it is.
+ *   error    the release has layers but not the one the target asks for.
+ * @returns {{ variant: string|null, artifact: object|null, bundled: boolean, error: string|null }|null}
+ */
+function selectBrandLayer(artifacts, component, runtimeConfig) {
+  const layer = component.brandLayer;
+  if (!layer) return null;
+  const layers = artifacts.filter((artifact) => artifact.component === layer.artifact && artifact.variant);
+  const config = runtimeConfigForComponent(runtimeConfig, component);
+  const raw = config && typeof config.values[layer.configKey] === 'string' ? config.values[layer.configKey] : '';
+  const variant = raw.trim().toLowerCase() || null;
+  if (layers.length === 0) return { variant, artifact: null, bundled: true, error: null };
+  if (!variant) return { variant: null, artifact: null, bundled: false, error: null };
+  const artifact = layers.find((candidate) => candidate.variant === variant) || null;
+  return {
+    variant,
+    artifact,
+    bundled: false,
+    error: artifact
+      ? null
+      : `no '${layer.artifact}' layer '${variant}' for ${component.name} (${layer.configKey}); it ships: ${layers.map((item) => item.variant).join(', ')}`,
+  };
+}
+
+/** What `currentVersions[component].layer` records for a selection (see selectBrandLayer). */
+function brandLayerMarker(selection) {
+  if (!selection) return undefined;
+  return selection.bundled ? '*' : selection.variant;
 }
 
 /**
@@ -1118,10 +1246,15 @@ module.exports = {
   targetAutoDeployErrors,
   isComposedRelease,
   isPreviewRelease,
+  isBuildVersion,
+  buildVersionName,
   PREVIEW_NOT_ALLOWED_ON_PROD,
   checkTargetConfirmation,
   targetArtifactOs,
   selectArtifact,
+  selectBrandLayer,
+  brandLayerMarker,
+  ARTIFACT_VARIANT_PATTERN,
   resolveTargetComponents,
   computeDeployTimeoutSec,
   artifactDownloadUrl,

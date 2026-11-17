@@ -225,7 +225,7 @@ test('deploy/rollback: Prod targets require the target name; triggeredBy and pub
     deploymentId: 'deploy_c', deployId: 'dep_3', sseUrl: '/api/deploy/logs/deploy_c', eventsUrl: '/api/deployments/deploy_c/events',
   });
   assert.deepEqual(services.calls.find((c) => c.name === 'applyConfig').args[0], {
-    targetId: 'tgt_prod', triggeredBy: 'user-deployer',
+    targetId: 'tgt_prod', triggeredBy: 'user-deployer', publicUrl: 'https://idp.example',
   });
 });
 

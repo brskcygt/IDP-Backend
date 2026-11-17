@@ -42,14 +42,18 @@ function createArtifactUploadService({
   /**
    * Keeps the newest `retention` releases of EACH bucket — previews (composed
    * or generated `0.0.0-…` builds) and named releases — so a run of test
-   * builds never evicts a real release. Releases current on a target or
-   * being deployed are never pruned.
+   * builds never evicts a real release. A bucket is also per set of components:
+   * one customer's own releases never evict another customer's. Releases current
+   * on a target or being deployed are never pruned.
    */
   function prune(projectId) {
-    const releases = repository.listReadyLocalReleases(projectId);
-    const previews = releases.filter(isPreviewRelease);
-    const named = releases.filter((release) => !isPreviewRelease(release));
-    const candidates = [...previews.slice(retention), ...named.slice(retention)];
+    const buckets = new Map();
+    for (const release of repository.listReadyLocalReleases(projectId)) {
+      const components = (release.manifest?.artifacts ?? []).map((artifact) => artifact.component);
+      const key = `${isPreviewRelease(release)}:${[...new Set(components)].sort().join(',')}`;
+      buckets.set(key, [...(buckets.get(key) ?? []), release]);
+    }
+    const candidates = [...buckets.values()].flatMap((bucket) => bucket.slice(retention));
     const pruned = [];
     for (const release of candidates) {
       if (protectedRelease(release)) continue;

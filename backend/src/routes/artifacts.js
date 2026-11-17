@@ -77,6 +77,7 @@ const createTagSchema = object({
   allowUnknown: false,
 });
 const importReleaseSchema = object({ fields: { version: versionRule() }, allowUnknown: false });
+const buildReleaseSchema = object({ fields: { version: versionRule(), buildReleaseId: string({ min: 1, max: 128 }), operationId: optional(string({ min: 8, max: 64, pattern: /^[A-Za-z0-9_-]+$/ })) }, allowUnknown: false });
 const folderReleaseSchema = object({
   fields: {
     version: versionRule(),
@@ -128,7 +129,7 @@ function bearerToken(req) {
 function createArtifactRoutes({ services, getProject, listProjects = () => [], auditLogger, publicUrl = null, publicUrlError = null, upload = {}, rateLimits = {} }) {
   if (!services) throw new Error('createArtifactRoutes: services are required.');
   if (!auditLogger) throw new Error('createArtifactRoutes: auditLogger is required.');
-  const { releaseService, composeService, targetService, artifactDeployService, uploadService, autoDeployService, folderImportService, downloadService } = services;
+  const { releaseService, composeService, targetService, artifactDeployService, uploadService, autoDeployService, folderImportService, variantReleaseService, downloadService } = services;
   const trigger = rateLimits.trigger ? [rateLimits.trigger] : [];
   const actor = (req) => req.session?.user?.username;
   const invalid = (res, message, result) => res.status(400).json({ error: message, details: result.errors });
@@ -273,6 +274,38 @@ function createArtifactRoutes({ services, getProject, listProjects = () => [], a
     }
   });
 
+  // A release from an uploaded build: IDP makes each customer's package from it. The caller may
+  // name the operation and poll its progress (kept in memory, dropped a few minutes after it ends).
+  const buildProgress = new Map();
+  const PROGRESS_KEEP_MS = 5 * 60 * 1000;
+  const forgetProgressLater = (key) => setTimeout(() => buildProgress.delete(key), PROGRESS_KEEP_MS).unref?.();
+  api.post('/api/projects/:id/releases/from-build', requirePermission('release:create'), ...trigger, async (req, res) => {
+    const body = validate(req.body ?? {}, buildReleaseSchema);
+    if (!body.valid) return invalid(res, 'Invalid build release request.', body);
+    const key = body.value.operationId ? `${req.params.id}:${body.value.operationId}` : null;
+    if (key) buildProgress.set(key, { percent: 0, phase: 'starting', done: false });
+    try {
+      const release = await variantReleaseService.createFromBuild({
+        projectId: req.params.id,
+        buildReleaseId: body.value.buildReleaseId,
+        version: body.value.version,
+        triggeredBy: actor(req),
+        onProgress: (state) => { if (key) buildProgress.set(key, { ...state, done: false }); },
+      });
+      if (key) { buildProgress.set(key, { percent: 100, phase: 'done', done: true }); forgetProgressLater(key); }
+      res.json(release);
+    } catch (err) {
+      if (key) { buildProgress.set(key, { percent: 0, phase: 'failed', done: true, error: true }); forgetProgressLater(key); }
+      sendError(res, err);
+    }
+  });
+
+  api.get('/api/projects/:id/releases/from-build/progress/:operationId', requirePermission('release:create'), (req, res) => {
+    const state = buildProgress.get(`${req.params.id}:${req.params.operationId}`);
+    if (!state) return res.status(404).json({ error: 'No such operation.' });
+    return res.json(state);
+  });
+
   api.get('/api/releases/:id', requirePermission('project:read'), (req, res) => {
     try {
       res.json(releaseService.getRelease(req.params.id));
@@ -406,6 +439,8 @@ function createArtifactRoutes({ services, getProject, listProjects = () => [], a
       const result = await artifactDeployService.applyConfig({
         targetId: target.id,
         triggeredBy: actor(req),
+        // A changed brand cannot be a config write: the brand layer is reinstalled.
+        publicUrl,
       });
       res.status(202).json({
         ...result,
@@ -461,6 +496,7 @@ function createArtifactRoutes({ services, getProject, listProjects = () => [], a
       agentId: binding.agentId,
       deploymentId: binding.deploymentId,
       use: binding.uses,
+      ...(authorized.layer ? { layerArtifactId: authorized.layer.id, layerVariant: authorized.layer.variant } : {}),
     };
     const upstream = new AbortController();
     res.on('close', () => {
@@ -476,18 +512,24 @@ function createArtifactRoutes({ services, getProject, listProjects = () => [], a
       if (!res.headersSent) res.status(502).json({ error: 'The artifact source is unavailable.' });
       return;
     }
-    if (opened.contentLength !== null && opened.contentLength !== artifact.size) {
+    // A layered download (package + brand layer) is its own file: its sha256 / size come with it.
+    const served = {
+      size: opened.size ?? artifact.size,
+      sha256: opened.sha256 ?? artifact.sha256,
+      fileName: opened.fileName ?? artifact.fileName,
+    };
+    if (opened.contentLength !== null && opened.contentLength !== served.size) {
       opened.stream.destroy();
       auditLogger.log(null, 'ARTIFACT_DOWNLOAD_FAILED', `Artifact size mismatch at the source: ${artifact.fileName}`,
-        { ...meta, error: `source Content-Length ${opened.contentLength} != manifest size ${artifact.size}` }, { outcome: 'failure' });
+        { ...meta, error: `source Content-Length ${opened.contentLength} != manifest size ${served.size}` }, { outcome: 'failure' });
       return res.status(502).json({ error: 'The artifact at the source does not match the release manifest.' });
     }
 
     res.status(200).set({
       'Content-Type': 'application/gzip',
-      'Content-Length': String(artifact.size),
-      'X-Artifact-Sha256': artifact.sha256,
-      'Content-Disposition': `attachment; filename="${artifact.fileName}"`,
+      'Content-Length': String(served.size),
+      'X-Artifact-Sha256': served.sha256,
+      'Content-Disposition': `attachment; filename="${served.fileName}"`,
     });
     try {
       await pipeline(opened.stream, res);

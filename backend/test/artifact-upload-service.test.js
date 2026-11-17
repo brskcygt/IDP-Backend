@@ -57,25 +57,25 @@ function setup() {
   };
 }
 
-function releaseManifest(version, body) {
+function releaseManifest(version, body, component = 'frontend') {
   return {
     schema: 1,
     project: 'jetsrm',
     version,
     commit: `commit-${version}`,
     artifacts: [{
-      component: 'frontend',
+      component,
       os: 'any',
-      file: `jetsrm-frontend-${version}.tar.gz`,
+      file: `jetsrm-${component}-${version}.tar.gz`,
       sha256: sha(body),
       size: body.length,
     }],
   };
 }
 
-async function stageAndFinalize(env, version) {
+async function stageAndFinalize(env, version, component) {
   const body = Buffer.from(`artifact-${version}`);
-  const manifest = releaseManifest(version, body);
+  const manifest = releaseManifest(version, body, component);
   await env.service.uploadArtifact({
     projectId: 'p1',
     version,
@@ -248,6 +248,24 @@ test('retention keeps newest three local releases plus installed/busy releases a
     assert.deepEqual(versions, ['6.0.0', '5.0.0', '4.0.0', '3.0.0', '2.0.0', '1.0.0']);
     assert.equal(fs.existsSync(path.join(env.dir, 'artifacts', 'releases', projectKey('p1'), '0.9.0')), false);
     assert.ok(env.audit.some((entry) => entry.action === 'RELEASE_PRUNED' && entry.metadata.version === '0.9.0'));
+  } finally {
+    env.cleanup();
+  }
+});
+
+test('retention keeps each customer\'s own releases: a release of one firm never evicts another\'s', async () => {
+  const env = setup();
+  env.project.config.artifactDeploy.components = ['frontend-evyap', 'frontend-koksan']
+    .map((name) => ({ name, subdir: name, runtime: { type: 'iis-static' } }));
+  try {
+    const evyap = await stageAndFinalize(env, '1.0.0-evyap', 'frontend-evyap');
+    const koksan = [];
+    for (const version of ['1.0.0', '1.0.1', '1.0.2', '1.0.3']) {
+      koksan.push(await stageAndFinalize(env, `${version}-koksan`, 'frontend-koksan'));
+    }
+    assert.ok(env.repository.findRelease(evyap.id), 'evyap keeps its only release');
+    assert.equal(env.repository.findRelease(koksan[0].id), null, 'koksan still keeps only its newest three');
+    assert.ok(env.repository.findRelease(koksan[1].id));
   } finally {
     env.cleanup();
   }

@@ -31,14 +31,31 @@ async function hashFile(filePath) {
   return { sha256: hash.digest('hex'), size };
 }
 
-function createLocalArtifactStore({ root, maxArtifactBytes }) {
+/**
+ * @param {object} options
+ * @param {string} options.root - absolute storage root.
+ * @param {number} options.maxArtifactBytes
+ * @param {(projectId: string) => string} [options.projectFolder] - names a project's folder
+ *   directly under `root` (see projectFolders.js): releases then live at `<root>/<folder>/<version>`,
+ *   where an operator browsing the server finds them by project name. Without it releases live at
+ *   `<root>/releases/<hash of the id>/<version>`. A release already stored that way is still found
+ *   after switching, so turning folders on never strands an existing release.
+ */
+function createLocalArtifactStore({ root, maxArtifactBytes, projectFolder = null }) {
   if (!path.isAbsolute(root)) throw new Error('Artifact storage root must be absolute.');
   if (!Number.isSafeInteger(maxArtifactBytes) || maxArtifactBytes <= 0) throw new Error('Artifact max size must be a positive safe integer.');
 
   const stagingRoot = path.join(root, '.staging');
   const releasesRoot = path.join(root, 'releases');
-  const stagingDir = (projectId, version) => path.join(stagingRoot, projectKey(projectId), version);
-  const releaseDir = (projectId, version) => path.join(releasesRoot, projectKey(projectId), version);
+  const folderOf = (projectId) => (projectFolder ? projectFolder(String(projectId)) : projectKey(projectId));
+  const stagingDir = (projectId, version) => path.join(stagingRoot, folderOf(projectId), version);
+  const legacyReleaseDir = (projectId, version) => path.join(releasesRoot, projectKey(projectId), version);
+  const releaseDir = (projectId, version) => {
+    if (!projectFolder) return legacyReleaseDir(projectId, version);
+    const named = path.join(root, folderOf(projectId), version);
+    if (!fs.existsSync(named) && fs.existsSync(legacyReleaseDir(projectId, version))) return legacyReleaseDir(projectId, version);
+    return named;
+  };
 
   function validateLocation(version, fileName) {
     if (typeof version !== 'string' || !VERSION_PATTERN.test(version)) throw new ValidationError('Invalid artifact version.');

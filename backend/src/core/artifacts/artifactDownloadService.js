@@ -29,9 +29,10 @@ function defaultCreateSourceClient(source, credentials) {
  * @param {(project: object) => Promise<object>} deps.resolveSecrets
  * @param {object} [deps.localStore]
  * @param {Function} [deps.createSourceClient]
+ * @param {object} [deps.layered] - layeredArtifacts: a token bound to a layer serves package + layer merged.
  */
-function createArtifactDownloadService({ repository, tokens, getProject, resolveSecrets, localStore = null, createSourceClient = defaultCreateSourceClient }) {
-  return {
+function createArtifactDownloadService({ repository, tokens, getProject, resolveSecrets, localStore = null, createSourceClient = defaultCreateSourceClient, layered = null }) {
+  const service = {
     /**
      * Consumes one use of `token` for `artifactId`.
      * @returns {{ artifact: object, release: object, binding: object }|null} null → 401, no detail.
@@ -43,14 +44,28 @@ function createArtifactDownloadService({ repository, tokens, getProject, resolve
       if (!artifact) return null;
       const release = repository.findRelease(artifact.releaseId);
       if (!release || release.status !== 'ready') return null;
-      return { artifact, release, binding };
+      if (!binding.layerArtifactId) return { artifact, release, binding, layer: null };
+      const layer = repository.findArtifact(binding.layerArtifactId);
+      if (!layer || layer.releaseId !== artifact.releaseId || !layer.variant || !binding.layerDir) return null;
+      return { artifact, release, binding, layer };
     },
 
     /**
-     * Opens the artifact stream at the source.
-     * @returns {Promise<{ stream: import('node:stream').Readable, contentLength: number|null }>}
+     * Opens what the token serves: the artifact itself, or — for a token bound
+     * to a layer — the artifact with the layer merged in, whose sha256 / size /
+     * fileName then differ from the artifact row and are returned with it.
+     * @returns {Promise<{ stream: import('node:stream').Readable, contentLength: number|null, sha256?: string, size?: number, fileName?: string }>}
      */
-    async open({ artifact, release }, { signal } = {}) {
+    async open({ artifact, release, binding, layer }, { signal } = {}) {
+      if (layer) {
+        if (!layered) throw new Error('Layered artifacts are unavailable.');
+        return layered.open({ release, base: artifact, layer, dir: binding.layerDir });
+      }
+      return service.openArtifact(artifact, release, { signal });
+    },
+
+    /** Opens one artifact's own stream at its source. */
+    async openArtifact(artifact, release, { signal } = {}) {
       if (release.sourcePlatform === 'local') {
         if (!localStore) throw new Error('Local artifact storage is unavailable.');
         return localStore.open({ artifact, release }, { signal });
@@ -84,6 +99,7 @@ function createArtifactDownloadService({ repository, tokens, getProject, resolve
       }
     },
   };
+  return service;
 }
 
 module.exports = { createArtifactDownloadService };

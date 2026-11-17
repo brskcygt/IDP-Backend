@@ -57,7 +57,13 @@ async function hashFile(filePath) {
 
 /** The component a file name points at, when exactly one configured name appears in it as a word. */
 function guessComponent(fileName, componentNames) {
-  const words = new Set(fileName.toLowerCase().replace(/\.tar\.gz$/i, '').split(/[^a-z0-9]+/).filter(Boolean));
+  const wordList = fileName.toLowerCase().replace(/\.tar\.gz$/i, '').split(/[^a-z0-9]+/).filter(Boolean);
+  // The name written out in one piece decides first: `mdp-srm-frontend-evyap` is
+  // frontend-evyap even though it also holds both words of frontend-mdp.
+  const joined = `-${wordList.join('-')}-`;
+  const written = componentNames.filter((name) => joined.includes(`-${name.toLowerCase()}-`));
+  if (written.length === 1) return written[0];
+  const words = new Set(wordList);
   // A whole name (`backend`, `admin-panel`) or a clear abbreviation of it: `front-build` → frontend.
   const hasPart = (part) => words.has(part) || [...words].some((word) => word.length >= 4 && part.startsWith(word));
   const matches = componentNames.filter((name) => name.split('-').every(hasPart));
@@ -126,6 +132,31 @@ function packFolder(dirPath, outFile) {
  * @param {(id: string) => object} deps.getProject
  * @param {() => number} [deps.now]
  */
+/** A name the listing can return: a package, a folder, or a package one folder down. Never a longer path. */
+function isListableEntry(file) {
+  if (typeof file !== 'string') return false;
+  const safeFolder = (name) => FOLDER_NAME_PATTERN.test(name) && name !== '.' && name !== '..';
+  const parts = file.split('/');
+  if (parts.length === 2) return safeFolder(parts[0]) && ARTIFACT_FILE_PATTERN.test(parts[1]);
+  return ARTIFACT_FILE_PATTERN.test(file) || (safeFolder(file) && !/\.tar\.gz$/i.test(file));
+}
+
+/** The .tar.gz files directly inside `dirPath`. */
+async function packagesIn(dirPath) {
+  const entries = await fs.promises.readdir(dirPath, { withFileTypes: true }).catch(() => []);
+  return entries.filter((entry) => entry.isFile() && /\.tar\.gz$/i.test(entry.name)).map((entry) => entry.name);
+}
+
+/** The configured folder as a path on THIS server: `~` is its user's home. */
+function resolveFolder(folder) {
+  if (process.platform !== 'win32' && /^(?:[A-Za-z]:[\\/]|\\\\)/.test(folder)) {
+    throw new ValidationError(`This IDP server does not run on Windows, so it cannot read the folder ${folder}. Enter a path on this server, e.g. /Users/me/builds.`);
+  }
+  if (folder === '~') return os.homedir();
+  if (/^~[\\/]/.test(folder)) return path.join(os.homedir(), folder.slice(2));
+  return path.resolve(folder);
+}
+
 function createFolderImportService({ repository, uploadService, auditLogger, getProject, now = () => Date.now() }) {
   function requireFolderConfig(projectId) {
     const project = getProject(projectId);
@@ -137,7 +168,7 @@ function createFolderImportService({ repository, uploadService, auditLogger, get
     if (config.components.length === 0) {
       throw new ValidationError('This project has no components — define backend/frontend under Settings → Build and source.');
     }
-    return { project, config, folder: path.resolve(config.localFolder) };
+    return { project, config, folder: resolveFolder(config.localFolder) };
   }
 
   async function readFolder(folder) {
@@ -167,8 +198,34 @@ function createFolderImportService({ repository, uploadService, auditLogger, get
         || (entry.isDirectory() && !entry.name.startsWith('.') && !/\.tar\.gz$/i.test(entry.name)));
 
       const files = [];
+      const addFile = async (name, entryPath) => {
+        const baseName = path.basename(name);
+        const stat = await fs.promises.stat(entryPath).catch(() => null);
+        if (!stat) return; // Removed between readdir and stat.
+        const validName = ARTIFACT_FILE_PATTERN.test(baseName);
+        files.push({
+          name,
+          kind: 'file',
+          size: stat.size,
+          modifiedAt: stat.mtime.toISOString(),
+          component: guessComponent(baseName, componentNames),
+          version: guessVersion(baseName),
+          settling: now() - stat.mtimeMs < SETTLE_MS,
+          // Spaces or other characters the artifact store does not accept.
+          problem: validName ? null : 'File name may only contain letters, digits, ".", "_" and "-".',
+        });
+      };
       for (const entry of entries) {
         const entryPath = path.join(folder, entry.name);
+        if (entry.isDirectory()) {
+          // A CI that drops each build's packages into its own folder: the packages
+          // are the builds, and packing that folder would nest archives in an archive.
+          const packages = await packagesIn(entryPath);
+          if (packages.length > 0) {
+            for (const name of packages) await addFile(`${entry.name}/${name}`, path.join(entryPath, name));
+            continue;
+          }
+        }
         let stat;
         try {
           stat = await fs.promises.stat(entryPath);
@@ -189,21 +246,20 @@ function createFolderImportService({ repository, uploadService, auditLogger, get
           });
           continue;
         }
-        const validName = ARTIFACT_FILE_PATTERN.test(entry.name);
-        files.push({
-          name: entry.name,
-          kind: 'file',
-          size: stat.size,
-          modifiedAt: stat.mtime.toISOString(),
-          component: guessComponent(entry.name, componentNames),
-          version: guessVersion(entry.name),
-          settling: now() - stat.mtimeMs < SETTLE_MS,
-          // Spaces or other characters the artifact store does not accept.
-          problem: validName ? null : 'File name may only contain letters, digits, ".", "_" and "-".',
-        });
+        await addFile(entry.name, entryPath);
       }
       files.sort((a, b) => b.modifiedAt.localeCompare(a.modifiedAt));
-      return { folder, components: componentNames, truncated: files.length > MAX_LISTED_FILES, files: files.slice(0, MAX_LISTED_FILES) };
+      // A release taken from this very folder stores a copy of the package under
+      // the same file name: the build is listed once, as its original.
+      const seen = new Set();
+      const unique = files.reverse().filter((file) => {
+        if (file.kind !== 'file') return true;
+        const baseName = path.basename(file.name);
+        if (seen.has(baseName)) return false;
+        seen.add(baseName);
+        return true;
+      }).reverse();
+      return { folder, components: componentNames, truncated: unique.length > MAX_LISTED_FILES, files: unique.slice(0, MAX_LISTED_FILES) };
     },
 
     /**
@@ -227,8 +283,7 @@ function createFolderImportService({ repository, uploadService, auditLogger, get
         if (!components.has(component)) throw new ValidationError(`Unknown component: ${component}.`);
         if (seenComponents.has(component)) throw new ValidationError(`Component ${component} is picked twice.`);
         // A .tar.gz by the store's own rule, otherwise a folder name — never a path.
-        const validEntry = typeof file === 'string' && (ARTIFACT_FILE_PATTERN.test(file)
-          || (FOLDER_NAME_PATTERN.test(file) && file !== '.' && file !== '..' && !/\.tar\.gz$/i.test(file)));
+        const validEntry = isListableEntry(file);
         if (!validEntry) throw new ValidationError(`Invalid file name: ${file}.`);
         if (seenFiles.has(file)) throw new ValidationError(`${file} is picked for two components.`);
         seenComponents.add(component);
@@ -252,7 +307,7 @@ function createFolderImportService({ repository, uploadService, auditLogger, get
           }
 
           let source = entryPath;
-          let storedName = file;
+          let storedName = path.basename(file);
           if (stat.isDirectory()) {
             // A folder changes file by file while the CI copies into it, and its
             // own mtime only notices entries added or removed directly in it.
@@ -264,7 +319,7 @@ function createFolderImportService({ repository, uploadService, auditLogger, get
             source = path.join(scratch, storedName);
             await packFolder(entryPath, source);
           } else if (stat.isFile()) {
-            if (!ARTIFACT_FILE_PATTERN.test(file)) throw new ValidationError(`Invalid file name: ${file}.`);
+            if (!ARTIFACT_FILE_PATTERN.test(storedName)) throw new ValidationError(`Invalid file name: ${file}.`);
             if (now() - stat.mtimeMs < SETTLE_MS) {
               throw new ConflictError(`${file} changed in the last few seconds and may still be being copied — try again shortly.`);
             }
@@ -316,4 +371,4 @@ function createFolderImportService({ repository, uploadService, auditLogger, get
   };
 }
 
-module.exports = { createFolderImportService, guessComponent, guessVersion, SETTLE_MS };
+module.exports = { createFolderImportService, guessComponent, guessVersion, SETTLE_MS, hashFile, packFolder, tarCommand };

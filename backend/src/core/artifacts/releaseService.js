@@ -26,6 +26,7 @@ const {
   resolveSourceCredentials,
   validateManifest,
   manifestFileName,
+  buildVersionName,
 } = require('./contracts');
 const { mergeBuildParameters } = require('../deployment/buildParameters');
 
@@ -35,20 +36,6 @@ const COMPONENTS_VARIABLE = 'COMPONENTS';
 /** Build parameter carrying the branch for providers without a ref concept. */
 const BRANCH_VARIABLE = 'BRANCH';
 const REF_TYPES = ['branch', 'tag'];
-
-/**
- * A version for a build nobody named: `0.0.0-<branch>.<utc timestamp>`.
- *
- * 0.0.0 keeps it visibly below any real version, the branch says where it came
- * from and the timestamp makes it unique — two test deploys a minute apart must
- * not collide on an immutable release row. Branch characters outside the
- * version pattern (slashes in `feature/x`) become dashes.
- */
-function generateVersion(ref, now = new Date()) {
-  const branch = String(ref).replace(/[^0-9A-Za-z._-]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 24) || 'branch';
-  const stamp = now.toISOString().replace(/[-:T]/g, '').replace(/\..+$/, '');
-  return `0.0.0-${branch}.${stamp}`;
-}
 
 /**
  * @param {string[]|undefined|null} requested
@@ -523,7 +510,7 @@ function createReleaseService({
      *
      * A version is still cut — the deploy path, rollback and "what is installed
      * here" all key off a release row — but it is generated, and its shape says
-     * plainly that it is not a hand-picked one: `0.0.0-<branch>.<timestamp>`.
+     * plainly that it is not a hand-picked one: `<DDMMYYYYHHMM>-<project>`.
      *
      * Production is excluded on purpose: there a version is the whole point.
      * You deploy something that was built, seen and named earlier, not whatever
@@ -542,7 +529,7 @@ function createReleaseService({
       }
       return this.createRelease({
         projectId: target.projectId,
-        version: generateVersion(target.ref),
+        version: buildVersionName(requireConfig(getProject(target.projectId)).artifactName),
         ref: target.ref,
         components,
         deployTo: { targetId: target.id, components },

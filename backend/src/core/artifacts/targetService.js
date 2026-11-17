@@ -265,8 +265,16 @@ function createTargetService({ repository, auditLogger, getProject, getGateway, 
         const status = sanitizeStatusResult(payload);
         const versions = [...new Set(Object.values(status.components).map((entry) => entry.version).filter(Boolean))];
         const release = versions.length === 1 ? repository.findReleaseByVersion(target.projectId, versions[0]) : null;
+        // The agent knows versions, not brand layers: keep the recorded layer
+        // of a component still on the same version.
+        const previous = target.currentVersions && typeof target.currentVersions === 'object' ? target.currentVersions : {};
+        const currentVersions = Object.fromEntries(Object.entries(status.components).map(([name, entry]) => {
+          const before = previous[name];
+          const keepLayer = before && before.layer !== undefined && before.version === entry.version;
+          return [name, keepLayer ? { ...entry, layer: before.layer } : entry];
+        }));
         return redactTarget(repository.updateTarget(id, {
-          currentVersions: status.components,
+          currentVersions,
           basePath: status.basePath ?? target.basePath,
           currentReleaseId: release ? release.id : null,
         }));

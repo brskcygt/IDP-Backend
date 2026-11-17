@@ -51,3 +51,36 @@ test('make-manifest rejects malformed, duplicate and missing artifact inputs', a
     fs.rmSync(dir, { recursive: true, force: true });
   }
 });
+
+test('make-manifest: layer variants, one by one or every file of a `*` pattern', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'idp-manifest-variants-'));
+  try {
+    fs.mkdirSync(path.join(dir, 'artifacts'));
+    for (const name of ['srm-frontend-1.0.0.tar.gz', 'srm-brand-koksan-1.0.0.tar.gz', 'srm-brand-temsa-1.0.0.tar.gz', 'srm-brand-BAD!-1.0.0.tar.gz']) {
+      fs.writeFileSync(path.join(dir, 'artifacts', name), name);
+    }
+    assert.deepEqual(parseEntry('brand@koksan:any:x.tar.gz'), { component: 'brand', variant: 'koksan', os: 'any', file: 'x.tar.gz' });
+    assert.throws(() => parseEntry('brand@Koksan:any:x.tar.gz'), /variant/);
+    assert.throws(() => parseEntry('brand@a@b:any:x.tar.gz'), /component/);
+
+    const result = await makeManifest([
+      'srm', '1.0.0', 'abcdef1',
+      'frontend:any:artifacts/srm-frontend-1.0.0.tar.gz',
+      'brand@*:any:artifacts/srm-brand-*-1.0.0.tar.gz',
+    ], dir);
+    assert.deepEqual(result.manifest.artifacts.map((a) => [a.component, a.variant ?? null, a.file]), [
+      ['frontend', null, 'srm-frontend-1.0.0.tar.gz'],
+      ['brand', 'koksan', 'srm-brand-koksan-1.0.0.tar.gz'],
+      ['brand', 'temsa', 'srm-brand-temsa-1.0.0.tar.gz'],
+    ]);
+    assert.equal('variant' in result.manifest.artifacts[0], false);
+
+    await assert.rejects(makeManifest(['srm', '1.0.0', 'abcdef1', 'brand@*:any:artifacts/none-*.tar.gz'], dir), /No file matches/);
+    await assert.rejects(makeManifest(['srm', '1.0.0', 'abcdef1', 'brand@*:any:artifacts/*-*.tar.gz'], dir), /exactly one \*/);
+    await assert.rejects(makeManifest([
+      'srm', '1.0.0', 'abcdef1', 'brand@*:any:artifacts/srm-brand-*-1.0.0.tar.gz', 'brand@temsa:any:artifacts/srm-frontend-1.0.0.tar.gz',
+    ], dir), /Duplicate/);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});

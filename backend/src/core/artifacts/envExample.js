@@ -184,7 +184,8 @@ function parseEnvExample(text) {
 async function buildConfigSchema(artifacts, openArtifact) {
   const schema = {};
   for (const artifact of artifacts) {
-    if (schema[artifact.component]) continue;
+    // Layer variants (brands) carry no config of their own.
+    if (artifact.variant || schema[artifact.component]) continue;
     let text = null;
     try {
       text = await readEnvExampleFromTarGz(await openArtifact(artifact));

@@ -30,7 +30,10 @@ const { createArtifactDownloadService } = require('./artifactDownloadService');
 const { createArtifactUploadService } = require('./artifactUploadService');
 const { createAutoDeployService } = require('./autoDeployService');
 const { createFolderImportService } = require('./folderImportService');
+const { createVariantReleaseService } = require('./variantReleaseService');
 const { createLocalArtifactStore } = require('./localArtifactStore');
+const { createProjectFolders } = require('./projectFolders');
+const { createLayeredArtifacts } = require('./layeredArtifacts');
 const { validateArtifactStorageEnv, validateArtifactPublicUrlEnv } = require('../../config');
 const {
   persistTargetRuntimeConfig,
@@ -55,9 +58,15 @@ const targetSecretOptions = { requireEncryption: process.env.NODE_ENV === 'produ
 const tokens = createDownloadTokenService({ repository });
 const storageConfig = validateArtifactStorageEnv(process.env);
 if (storageConfig.errors.length > 0) throw new Error(storageConfig.errors.join(' '));
+// Releases are stored under a folder named after the project (<root>/<project>/<version>).
+const projectFolder = createProjectFolders({
+  root: storageConfig.storageRoot,
+  getProjectName: (id) => projectService.getProject(id).name,
+});
 const localStore = createLocalArtifactStore({
   root: storageConfig.storageRoot,
   maxArtifactBytes: storageConfig.maxArtifactBytes,
+  projectFolder,
 });
 const abandonedStaging = localStore.cleanupStagingSync();
 if (abandonedStaging > 0) console.log(`Removed ${abandonedStaging} abandoned artifact staging directorie(s).`);
@@ -96,8 +105,15 @@ const composeService = createComposeService({
   getProject,
   resolveSecrets,
 });
+// Package + one brand layer merged into the single tarball an agent installs.
+// downloadService is defined below; it is only called once a deploy runs.
+const layered = createLayeredArtifacts({
+  root: storageConfig.storageRoot,
+  openArtifact: (artifact, release) => downloadService.openArtifact(artifact, release),
+});
 artifactDeployService = createArtifactDeployService({
   repository,
+  layered,
   deploymentManager,
   auditLogger,
   getProject,
@@ -141,7 +157,15 @@ const uploadService = createArtifactUploadService({
 });
 // Ready builds another CI drops into a folder on this server.
 const folderImportService = createFolderImportService({ repository, uploadService, auditLogger, getProject });
-const downloadService = createArtifactDownloadService({ repository, tokens, getProject, resolveSecrets, localStore });
+const downloadService = createArtifactDownloadService({ repository, tokens, getProject, resolveSecrets, localStore, layered });
+// A release made from one uploaded build, one package per customer component it derives.
+const variantReleaseService = createVariantReleaseService({
+  repository,
+  uploadService,
+  openArtifact: (artifact, release) => downloadService.openArtifact(artifact, release),
+  auditLogger,
+  getProject,
+});
 
 module.exports = {
   contracts,
@@ -154,6 +178,7 @@ module.exports = {
   uploadService,
   autoDeployService,
   folderImportService,
+  variantReleaseService,
   downloadService,
   localStore,
 };

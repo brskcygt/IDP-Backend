@@ -75,6 +75,7 @@ function rowToArtifact(row) {
     sourceRef: row.source_ref ?? null,
     sha256: row.sha256,
     size: row.size,
+    variant: row.variant ?? null,
   };
 }
 
@@ -122,6 +123,8 @@ function rowToToken(row) {
     maxUses: row.max_uses,
     uses: row.uses,
     createdAt: row.created_at ?? null,
+    layerArtifactId: row.layer_artifact_id ?? null,
+    layerDir: row.layer_dir ?? null,
   };
 }
 
@@ -310,7 +313,8 @@ function createArtifactDeployRepository(db) {
         const existing = db.prepare('SELECT * FROM release_artifacts WHERE release_id = ?').all(releaseId).map(rowToArtifact);
         const keep = new Set();
         for (const artifact of artifacts) {
-          const match = existing.find((row) => row.component === artifact.component && row.os === artifact.os);
+          const variant = artifact.variant || null;
+          const match = existing.find((row) => row.component === artifact.component && row.os === artifact.os && row.variant === variant);
           if (match) {
             keep.add(match.id);
             db.prepare(`
@@ -318,9 +322,9 @@ function createArtifactDeployRepository(db) {
             `).run(artifact.file, sqlValue(artifact.sourceRef), artifact.sha256, artifact.size, match.id);
           } else {
             db.prepare(`
-              INSERT INTO release_artifacts (id, release_id, component, os, file_name, source_ref, sha256, size)
-              VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-            `).run(newId('art'), releaseId, artifact.component, artifact.os, artifact.file, sqlValue(artifact.sourceRef), artifact.sha256, artifact.size);
+              INSERT INTO release_artifacts (id, release_id, component, os, file_name, source_ref, sha256, size, variant)
+              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            `).run(newId('art'), releaseId, artifact.component, artifact.os, artifact.file, sqlValue(artifact.sourceRef), artifact.sha256, artifact.size, variant);
           }
         }
         for (const row of existing) {
@@ -333,7 +337,7 @@ function createArtifactDeployRepository(db) {
     },
 
     listArtifacts(releaseId) {
-      return db.prepare('SELECT * FROM release_artifacts WHERE release_id = ? ORDER BY component ASC, os ASC')
+      return db.prepare('SELECT * FROM release_artifacts WHERE release_id = ? ORDER BY component ASC, os ASC, variant ASC')
         .all(releaseId)
         .map(rowToArtifact);
     },
@@ -425,8 +429,8 @@ function createArtifactDeployRepository(db) {
 
     insertToken(token) {
       db.prepare(`
-        INSERT INTO artifact_download_tokens (token_hash, artifact_id, agent_id, deployment_id, expires_at, max_uses, uses, created_at)
-        VALUES (?, ?, ?, ?, ?, ?, 0, ?)
+        INSERT INTO artifact_download_tokens (token_hash, artifact_id, agent_id, deployment_id, expires_at, max_uses, uses, created_at, layer_artifact_id, layer_dir)
+        VALUES (?, ?, ?, ?, ?, ?, 0, ?, ?, ?)
       `).run(
         token.tokenHash,
         token.artifactId,
@@ -434,7 +438,9 @@ function createArtifactDeployRepository(db) {
         sqlValue(token.deploymentId),
         token.expiresAt,
         token.maxUses,
-        token.createdAt || new Date().toISOString()
+        token.createdAt || new Date().toISOString(),
+        sqlValue(token.layerArtifactId),
+        sqlValue(token.layerDir)
       );
     },
 
