@@ -5,6 +5,12 @@
 //
 // --ref: the branch CI built when it started the build itself (a push). IDP
 // installs such a build on targets of that branch that have automatic install on.
+//
+// Layer variants (e.g. one brand per customer, see "Brand layer" in
+// docs/ARTIFACT-DEPLOY.md): <component>@<variant>:<os>:<file>, or every file
+// matching a pattern at once with `*` standing for the variant:
+//   'brand@*:any:artifacts/mdp-srm-brand-*-1.4.0.tar.gz'
+// (quote it so the shell leaves the `*` alone).
 
 const crypto = require('node:crypto');
 const fs = require('node:fs');
@@ -13,6 +19,7 @@ const path = require('node:path');
 const NAME = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
 const VERSION = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
 const COMPONENT = /^[a-z][a-z0-9-]{0,31}$/;
+const VARIANT = /^[a-z0-9][a-z0-9_-]{0,31}$/;
 const OS_VALUES = new Set(['win-x64', 'linux-x64', 'any']);
 const REF = /^[A-Za-z0-9._][A-Za-z0-9._/+-]{0,254}$/;
 
@@ -36,14 +43,36 @@ function parseEntry(entry) {
   const first = entry.indexOf(':');
   const second = first < 0 ? -1 : entry.indexOf(':', first + 1);
   if (first < 1 || second < first + 2 || second === entry.length - 1) {
-    throw new Error(`Invalid artifact entry '${entry}'; expected component:os:file.`);
+    throw new Error(`Invalid artifact entry '${entry}'; expected component[@variant]:os:file.`);
   }
-  const component = entry.slice(0, first);
+  const [component, variant = null, ...extra] = entry.slice(0, first).split('@');
   const os = entry.slice(first + 1, second);
   const file = entry.slice(second + 1);
-  if (!COMPONENT.test(component)) throw new Error(`Invalid component '${component}'.`);
+  if (!COMPONENT.test(component) || extra.length > 0) throw new Error(`Invalid component '${entry.slice(0, first)}'.`);
+  if (variant !== null && variant !== '*' && !VARIANT.test(variant)) throw new Error(`Invalid variant '${variant}'.`);
   if (!OS_VALUES.has(os)) throw new Error(`Invalid artifact OS '${os}'.`);
-  return { component, os, file };
+  return { component, variant, os, file };
+}
+
+/** `brand@*` entries → one entry per matching file, the `*` part being the variant. */
+async function expandEntry(entry, cwd) {
+  if (entry.variant !== '*') return [entry];
+  const absolute = path.resolve(cwd, entry.file);
+  const pattern = path.basename(absolute);
+  const star = pattern.indexOf('*');
+  if (star < 0 || pattern.indexOf('*', star + 1) >= 0) throw new Error(`'${entry.file}' needs exactly one * in the file name for ${entry.component}@*.`);
+  const prefix = pattern.slice(0, star);
+  const suffix = pattern.slice(star + 1);
+  const names = (await fs.promises.readdir(path.dirname(absolute))).sort();
+  const found = [];
+  for (const name of names) {
+    if (!name.startsWith(prefix) || !name.endsWith(suffix) || name.length <= prefix.length + suffix.length) continue;
+    const variant = name.slice(prefix.length, name.length - suffix.length);
+    if (!VARIANT.test(variant)) continue;
+    found.push({ component: entry.component, variant, os: entry.os, file: path.join(path.dirname(absolute), name) });
+  }
+  if (found.length === 0) throw new Error(`No file matches '${entry.file}'.`);
+  return found;
 }
 
 async function hashFile(file) {
@@ -72,9 +101,11 @@ async function makeManifest(args, cwd = process.cwd()) {
   const seen = new Set();
   const seenFiles = new Set();
   const artifacts = [];
-  for (const raw of rawEntries) {
-    const entry = parseEntry(raw);
-    const key = `${entry.component}/${entry.os}`;
+  const entries = [];
+  for (const raw of rawEntries) entries.push(...await expandEntry(parseEntry(raw), cwd));
+  if (entries.length > 40) throw new Error('A manifest holds at most 40 artifacts.');
+  for (const entry of entries) {
+    const key = `${entry.component}/${entry.os}${entry.variant ? `@${entry.variant}` : ''}`;
     if (seen.has(key)) throw new Error(`Duplicate component/OS entry: ${key}.`);
     seen.add(key);
     const absolute = path.resolve(cwd, entry.file);
@@ -85,7 +116,7 @@ async function makeManifest(args, cwd = process.cwd()) {
     if (seenFiles.has(fileName)) throw new Error(`Duplicate artifact file: ${fileName}.`);
     seenFiles.add(fileName);
     const digest = await hashFile(absolute);
-    artifacts.push({ component: entry.component, os: entry.os, file: fileName, ...digest });
+    artifacts.push({ component: entry.component, os: entry.os, file: fileName, ...digest, ...(entry.variant ? { variant: entry.variant } : {}) });
   }
 
   return {
